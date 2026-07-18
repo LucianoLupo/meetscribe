@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- FROZEN cross-phase invariant: bundle-id binds the TCC grant + any future Keychain key.
+         Changing it forces re-approval of the prompts (tccutil reset ... com.lucianolupo.meetscribe). -->
+    <key>CFBundleIdentifier</key>
+    <string>com.lucianolupo.meetscribe</string>
+    <key>CFBundleName</key>
+    <string>meetscribe</string>
+    <key>CFBundleExecutable</key>
+    <string>meetscribe</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>0.1.0</string>
+
+    <!-- Microphone (the mic INPUT sub-device in the aggregate). -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>meetscribe records your microphone to transcribe your side of meetings on-device.</string>
+
+    <!-- System audio (the global process tap). Triggers the "record system audio" prompt. -->
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>meetscribe records meeting audio from your apps to transcribe the other participants on-device.</string>
+</dict>
+</plist>

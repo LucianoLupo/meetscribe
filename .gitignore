@@ -1,0 +1,5 @@
+/target
+
+# Captured meeting audio — NEVER commit (private recordings)
+/capture
+*.wav
