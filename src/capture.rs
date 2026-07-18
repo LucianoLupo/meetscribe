@@ -38,6 +38,7 @@ mod imp {
         mic_ch: AtomicU32,
         tap_ch: AtomicU32,
         first_num_buffers: AtomicU32,
+        dropped: AtomicU32,
         layout_logged: AtomicBool,
     }
 
@@ -48,15 +49,20 @@ mod imp {
         shared: Arc<Shared>,
     }
 
-    /// The RT audio callback. `IN = 2`: mic buffer + tap buffer arrive as separate
-    /// `AudioBuffer`s. We push each source's raw interleaved f32 into its own ring and
-    /// de-interleave/downmix later off the RT thread (keeps this proc allocation-free).
+    /// The RT audio callback. Mic buffer + tap buffer arrive as separate `AudioBuffer`s.
+    /// We push each source's raw interleaved f32 into its own ring and de-interleave/downmix
+    /// later off the RT thread (keeps this proc allocation- and syscall-free — no HAL reads).
+    ///
+    /// The typed views are `AudioBufList<0>` (an 8-byte header only) so the reference is
+    /// never wider than CoreAudio's real variable-length `AudioBufferList` allocation, whatever
+    /// `number_buffers` it delivers. Individual buffers are read via a raw offset from the
+    /// contiguous `buffers` array — the correct idiom for a variable-length buffer list.
     extern "C" fn audio_proc(
-        device: ca::Device,
+        _device: ca::Device,
         _now: &cat::AudioTimeStamp,
-        input: &cat::AudioBufList<2>,
+        input: &cat::AudioBufList<0>,
         _in_time: &cat::AudioTimeStamp,
-        _out: &mut cat::AudioBufList<1>,
+        _out: &mut cat::AudioBufList<0>,
         _out_time: &cat::AudioTimeStamp,
         ctx: Option<&mut AudioContext>,
     ) -> os::Status {
@@ -72,31 +78,33 @@ mod imp {
                 .store(num_buffers as u32, Ordering::Release);
         }
 
-        // buffers[0] -> mic ("You"), buffers[1] -> tap ("Others").
-        // Ordering follows the composition (sub_device_list before tap_list); it is
-        // human-verified by listening to the two WAVs in Phase 0a.
+        // buffers[0] -> mic ("You"), buffers[1] -> tap ("Others"). Ordering follows the
+        // composition (sub_device_list before tap_list); human-verified by listening in 0a.
         let n = num_buffers.min(2);
+        let base = input.buffers.as_ptr(); // *const Buf at the buffers[] field offset
         for i in 0..n {
-            let buf = &input.buffers[i];
+            // SAFETY: buffers[0..number_buffers] are contiguous `#[repr(C)]` Buf entries in
+            // CoreAudio's allocation; `i < min(number_buffers, 2)` keeps this in bounds even
+            // though our typed view declares a zero-length array.
+            let buf = unsafe { &*base.add(i) };
             let floats = buf.data_bytes_size as usize / std::mem::size_of::<f32>();
             if buf.data.is_null() || floats == 0 {
                 continue;
             }
             let data = unsafe { std::slice::from_raw_parts(buf.data as *const f32, floats) };
             let ch = buf.number_channels.max(1);
-            if i == 0 {
+            let pushed = if i == 0 {
                 ctx.shared.mic_ch.store(ch, Ordering::Release);
-                let _ = ctx.mic_prod.push_slice(data);
+                ctx.mic_prod.push_slice(data)
             } else {
                 ctx.shared.tap_ch.store(ch, Ordering::Release);
-                let _ = ctx.tap_prod.push_slice(data);
+                ctx.tap_prod.push_slice(data)
+            };
+            if pushed < data.len() {
+                ctx.shared
+                    .dropped
+                    .fetch_add((data.len() - pushed) as u32, Ordering::Relaxed);
             }
-        }
-
-        // All sub-sources run at the aggregate's (mic clock's) nominal rate; the tap's
-        // native rate is drift-resampled into it. So one rate governs both WAVs.
-        if let Ok(rate) = device.nominal_sample_rate() {
-            ctx.shared.agg_rate.store(rate as u32, Ordering::Release);
         }
 
         os::Status::NO_ERR
@@ -200,6 +208,7 @@ mod imp {
                 mic_ch: AtomicU32::new(0),
                 tap_ch: AtomicU32::new(0),
                 first_num_buffers: AtomicU32::new(0),
+                dropped: AtomicU32::new(0),
                 layout_logged: AtomicBool::new(false),
             });
 
@@ -255,6 +264,10 @@ mod imp {
         pub fn first_num_buffers(&self) -> u32 {
             self.shared.first_num_buffers.load(Ordering::Acquire)
         }
+        /// Total f32 samples the RT proc dropped because a ring was full (drain fell behind).
+        pub fn dropped(&self) -> u32 {
+            self.shared.dropped.load(Ordering::Acquire)
+        }
     }
 
     fn drain_ring(cons: &mut HeapCons<f32>, out: &mut Vec<f32>) {
@@ -300,6 +313,9 @@ mod stub {
             0
         }
         pub fn first_num_buffers(&self) -> u32 {
+            0
+        }
+        pub fn dropped(&self) -> u32 {
             0
         }
     }
