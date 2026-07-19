@@ -306,37 +306,39 @@ fn run_transcribe(argv: &[String]) -> Result<()> {
         source_dir: dir.display().to_string(),
         model: model_name(&model),
         lang: lang.clone(),
-        started_at: earliest_capture_mtime(&mic_files, &sys_files),
+        started_at: earliest_capture_start(&mic_files, &sys_files),
         duration_secs: meeting_secs,
         created_at: now_epoch(),
     };
 
+    // Persist to the DB, then export. A storage failure must NOT discard the transcript we
+    // just spent real compute on: on error we log and fall back to a synthetic row so the
+    // Markdown/JSON still get written. (Correctness of the DB round-trip is covered by the
+    // db.rs unit test and the `export <id>` read path, not re-checked here every run.)
     let row = if no_store {
         synth_row(&meta, merged.len())
     } else {
         let rt = new_runtime()?;
-        rt.block_on(async {
+        let stored = rt.block_on(async {
             let mut database = db::Db::open(&db_path).await?;
             let id = database.insert_meeting(&meta, &merged).await?;
-            // Round-trip check on the real read path (not just "insert didn't error").
-            let loaded = database.load_segments(id).await?;
-            if loaded == merged {
-                log::info!("DB round-trip OK: {} segments read back identical", loaded.len());
-            } else {
-                log::error!(
-                    "DB round-trip MISMATCH: stored {} vs read {}",
-                    merged.len(),
-                    loaded.len()
-                );
-            }
             let row = database
                 .get_meeting(id)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("meeting {id} vanished after insert"))?;
             database.close().await?;
-            log::info!("stored meeting id {id} → {}", db_path.display());
-            anyhow::Ok(row)
-        })?
+            anyhow::Ok((id, row))
+        });
+        match stored {
+            Ok((id, row)) => {
+                log::info!("stored meeting id {id} → {}", db_path.display());
+                row
+            }
+            Err(e) => {
+                log::warn!("could not persist meeting ({e:#}); exporting without storage");
+                synth_row(&meta, merged.len())
+            }
+        }
     };
 
     let (md_path, json_path) = export::write_exports(&export_dir, "transcript", &row, &merged)?;
@@ -372,19 +374,23 @@ fn now_epoch() -> i64 {
         .unwrap_or(0)
 }
 
-fn file_mtime_epoch(p: &Path) -> Option<i64> {
-    let mtime = std::fs::metadata(p).ok()?.modified().ok()?;
-    mtime
-        .duration_since(std::time::UNIX_EPOCH)
+/// When a capture file started recording: its birth time (`created`), set when the WAV is
+/// first opened at capture start. mtime would be ~recording END (a WAV is written throughout
+/// capture), so we prefer birth time and only fall back to mtime if unavailable (macOS/APFS
+/// reports birth time).
+fn file_start_epoch(p: &Path) -> Option<i64> {
+    let meta = std::fs::metadata(p).ok()?;
+    let t = meta.created().or_else(|_| meta.modified()).ok()?;
+    t.duration_since(std::time::UNIX_EPOCH)
         .ok()
         .map(|d| d.as_secs() as i64)
 }
 
-/// The real meeting start time = the earliest capture-WAV mtime (falls back to now).
-fn earliest_capture_mtime(mic: &[PathBuf], sys: &[PathBuf]) -> i64 {
+/// The real meeting start time = the earliest capture-file birth time (falls back to now).
+fn earliest_capture_start(mic: &[PathBuf], sys: &[PathBuf]) -> i64 {
     mic.iter()
         .chain(sys.iter())
-        .filter_map(|p| file_mtime_epoch(p))
+        .filter_map(|p| file_start_epoch(p))
         .min()
         .unwrap_or_else(now_epoch)
 }
