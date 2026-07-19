@@ -15,6 +15,10 @@
 //!   (no --seconds ⇒ records until you press Enter)
 
 mod capture;
+mod resample;
+mod vad;
+mod asr;
+mod transcript;
 
 use anyhow::{Context, Result};
 use capture::DualCapture;
@@ -67,8 +71,179 @@ fn parse_args() -> Args {
     }
 }
 
+/// Read a capture WAV of any sample rate → (mono f32 samples, rate).
+fn read_wav_any_rate(path: &Path) -> Result<(Vec<f32>, u32)> {
+    let reader = hound::WavReader::open(path).with_context(|| format!("open {}", path.display()))?;
+    let spec = reader.spec();
+    if spec.channels != 1 || spec.sample_format != hound::SampleFormat::Float || spec.bits_per_sample != 32 {
+        anyhow::bail!(
+            "{}: expected mono 32-bit float WAV (got {} ch, {:?}/{}-bit)",
+            path.display(),
+            spec.channels,
+            spec.sample_format,
+            spec.bits_per_sample
+        );
+    }
+    let samples = reader
+        .into_samples::<f32>()
+        .collect::<std::result::Result<Vec<f32>, _>>()
+        .context("read samples")?;
+    Ok((samples, spec.sample_rate))
+}
+
+/// Ordered segment files for a channel base ("mic"/"system"): base.wav, base.001.wav, …
+fn discover_channel(dir: &Path, base: &str) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let seg0 = dir.join(format!("{base}.wav"));
+    if seg0.exists() {
+        files.push(seg0);
+    }
+    let mut n = 1u32;
+    loop {
+        let p = dir.join(format!("{base}.{n:03}.wav"));
+        if p.exists() {
+            files.push(p);
+            n += 1;
+        } else {
+            break;
+        }
+    }
+    files
+}
+
+/// `meetscribe transcribe <dir> [--model <ggml.bin>] [--lang <code>]` — batch, post-capture.
+/// Per channel: resample → VAD → whisper each speech window → tag You/Others → merge by time.
+fn run_transcribe(argv: &[String]) -> Result<()> {
+    let mut dir: Option<PathBuf> = None;
+    let mut model = String::from("models/ggml-large-v3.bin");
+    let mut lang = String::from("es");
+    let mut it = argv.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--model" | "-m" => {
+                if let Some(v) = it.next() {
+                    model = v.clone();
+                }
+            }
+            "--lang" | "-l" => {
+                if let Some(v) = it.next() {
+                    lang = v.clone();
+                }
+            }
+            "-h" | "--help" => {
+                eprintln!("usage: meetscribe transcribe <dir> [--model <ggml.bin>] [--lang <code>]");
+                return Ok(());
+            }
+            s if !s.starts_with('-') && dir.is_none() => dir = Some(PathBuf::from(s)),
+            _ => {}
+        }
+    }
+    let dir = dir.context("transcribe: missing <dir> (e.g. `meetscribe transcribe capture`)")?;
+
+    let mic_files = discover_channel(&dir, "mic");
+    let sys_files = discover_channel(&dir, "system");
+    if mic_files.is_empty() && sys_files.is_empty() {
+        anyhow::bail!("no mic.wav/system.wav found in {}", dir.display());
+    }
+    log::info!(
+        "transcribe {} — mic segments: {}, system segments: {}",
+        dir.display(),
+        mic_files.len(),
+        sys_files.len()
+    );
+
+    let asr = asr::Asr::load(&model).with_context(|| format!("load model {model}"))?;
+
+    let t0 = Instant::now();
+    let mut segs: Vec<transcript::TranscriptSegment> = Vec::new();
+    let mut meeting_secs = 0.0f64;
+
+    for (files, speaker) in [
+        (&mic_files, transcript::Speaker::You),
+        (&sys_files, transcript::Speaker::Others),
+    ] {
+        // Multi-segment (rate-roll) offset: cumulative prior-segment duration. Rebuild gaps
+        // (sub-second, recorded only in segments.txt) are ignored — single-segment is the norm.
+        let mut offset = 0.0f64;
+        for path in files {
+            let (samples, rate) = read_wav_any_rate(path)?;
+            let audio16 = resample::to_16k_mono(&samples, rate)
+                .with_context(|| format!("resample {}", path.display()))?;
+            let dur = audio16.len() as f64 / resample::TARGET_RATE as f64;
+            let windows =
+                vad::speech_windows(&audio16).with_context(|| format!("vad {}", path.display()))?;
+            log::info!(
+                "  {} @ {} Hz → {:.1}s, {} speech windows",
+                path.display(),
+                rate,
+                dur,
+                windows.len()
+            );
+            for w in windows {
+                let (a, b) = w.sample_range(audio16.len());
+                if b <= a {
+                    continue;
+                }
+                let (text, confidence) = asr.transcribe(&audio16[a..b], &lang)?;
+                if text.is_empty() {
+                    continue;
+                }
+                segs.push(transcript::TranscriptSegment {
+                    speaker,
+                    text,
+                    t_start: offset + w.start_ms as f64 / 1000.0,
+                    t_end: offset + w.end_ms as f64 / 1000.0,
+                    confidence,
+                });
+            }
+            offset += dur;
+        }
+        meeting_secs = meeting_secs.max(offset);
+    }
+
+    let merged = transcript::merge(segs);
+    let wall = t0.elapsed().as_secs_f64();
+
+    println!("\n===== TRANSCRIPT ({}) =====", dir.display());
+    for s in &merged {
+        println!(
+            "[{:7.2}-{:7.2}] {:<7} {}",
+            s.t_start,
+            s.t_end,
+            s.speaker.label(),
+            s.text
+        );
+    }
+
+    let json_path = dir.join("transcript.json");
+    std::fs::write(
+        &json_path,
+        serde_json::to_string_pretty(&merged).context("serialize transcript")?,
+    )
+    .with_context(|| format!("write {}", json_path.display()))?;
+
+    let rtf = if meeting_secs > 0.0 { wall / meeting_secs } else { 0.0 };
+    println!(
+        "\nsegments: {} | meeting: {:.1}s | wall: {:.1}s | RTF: {:.3}x (both channels through whisper)",
+        merged.len(),
+        meeting_secs,
+        wall,
+        rtf
+    );
+    println!("wrote {}", json_path.display());
+    Ok(())
+}
+
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    // Subcommand dispatch: `meetscribe transcribe <dir> …`. Anything else = the capture
+    // flow (back-compatible: `meetscribe --seconds 300` still records).
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("transcribe") {
+        return run_transcribe(&argv[2..]);
+    }
+
     let args = parse_args();
     std::fs::create_dir_all(&args.out_dir)
         .with_context(|| format!("create output dir {}", args.out_dir.display()))?;

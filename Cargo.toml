@@ -8,6 +8,13 @@ anyhow = "1.0"
 log = "0.4"
 env_logger = "0.11"
 hound = "3.5"
+# Phase 2 — transcription pipeline (batch, post-capture).
+rubato = "0.15"                                  # 16 kHz resample of native-rate capture WAVs
+serde = { version = "1", features = ["derive"] } # TranscriptSegment (storage/export contract)
+serde_json = "1"
+# silero VAD (gates ASR). static-model embeds the 1.7 MB onnx (no model file to provision,
+# no runtime download); pulls ort (ONNX Runtime, fetched at build time).
+silero = { git = "https://github.com/emotechlab/silero-rs", rev = "26a6460", features = ["static-model"] }
 
 # macOS single-aggregate capture layer.
 # cidre pinned to meetily's verified rev — the ported core_audio recipe compiles only against this API surface.

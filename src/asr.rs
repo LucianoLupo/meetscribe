@@ -1,0 +1,71 @@
+//! Whisper ASR wrapper (Phase 2) — one loaded model, transcribe per VAD window.
+//!
+//! Reuses the whisper-rs sequence proven in `src/bin/rtf_probe.rs` (Phase 1.5).
+//! CoreML is still toggled at build time by the crate `coreml` feature.
+
+use anyhow::{Context, Result};
+use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+
+/// Windows shorter than this are skipped (whisper needs a little audio to work with).
+const MIN_SAMPLES: usize = 16_000 / 10; // 100 ms @ 16 kHz
+
+pub struct Asr {
+    ctx: WhisperContext,
+    threads: i32,
+}
+
+impl Asr {
+    pub fn load(model_path: &str) -> Result<Self> {
+        let ctx = WhisperContext::new_with_params(model_path, WhisperContextParameters::default())
+            .with_context(|| format!("load whisper model {model_path}"))?;
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(8) as i32;
+        Ok(Self { ctx, threads })
+    }
+
+    /// Transcribe one 16 kHz mono window → (text, mean-token-probability confidence).
+    /// Sub-100 ms windows return `("", 0.0)` instead of erroring on too-short input.
+    pub fn transcribe(&self, audio_16k: &[f32], lang: &str) -> Result<(String, f32)> {
+        if audio_16k.len() < MIN_SAMPLES {
+            return Ok((String::new(), 0.0));
+        }
+        let mut state = self.ctx.create_state().context("create whisper state")?;
+
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        params.set_language(Some(lang));
+        params.set_n_threads(self.threads);
+        params.set_translate(false);
+        params.set_print_progress(false);
+        params.set_print_realtime(false);
+        params.set_print_timestamps(false);
+        state.full(params, audio_16k).context("whisper full()")?;
+
+        let n = state.full_n_segments().context("n_segments")?;
+        let mut text = String::new();
+        let mut prob_sum = 0.0f32;
+        let mut prob_n = 0u32;
+        for i in 0..n {
+            if let Ok(seg) = state.full_get_segment_text(i) {
+                let t = seg.trim();
+                if !t.is_empty() {
+                    if !text.is_empty() {
+                        text.push(' ');
+                    }
+                    text.push_str(t);
+                }
+            }
+            if let Ok(nt) = state.full_n_tokens(i) {
+                for tok in 0..nt {
+                    if let Ok(p) = state.full_get_token_prob(i, tok) {
+                        prob_sum += p;
+                        prob_n += 1;
+                    }
+                }
+            }
+        }
+        let confidence = if prob_n > 0 { prob_sum / prob_n as f32 } else { 0.0 };
+        Ok((text, confidence))
+    }
+}
