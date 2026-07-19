@@ -2,7 +2,13 @@
 
 Resume **meetscribe** — local-first, background macOS meeting transcriber (Granola-style, brain todo #30). State is in the auto-loaded memory `project_meetscribe.md`; plans in `plans/` (`2026-07-18-meetscribe.md` = phase roadmap §5; `2026-07-18-phase1-capture-watchdog.md` = the Phase 1 detail plan). Read both first.
 
-## Status: Phase 0 ✅ live-passed · Phase 1 (capture watchdog) — Batches 1–3 DONE + verified, Batch 4 (endurance + commit) REMAINS
+## Status: Phase 0 ✅ · Phase 1 (capture watchdog) ✅ DONE + review-hardened + PUSHED (commits 381ff8d + fce5c3e). NEXT = Phase 1.5 (multilingual model provisioning).
+
+**Phase 1 shipped 2026-07-18.** All 4 batches done; 30-min endurance passed (0 dropped, 0 watchdog false-fires, 0 panics, 25.6 min continuous single-segment capture, all segment pairs byte-aligned). `/review-branch` (13 agents) found + FIXED 2 medium correctness bugs before push: (1) rebuild() failure was fatal — now returns typed `StartError` and the drain loop retries non-fatally (a route-drop can't kill the session it's meant to save); (2) `WavStream::reset_channels()` on a rate-held rebuild so a same-rate input-device swap can't misalign channels. Skipped 2 low/conventions findings deliberately (thiserror; Diag field dedup). **Next fresh session → start Phase 1.5.** History below kept for context.
+
+---
+
+## (historical) Phase 1 build log — Batches 1–4
 
 Phase 1 makes the proven-but-fragile capture layer survive audio-route changes (headphones plug/unplug). Design: `DualCapture` splits a swappable `Option<DeviceInstance>{started,tap}` over process-stable plumbing (rings, producers in a pinned `Box<AudioContext>`, consumers, `Shared`). `rebuild()` tears down the old device and builds a fresh aggregate against the SAME rings; a Core Audio default-device listener + a mic-dry watchdog set an `Arc<AtomicBool>` that the single-threaded drain loop polls — no `!Send` handle crosses a thread.
 
