@@ -18,11 +18,28 @@ impl Speaker {
             Speaker::Others => "Others",
         }
     }
+
+    /// Lowercase token stored in the `speaker` TEXT column (matches the serde rename).
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            Speaker::You => "you",
+            Speaker::Others => "others",
+        }
+    }
+
+    /// Parse a `speaker` column value back into the enum.
+    pub fn from_sql(s: &str) -> Option<Speaker> {
+        match s {
+            "you" => Some(Speaker::You),
+            "others" => Some(Speaker::Others),
+            _ => None,
+        }
+    }
 }
 
 /// One transcribed span. Timestamps are seconds from meeting start. This is the
 /// contract Phase 3 (sqlx storage) and export will persist.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TranscriptSegment {
     pub speaker: Speaker,
     pub text: String,
@@ -57,6 +74,14 @@ mod tests {
         let order: Vec<f64> = merged.iter().map(|s| s.t_start).collect();
         assert_eq!(order, vec![0.0, 2.0, 3.0, 5.0]);
         assert_eq!(merged[1].speaker, Speaker::Others);
+    }
+
+    #[test]
+    fn speaker_sql_roundtrips() {
+        for sp in [Speaker::You, Speaker::Others] {
+            assert_eq!(Speaker::from_sql(sp.as_sql()), Some(sp));
+        }
+        assert_eq!(Speaker::from_sql("nobody"), None);
     }
 
     #[test]

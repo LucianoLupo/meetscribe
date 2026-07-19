@@ -16,6 +16,17 @@ serde_json = "1"
 # no runtime download); pulls ort (ONNX Runtime, fetched at build time).
 silero = { git = "https://github.com/emotechlab/silero-rs", rev = "26a6460", features = ["static-model"] }
 
+# Phase 3 — storage + export.
+# sqlx: plaintext SQLite (0600). tls-none is REQUIRED — sqlx errors at compile time with
+# default-features=false unless exactly one TLS backend is selected, even for local files.
+# The sqlite feature statically bundles SQLite from source (deterministic version).
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "tls-none"] }
+# tokio: DB ops only — one current-thread runtime, block_on around sqlx. Already in the tree
+# via cidre (byte/IO types), so this only selects the runtime features we call directly.
+tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
+# time: UTC date formatting for the Markdown export metadata (no local-offset — soundness footgun).
+time = { version = "0.3", features = ["formatting", "macros"] }
+
 # macOS single-aggregate capture layer.
 # cidre pinned to meetily's verified rev — the ported core_audio recipe compiles only against this API surface.
 [target.'cfg(target_os = "macos")'.dependencies]

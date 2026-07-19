@@ -19,6 +19,8 @@ mod resample;
 mod vad;
 mod asr;
 mod transcript;
+mod db;
+mod export;
 
 use anyhow::{Context, Result};
 use capture::DualCapture;
@@ -154,6 +156,10 @@ fn run_transcribe(argv: &[String]) -> Result<()> {
     let mut dir: Option<PathBuf> = None;
     let mut model = String::from("models/ggml-large-v3.bin");
     let mut lang = String::from("es");
+    let mut title: Option<String> = None;
+    let mut db_path: Option<PathBuf> = None;
+    let mut export_dir: Option<PathBuf> = None;
+    let mut no_store = false;
     let mut it = argv.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -167,8 +173,27 @@ fn run_transcribe(argv: &[String]) -> Result<()> {
                     lang = v.clone();
                 }
             }
+            "--title" | "-t" => {
+                if let Some(v) = it.next() {
+                    title = Some(v.clone());
+                }
+            }
+            "--db" => {
+                if let Some(v) = it.next() {
+                    db_path = Some(PathBuf::from(v));
+                }
+            }
+            "--export-dir" => {
+                if let Some(v) = it.next() {
+                    export_dir = Some(PathBuf::from(v));
+                }
+            }
+            "--no-store" => no_store = true,
             "-h" | "--help" => {
-                eprintln!("usage: meetscribe transcribe <dir> [--model <ggml.bin>] [--lang <code>]");
+                eprintln!(
+                    "usage: meetscribe transcribe <dir> [--title <t>] [--model <ggml.bin>] \
+                     [--lang <code>] [--db <path>] [--export-dir <dir>] [--no-store]"
+                );
                 return Ok(());
             }
             s if !s.starts_with('-') && dir.is_none() => dir = Some(PathBuf::from(s)),
@@ -176,6 +201,14 @@ fn run_transcribe(argv: &[String]) -> Result<()> {
         }
     }
     let dir = dir.context("transcribe: missing <dir> (e.g. `meetscribe transcribe capture`)")?;
+    let title = title.unwrap_or_else(|| {
+        dir.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("meeting")
+            .to_string()
+    });
+    let db_path = db_path.unwrap_or_else(default_db_path);
+    let export_dir = export_dir.unwrap_or_else(|| dir.clone());
 
     let mic_files = discover_channel(&dir, "mic");
     let sys_files = discover_channel(&dir, "system");
@@ -258,13 +291,6 @@ fn run_transcribe(argv: &[String]) -> Result<()> {
         );
     }
 
-    let json_path = dir.join("transcript.json");
-    std::fs::write(
-        &json_path,
-        serde_json::to_string_pretty(&merged).context("serialize transcript")?,
-    )
-    .with_context(|| format!("write {}", json_path.display()))?;
-
     let rtf = if meeting_secs > 0.0 { wall / meeting_secs } else { 0.0 };
     println!(
         "\nsegments: {} | meeting: {:.1}s | wall: {:.1}s | RTF: {:.3}x (both channels through whisper)",
@@ -273,6 +299,232 @@ fn run_transcribe(argv: &[String]) -> Result<()> {
         wall,
         rtf
     );
+
+    // Persist + export (Phase 3). started_at = the real meeting time (earliest capture mtime).
+    let meta = db::MeetingMeta {
+        title,
+        source_dir: dir.display().to_string(),
+        model: model_name(&model),
+        lang: lang.clone(),
+        started_at: earliest_capture_mtime(&mic_files, &sys_files),
+        duration_secs: meeting_secs,
+        created_at: now_epoch(),
+    };
+
+    let row = if no_store {
+        synth_row(&meta, merged.len())
+    } else {
+        let rt = new_runtime()?;
+        rt.block_on(async {
+            let mut database = db::Db::open(&db_path).await?;
+            let id = database.insert_meeting(&meta, &merged).await?;
+            // Round-trip check on the real read path (not just "insert didn't error").
+            let loaded = database.load_segments(id).await?;
+            if loaded == merged {
+                log::info!("DB round-trip OK: {} segments read back identical", loaded.len());
+            } else {
+                log::error!(
+                    "DB round-trip MISMATCH: stored {} vs read {}",
+                    merged.len(),
+                    loaded.len()
+                );
+            }
+            let row = database
+                .get_meeting(id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("meeting {id} vanished after insert"))?;
+            database.close().await?;
+            log::info!("stored meeting id {id} → {}", db_path.display());
+            anyhow::Ok(row)
+        })?
+    };
+
+    let (md_path, json_path) = export::write_exports(&export_dir, "transcript", &row, &merged)?;
+    println!("wrote {}", md_path.display());
+    println!("wrote {}", json_path.display());
+    Ok(())
+}
+
+/// `~/.meetscribe/meetscribe.db` (falls back to a repo-local path if `$HOME` is unset).
+fn default_db_path() -> PathBuf {
+    home_dir()
+        .map(|h| h.join(".meetscribe/meetscribe.db"))
+        .unwrap_or_else(|| PathBuf::from("meetscribe.db"))
+}
+
+/// `~/.meetscribe/exports/` (the default target for `export <id>`).
+fn default_export_dir() -> PathBuf {
+    home_dir()
+        .map(|h| h.join(".meetscribe/exports"))
+        .unwrap_or_else(|| PathBuf::from("exports"))
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
+fn now_epoch() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn file_mtime_epoch(p: &Path) -> Option<i64> {
+    let mtime = std::fs::metadata(p).ok()?.modified().ok()?;
+    mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs() as i64)
+}
+
+/// The real meeting start time = the earliest capture-WAV mtime (falls back to now).
+fn earliest_capture_mtime(mic: &[PathBuf], sys: &[PathBuf]) -> i64 {
+    mic.iter()
+        .chain(sys.iter())
+        .filter_map(|p| file_mtime_epoch(p))
+        .min()
+        .unwrap_or_else(now_epoch)
+}
+
+/// Clean model name for storage/display (`models/ggml-large-v3.bin` → `ggml-large-v3`).
+fn model_name(model: &str) -> String {
+    Path::new(model)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| model.to_string())
+}
+
+/// A `MeetingRow` for the `--no-store` export path (no DB id assigned).
+fn synth_row(meta: &db::MeetingMeta, segment_count: usize) -> db::MeetingRow {
+    db::MeetingRow {
+        id: 0,
+        title: meta.title.clone(),
+        source_dir: meta.source_dir.clone(),
+        model: meta.model.clone(),
+        lang: meta.lang.clone(),
+        started_at: meta.started_at,
+        duration_secs: meta.duration_secs,
+        segment_count: segment_count as i64,
+        created_at: meta.created_at,
+    }
+}
+
+fn new_runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime")
+}
+
+/// `meetscribe list [--db <path>]` — the stored meetings, newest first.
+fn run_list(argv: &[String]) -> Result<()> {
+    let mut db_path = default_db_path();
+    let mut it = argv.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--db" => {
+                if let Some(v) = it.next() {
+                    db_path = PathBuf::from(v);
+                }
+            }
+            "-h" | "--help" => {
+                eprintln!("usage: meetscribe list [--db <path>]");
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+    if !db_path.exists() {
+        println!("no meetings yet — db {} does not exist", db_path.display());
+        return Ok(());
+    }
+
+    let rt = new_runtime()?;
+    let meetings = rt.block_on(async {
+        let mut database = db::Db::open(&db_path).await?;
+        let m = database.list_meetings().await?;
+        database.close().await?;
+        anyhow::Ok(m)
+    })?;
+
+    if meetings.is_empty() {
+        println!("no meetings stored in {}", db_path.display());
+        return Ok(());
+    }
+    println!(
+        "{:>3}  {:<20}  {:>9}  {:>5}  TITLE",
+        "ID", "DATE", "DURATION", "SEGS"
+    );
+    for m in &meetings {
+        println!(
+            "{:>3}  {:<20}  {:>9}  {:>5}  {}",
+            m.id,
+            export::fmt_utc(m.started_at),
+            export::fmt_duration(m.duration_secs),
+            m.segment_count,
+            m.title
+        );
+    }
+    Ok(())
+}
+
+/// `meetscribe export <id> [--db <path>] [--export-dir <dir>]` — re-export from the DB.
+/// This exercises the real DB read path (round-trip proof).
+fn run_export(argv: &[String]) -> Result<()> {
+    let mut id: Option<i64> = None;
+    let mut db_path = default_db_path();
+    let mut export_dir: Option<PathBuf> = None;
+    let mut it = argv.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--db" => {
+                if let Some(v) = it.next() {
+                    db_path = PathBuf::from(v);
+                }
+            }
+            "--export-dir" => {
+                if let Some(v) = it.next() {
+                    export_dir = Some(PathBuf::from(v));
+                }
+            }
+            "-h" | "--help" => {
+                eprintln!("usage: meetscribe export <id> [--db <path>] [--export-dir <dir>]");
+                return Ok(());
+            }
+            s if !s.starts_with('-') && id.is_none() => {
+                id = Some(
+                    s.parse::<i64>()
+                        .with_context(|| format!("export: invalid id '{s}'"))?,
+                );
+            }
+            _ => {}
+        }
+    }
+    let id = id.context("export: missing <id> (e.g. `meetscribe export 1`)")?;
+    let export_dir = export_dir.unwrap_or_else(default_export_dir);
+    if !db_path.exists() {
+        anyhow::bail!("db {} does not exist — nothing to export", db_path.display());
+    }
+
+    let rt = new_runtime()?;
+    let (row, segs) = rt.block_on(async {
+        let mut database = db::Db::open(&db_path).await?;
+        let row = database
+            .get_meeting(id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no meeting with id {id} in {}", db_path.display()))?;
+        let segs = database.load_segments(id).await?;
+        database.close().await?;
+        anyhow::Ok((row, segs))
+    })?;
+
+    let (md_path, json_path) =
+        export::write_exports(&export_dir, &format!("meeting-{id}"), &row, &segs)?;
+    println!("wrote {}", md_path.display());
     println!("wrote {}", json_path.display());
     Ok(())
 }
@@ -280,11 +532,14 @@ fn run_transcribe(argv: &[String]) -> Result<()> {
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    // Subcommand dispatch: `meetscribe transcribe <dir> …`. Anything else = the capture
-    // flow (back-compatible: `meetscribe --seconds 300` still records).
+    // Subcommand dispatch. Anything unrecognized falls through to the capture flow
+    // (back-compatible: `meetscribe --seconds 300` still records).
     let argv: Vec<String> = std::env::args().collect();
-    if argv.get(1).map(String::as_str) == Some("transcribe") {
-        return run_transcribe(&argv[2..]);
+    match argv.get(1).map(String::as_str) {
+        Some("transcribe") => return run_transcribe(&argv[2..]),
+        Some("list") => return run_list(&argv[2..]),
+        Some("export") => return run_export(&argv[2..]),
+        _ => {}
     }
 
     let args = parse_args();
