@@ -164,16 +164,31 @@ pub(crate) fn run_daemon(argv: &[String]) -> Result<()> {
     );
 
     let detector = MeetingDetector::new();
+    // Consecutive capture-start failures for the currently-detected app — throttles the error log
+    // and backs off, so a persistently-denied grant doesn't spin+spam at the poll rate.
+    let mut capture_fail_streak = 0u32;
     while !SHUTDOWN.load(Ordering::SeqCst) {
         match detector.active_app() {
-            Ok(Some(app)) => {
-                record_and_process(&cfg, &app);
-                if cfg.once {
-                    log::info!("--once: processed one meeting, exiting");
-                    break;
+            Ok(Some(app)) => match record_and_process(&cfg, &app) {
+                Ok(()) => {
+                    capture_fail_streak = 0;
+                    if cfg.once {
+                        log::info!("--once: processed one meeting, exiting");
+                        break;
+                    }
                 }
-            }
-            Ok(None) => {}
+                Err(e) => {
+                    capture_fail_streak += 1;
+                    if capture_fail_streak == 1 || capture_fail_streak.is_multiple_of(20) {
+                        log::error!("{e:#} (attempt #{capture_fail_streak}; backing off)");
+                    }
+                    let backoff =
+                        (POLL_INTERVAL * capture_fail_streak.min(20)).min(Duration::from_secs(30));
+                    sleep_interruptible(backoff);
+                    continue;
+                }
+            },
+            Ok(None) => capture_fail_streak = 0,
             Err(e) => log::warn!("detector poll failed (transient): {e}"),
         }
         // Interruptible idle wait.
@@ -184,10 +199,11 @@ pub(crate) fn run_daemon(argv: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Record one meeting (`app` holds the mic), then gate + transcribe+store+export. Never returns an
-/// error — a capture/transcription failure is logged and the daemon returns to IDLE (the recovery
-/// machinery must not take down the daemon).
-fn record_and_process(cfg: &DaemonConfig, app: &str) {
+/// Record one meeting (`app` holds the mic), then gate + transcribe+store+export. Returns `Err`
+/// ONLY if capture failed to start/run — the caller throttles + backs off, so a persistently-denied
+/// grant (common on first run) doesn't spin+spam at the poll rate. A transcription failure is logged
+/// internally and returns `Ok` (the WAVs are kept); the daemon then returns to IDLE.
+fn record_and_process(cfg: &DaemonConfig, app: &str) -> Result<()> {
     let started = crate::now_epoch();
     let dir = cfg.sessions_dir.join(export::stamp_compact(started));
     let label = detect::app_label(app);
@@ -196,9 +212,10 @@ fn record_and_process(cfg: &DaemonConfig, app: &str) {
     // Stop predicate: the app released the mic for MEETING_END_DEBOUNCE, or we were signalled.
     // The detector is polled at most every DETECT_POLL_DURING_CAPTURE (the capture loop ticks far
     // faster). A transient detector error keeps the last state (don't drop a live recording).
+    // `released_since` is Some only while the app has been off the mic; it fully encodes the
+    // "released?" state (no separate bool needed).
     let detector = MeetingDetector::new();
     let mut last_poll = Instant::now();
-    let mut active = true;
     let mut released_since: Option<Instant> = None;
     let stop = move || -> bool {
         if SHUTDOWN.load(Ordering::SeqCst) {
@@ -207,27 +224,18 @@ fn record_and_process(cfg: &DaemonConfig, app: &str) {
         if last_poll.elapsed() >= DETECT_POLL_DURING_CAPTURE {
             last_poll = Instant::now();
             match detector.active_app() {
-                Ok(Some(_)) => {
-                    active = true;
-                    released_since = None;
-                }
+                Ok(Some(_)) => released_since = None,
                 Ok(None) => {
-                    active = false;
                     released_since.get_or_insert_with(Instant::now);
                 }
                 Err(_) => {}
             }
         }
-        !active && released_since.is_some_and(|s| s.elapsed() >= MEETING_END_DEBOUNCE)
+        released_since.is_some_and(|s| s.elapsed() >= MEETING_END_DEBOUNCE)
     };
 
-    let summary = match session::run_capture(&dir, stop, None) {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!("capture failed for {label} ({}): {e} — returning to idle", dir.display());
-            return;
-        }
-    };
+    let summary = session::run_capture(&dir, stop, None)
+        .with_context(|| format!("capture failed for {label} ({})", dir.display()))?;
     log::info!(
         "meeting ended — {label}: captured {:.1}s ({} segment file(s), {} dropped)",
         summary.duration_secs,
@@ -242,12 +250,12 @@ fn record_and_process(cfg: &DaemonConfig, app: &str) {
             cfg.min_secs,
             dir.display()
         );
-        return;
+        return Ok(());
     }
 
     if SHUTDOWN.load(Ordering::SeqCst) {
         log::info!("shutdown requested — WAVs kept at {}, skipping transcription", dir.display());
-        return;
+        return Ok(());
     }
 
     let opts = pipeline::PipelineOpts {
@@ -268,6 +276,7 @@ fn record_and_process(cfg: &DaemonConfig, app: &str) {
         ),
         Err(e) => log::error!("transcription failed for {} — WAVs kept: {e}", dir.display()),
     }
+    Ok(())
 }
 
 /// Sleep in small slices so a signal breaks the idle wait promptly (SIGTERM → clean shutdown).
