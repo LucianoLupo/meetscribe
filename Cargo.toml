@@ -14,3 +14,10 @@ hound = "3.5"
 [target.'cfg(target_os = "macos")'.dependencies]
 cidre = { git = "https://github.com/yury/cidre", rev = "a9587fa", features = ["av"] }
 ringbuf = "0.4.8"
+# ASR engine. Metal is the always-on baseline; CoreML is gated behind our `coreml`
+# feature (see [features]) so a broken CoreML build can never block the metal path.
+whisper-rs = { version = "0.13.2", features = ["raw-api", "metal"] }
+
+[features]
+default = []
+coreml = ["whisper-rs/coreml"]

@@ -2,9 +2,20 @@
 
 Resume **meetscribe** — local-first, background macOS meeting transcriber (Granola-style, brain todo #30). State is in the auto-loaded memory `project_meetscribe.md`; plans in `plans/` (`2026-07-18-meetscribe.md` = phase roadmap §5; `2026-07-18-phase1-capture-watchdog.md` = the Phase 1 detail plan). Read both first.
 
-## Status: Phase 0 ✅ · Phase 1 (capture watchdog) ✅ DONE + review-hardened + PUSHED (commits 381ff8d + fce5c3e). NEXT = Phase 1.5 (multilingual model provisioning).
+## Status: Phase 0 ✅ · Phase 1 ✅ · Phase 1.5 (model provisioning) ✅ DONE. NEXT = Phase 2 (silero_rs VAD + whisper-rs per channel).
 
-**Phase 1 shipped 2026-07-18.** All 4 batches done; 30-min endurance passed (0 dropped, 0 watchdog false-fires, 0 panics, 25.6 min continuous single-segment capture, all segment pairs byte-aligned). `/review-branch` (13 agents) found + FIXED 2 medium correctness bugs before push: (1) rebuild() failure was fatal — now returns typed `StartError` and the drain loop retries non-fatally (a route-drop can't kill the session it's meant to save); (2) `WavStream::reset_channels()` on a rate-held rebuild so a same-rate input-device swap can't misalign channels. Skipped 2 low/conventions findings deliberately (thiserror; Diag field dedup). **Next fresh session → start Phase 1.5.** History below kept for context.
+**Phase 1.5 shipped 2026-07-19.** Provisioned the biggest/best multilingual model = full **`large-v3`** (Spanish meetings). `models/provision.sh` = deliberate, sha256-verified, idempotent download of `ggml-large-v3.bin` (2.9 GB) + the pre-converted CoreML encoder (1.2 GB) from the official whisper.cpp HF repo — NO silent runtime download (zero-telemetry). `whisper-rs 0.13.2` introduced (`Cargo.toml`, macOS block, features `raw-api,metal` + a `[features] coreml` toggle); `src/bin/rtf_probe.rs` measures RTF through the real engine. **Verified on the real 5-min Spanish `capture/system.wav` (M1 Pro):** whisper-rs metal build clean; **metal-only RTF 0.399×**; **metal+CoreML warm RTF 0.194× (~2×)** with a one-time ~23-min ANE compile that then caches; transcripts equivalent + clearly better than the `small` reference. Details + numbers + the "pre-warm CoreML at provisioning so a live meeting never eats the compile" note = `models/PROVISIONING.md`. Model paths: `models/ggml-large-v3.bin` + `models/ggml-large-v3-encoder.mlmodelc/` (side-by-side, gitignored). Detail plan = `plans/2026-07-18-phase1.5-model-provisioning.md`.
+
+### Phase 2 pickup notes
+- whisper-rs API used (0.13.2): `WhisperContext::new_with_params(&str, WhisperContextParameters::default())` → `create_state()` → `state.full(FullParams, &[f32])`; read via `full_n_segments()/full_get_segment_text(i)/full_get_segment_t0|t1(i)` (t0/t1 = centiseconds). `full()` wants **16 kHz mono f32**. `rtf_probe.rs` is the working reference.
+- CoreML toggles via `--features coreml` (auto-loads `models/ggml-large-v3-encoder.mlmodelc` beside the `.bin`); v1 runtime default (metal vs coreml) is a Phase-2 decision — see PROVISIONING.md recommendation.
+- Capture writes native-rate WAVs; Phase 2 owns the 48 kHz→16 kHz rubato resample before `full()` (the probe rejects non-16 kHz on purpose).
+
+---
+
+## (historical) Phase 1 — capture watchdog ✅ (commits 381ff8d + fce5c3e)
+
+**Phase 1 shipped 2026-07-18.** All 4 batches done; 30-min endurance passed (0 dropped, 0 watchdog false-fires, 0 panics, 25.6 min continuous single-segment capture, all segment pairs byte-aligned). `/review-branch` (13 agents) found + FIXED 2 medium correctness bugs before push: (1) rebuild() failure was fatal — now returns typed `StartError` and the drain loop retries non-fatally (a route-drop can't kill the session it's meant to save); (2) `WavStream::reset_channels()` on a rate-held rebuild so a same-rate input-device swap can't misalign channels. Skipped 2 low/conventions findings deliberately (thiserror; Diag field dedup). History below kept for context.
 
 ---
 

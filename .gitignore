@@ -3,3 +3,9 @@
 # Captured meeting audio — NEVER commit (private recordings)
 /capture
 *.wav
+
+# ASR model artifacts — large binaries, provisioned via models/provision.sh
+/models/*.bin
+/models/*.mlmodelc/
+/models/*.zip
+/models/__MACOSX/
