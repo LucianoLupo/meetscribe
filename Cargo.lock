@@ -958,6 +958,7 @@ dependencies = [
  "cidre",
  "env_logger",
  "hound",
+ "libc",
  "log",
  "ringbuf",
  "rubato 0.15.0",

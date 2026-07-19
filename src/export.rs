@@ -47,6 +47,15 @@ pub fn fmt_utc(epoch: i64) -> String {
         .unwrap_or_else(|| format!("epoch {epoch}"))
 }
 
+/// `YYYYMMDD-HHMMSS` (UTC) from a unix epoch — a filesystem-safe session directory name.
+pub fn stamp_compact(epoch: i64) -> String {
+    let fmt = format_description!("[year][month][day]-[hour][minute][second]");
+    OffsetDateTime::from_unix_timestamp(epoch)
+        .ok()
+        .and_then(|dt| dt.format(&fmt).ok())
+        .unwrap_or_else(|| format!("{epoch}"))
+}
+
 /// Pretty JSON — identical to the pipeline's transcript.json shape.
 pub fn to_json(segs: &[TranscriptSegment]) -> Result<String> {
     serde_json::to_string_pretty(segs).context("serialize transcript json")
