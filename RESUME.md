@@ -2,7 +2,23 @@
 
 Resume **meetscribe** — local-first, background macOS meeting transcriber (Granola-style, brain todo #30). State is in the auto-loaded memory `project_meetscribe.md`; plans in `plans/` (`2026-07-18-meetscribe.md` = phase roadmap §5; `2026-07-18-phase1-capture-watchdog.md` = the Phase 1 detail plan). Read both first.
 
-## Status: Phases 0 · 1 · 1.5 · 2 · 3 · **4** all ✅ DONE. **Phase 4 committed to `master` (`b03503a`) — NOT pushed** (`origin/master`=`6655410`, 2 commits ahead). NEXT = Phase 5 (control surface + polish, plan §5): tray menu (status/pause/quit), a versioned config file (top-level `version`, warn-and-default on unknown keys — SUBSUMES the hardcoded detector allowlist + would add a user override), CoreML pre-warm at provisioning, disk/log hygiene.
+## Status: Phases 0 · 1 · 1.5 · 2 · 3 · 4 · **5** all ✅ DONE. **Phase 5 committed to `master` (`a83af1b`) — NOT pushed** (`origin/master`=`6655410`, **4 commits ahead**). v1 scope (transcripts-only, on-device, background) is COMPLETE.
+
+### Two deploy-time steps — USER's to time (NOT done unprompted)
+1. **Push** master (4 ahead of origin) — your call.
+2. **Reinstall the live daemon** so it picks up the Phase-5 code (status.json / config / hygiene): `cargo build` + re-sign + `./target/debug/meetscribe install`. This boots out the RUNNING daemon (pid was 2567, old code) — do it when NOT mid-meeting. Until then the live daemon runs Phase-4 code and won't write status.json (so the tray shows "daemon stopped").
+3. **(still pending from Phase 4)** the automatic-natural-end real-call verify — needs you on a real meeting.
+
+### Phase 5 DONE (2026-07-19, commit `a83af1b`) — control surface + polish
+Plan = `plans/2026-07-19-phase5-control-surface.md`. Decisions: tray = SEPARATE PROCESS (daemon untouched); CoreML prewarm = DOC-ONLY (daemon is metal-only). `/review-branch` (12 agents): 8 raw → 5 confirmed (all convention/simplicity, NO correctness bugs) → all fixed. 35 unit tests, clippy clean.
+- **`src/config.rs`** — versioned `~/.meetscribe/config.toml` (the ONLY control surface for the flagless launchd daemon). `Config::load` = PURE read (no writes — `detect` won't materialize it); `Config::load_or_init` = writes the commented template on first run (daemon only). Unknown keys captured via serde `flatten` + WARNED; newer-version warns. Fields: `[detector] allowlist_extra` + `use_builtin_allowlist`, `[daemon] lang`+`min_secs`, `[retention] sessions_days`+`log_max_mb`. Daemon precedence = flag > config > default. `effective_allowlist()` = builtins ∪ extras (deduped). New `config_path(base)` helper.
+- **`src/maintenance.rs`** — prune session dirs older than `sessions_days` (0=keep forever, safe default); rotate the daemon log over `log_max_mb` via **COPYTRUNCATE** (copy→`.1`, truncate in place — rename would strand launchd's held O_APPEND fd). Runs at daemon startup + once/day.
+- **`src/status.rs`** — daemon↔tray IPC: `status.json` (daemon writes on state change; atomic temp+rename) + `paused` flag file. `is_paused()`, `Status::{read,write}`.
+- **`src/tray.rs`** — `meetscribe tray` = SEPARATE menu-bar process (tao 0.35 + tray-icon 0.24, macOS-gated; Accessory = no Dock icon). Polls status.json (1s), coloured dot (green/red/amber/gray), menu = Pause/Resume (toggles `paused`), Open recordings/config, Stop daemon. NEVER touches audio → zero risk to capture.
+- **`src/daemon.rs`** — loads config (`load_or_init`), builds effective allowlist, publishes status.json on transitions, honors the `paused` flag (skips STARTING new recordings; in-progress finishes), runs hygiene at startup+daily.
+- **`src/detect.rs`** — `MeetingDetector::with_allowlist(Vec<String>)` (dead `new()`/`Default` removed); `detect` CLI mirrors the config allowlist via the pure `load`.
+- **Deps:** `toml` 0.8; `tao` 0.35 + `tray-icon` 0.24 (macOS target block). **CoreML prewarm** = opt-in doc in `models/PROVISIONING.md` (no subcommand — daemon is metal-only). Ops updated in `docs/DAEMON.md` (Configure + Tray sections).
+- **VERIFIED:** 35 unit tests; config write/read/unknown-key/version + load-vs-load_or_init driven; hygiene (prune + copytruncate) driven on a real daemon; status.json idle→paused→idle + clean SIGTERM driven on a real daemon; tray smoke-tested (builds menu-bar item on main thread, loop runs, reads status, no panic). **NOT driven (user's):** the tray's VISUAL/interactive UX (icon renders + color-changes, menu clicks fire) — needs eyes on the menu bar; the `recording`-state status publish (covered by the real-call verify).
 
 ### Phase 4 DONE (2026-07-19, commits `d402821` + review-fix `b03503a`) — auto-detect + launchd daemon
 **meetscribe now auto-records meetings at login** (LaunchAgent `com.lucianolupo.meetscribe` LIVE). An allowlisted app taking the mic → capture via `DualCapture` → on release → finalize → transcribe → store + export. Plan = `plans/2026-07-19-phase4-daemon.md` (revised post `/audit-plan`); ops = `docs/DAEMON.md`.
