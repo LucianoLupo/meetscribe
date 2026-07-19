@@ -2,12 +2,12 @@
 
 Resume **meetscribe** — local-first, background macOS meeting transcriber (Granola-style, brain todo #30). State is in the auto-loaded memory `project_meetscribe.md`; plans in `plans/` (`2026-07-18-meetscribe.md` = phase roadmap §5; `2026-07-18-phase1-capture-watchdog.md` = the Phase 1 detail plan). Read both first.
 
-## Status: Phases 0 · 1 · 1.5 · 2 · 3 · 4 · **5** all ✅ DONE. **Phase 5 committed to `master` (`a83af1b`) — NOT pushed** (`origin/master`=`6655410`, **4 commits ahead**). v1 scope (transcripts-only, on-device, background) is COMPLETE.
+## Status: Phases 0 · 1 · 1.5 · 2 · 3 · 4 · **5** all ✅ DONE + **SHIPPED**. `master` = `32544a7`, **pushed** to `origin/master` (2026-07-19). v1 scope (transcripts-only, on-device, background) is COMPLETE.
 
-### Two deploy-time steps — USER's to time (NOT done unprompted)
-1. **Push** master (4 ahead of origin) — your call.
-2. **Reinstall the live daemon** so it picks up the Phase-5 code (status.json / config / hygiene): `cargo build` + re-sign + `./target/debug/meetscribe install`. This boots out the RUNNING daemon (pid was 2567, old code) — do it when NOT mid-meeting. Until then the live daemon runs Phase-4 code and won't write status.json (so the tray shows "daemon stopped").
-3. **(still pending from Phase 4)** the automatic-natural-end real-call verify — needs you on a real meeting.
+### Deploy steps — DONE 2026-07-19
+1. ✅ **Pushed** master → `origin/master` (`6655410..32544a7`, 5 commits: Phase 4 + Phase 5 + docs).
+2. ✅ **Reinstalled the live daemon** onto Phase-5 code: `cargo build` (metal-only) → re-sign (frozen identity) → `install`. Old daemon (pid 2567) booted out cleanly; **new daemon pid 64375** now runs the Phase-5 binary, writes `~/.meetscribe/config.toml` + `~/.meetscribe/status.json`, honors `paused`, runs hygiene. Stable copy re-signed with `com.lucianolupo.meetscribe` / Team `L634X3YJBF` — TCC grant preserved.
+3. ⏳ **STILL PENDING (user's, needs a live call):** the automatic natural-end real-call verify — mic-release → 10s debounce → auto-transcribe → store → `meetscribe list`; and the tray's VISUAL/interactive UX (`meetscribe tray`: dot green→red→green, Pause/Resume). Tail `~/.meetscribe/logs/meetscribe.err.log` during a real meeting.
 
 ### Phase 5 DONE (2026-07-19, commit `a83af1b`) — control surface + polish
 Plan = `plans/2026-07-19-phase5-control-surface.md`. Decisions: tray = SEPARATE PROCESS (daemon untouched); CoreML prewarm = DOC-ONLY (daemon is metal-only). `/review-branch` (12 agents): 8 raw → 5 confirmed (all convention/simplicity, NO correctness bugs) → all fixed. 35 unit tests, clippy clean.
