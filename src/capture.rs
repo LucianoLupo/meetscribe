@@ -479,7 +479,7 @@ mod imp {
         /// into the SAME rings (the same producers in `self.ctx`). `self.mic_cons`/`tap_cons`
         /// are untouched, so the drain loop + WAV writers continue. MUST be called on the
         /// thread that owns `self` (Core Audio handles are `!Send`; none crosses a boundary).
-        pub fn rebuild(&mut self) -> Result<RebuildOutcome> {
+        pub fn rebuild(&mut self) -> Result<RebuildOutcome, StartError> {
             let t0 = Instant::now();
             // RAII teardown FIRST — dropping the old instance stops the IO proc (so the RT
             // thread stops touching self.ctx) BEFORE we reuse ctx for the new proc.
@@ -582,7 +582,7 @@ pub use imp::DualCapture;
 #[cfg(not(target_os = "macos"))]
 mod stub {
     use super::{RebuildOutcome, StartError};
-    use anyhow::{Result, bail};
+    use anyhow::Result;
 
     // Field parity with the macOS impl so main.rs compiles cross-platform.
     pub struct DualCapture {
@@ -597,8 +597,8 @@ mod stub {
         pub fn start() -> Result<Self, StartError> {
             Err(StartError::Other("meetscribe capture is macOS-only".into()))
         }
-        pub fn rebuild(&mut self) -> Result<RebuildOutcome> {
-            bail!("meetscribe capture is macOS-only")
+        pub fn rebuild(&mut self) -> Result<RebuildOutcome, StartError> {
+            Err(StartError::Other("meetscribe capture is macOS-only".into()))
         }
         #[must_use]
         pub fn rebuild_requested(&self) -> bool {

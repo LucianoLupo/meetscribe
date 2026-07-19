@@ -135,6 +135,9 @@ fn main() -> Result<()> {
         .rebuild_after
         .map(|s| started_at + Duration::from_secs(s));
     let mut rebuilds = 0u32;
+    // Consecutive failed rebuild attempts (transient route-transition failures). A rebuild
+    // failure is NEVER fatal — we re-arm and retry rather than tear down a live recording.
+    let mut rebuild_failures = 0u32;
     // A single physical route change emits a BURST of HAL notifications; wait for the route
     // to settle before rebuilding once, so we don't spawn empty micro-segments.
     const REBUILD_SETTLE: Duration = Duration::from_millis(500);
@@ -203,70 +206,95 @@ fn main() -> Result<()> {
 
             let mic_before = mic_w.written();
             let sys_before = sys_w.written();
-            let out = cap.rebuild().context("rebuild capture device")?;
-            rebuilds += 1;
-            mic_last_seen = Instant::now(); // fresh watchdog window for the new device
 
-            if out.rate_changed {
-                // The new device couldn't hold the original rate → the fixed-header WAV
-                // can't continue. Finalize the current segment, roll to a fresh pair at the
-                // new rate, and record the boundary + gap in the manifest.
-                let (mn, mr, mp) = std::mem::replace(
-                    &mut mic_w,
-                    WavStream::create(
-                        &segment_path(&args.out_dir, "mic", segment + 1),
-                        out.actual_rate,
-                    )
-                    .context("open rolled mic segment")?,
-                )
-                .finalize()
-                .context("finalize rolled mic segment")?;
-                let (sn, sr, sp) = std::mem::replace(
-                    &mut sys_w,
-                    WavStream::create(
-                        &segment_path(&args.out_dir, "system", segment + 1),
-                        out.actual_rate,
-                    )
-                    .context("open rolled system segment")?,
-                )
-                .finalize()
-                .context("finalize rolled system segment")?;
-                report("mic seg (rolled)   ", &mic_path, mn, mr, mp, rate);
-                report("system seg (rolled)", &sys_path, sn, sr, sp, rate);
+            // A rebuild failure is NEVER fatal. `rebuild()` fails on exactly the transient
+            // operations (default input / process tap / aggregate assembly) that are most
+            // likely to hiccup DURING a route change — the moment we rebuild. Killing the
+            // session here would make the recovery machinery destroy what it exists to save.
+            // So: log the classified remedy, re-arm the settle timer, and retry on a later
+            // tick. `cap.device` is left None by a failed rebuild and recovers on a retry.
+            match cap.rebuild() {
+                Err(e) => {
+                    rebuild_failures += 1;
+                    if rebuild_failures == 1 || rebuild_failures.is_multiple_of(20) {
+                        log::warn!(
+                            "rebuild failed — {e} (capture paused; retry #{rebuild_failures})"
+                        );
+                    }
+                    rebuild_pending_since = Some(Instant::now());
+                    mic_last_seen = Instant::now();
+                }
+                Ok(out) => {
+                    rebuilds += 1;
+                    rebuild_failures = 0;
+                    mic_last_seen = Instant::now(); // fresh watchdog window for the new device
 
-                segment += 1;
-                mic_path = segment_path(&args.out_dir, "mic", segment);
-                sys_path = segment_path(&args.out_dir, "system", segment);
-                let old_rate = rate;
-                rate = out.actual_rate;
-                log::warn!(
-                    "GAP MARKER rebuild #{rebuilds}: rate {old_rate}→{rate} Hz, \
-                     ~{} frame gap → ROLLED to segment {segment}",
-                    out.gap_frames
-                );
-                append_manifest(
-                    &args.out_dir,
-                    &format!(
-                        "seg {segment} mic={} system={} rate={rate} gap_frames={} \
-                         prev_rate={old_rate} reason=route_change",
-                        mic_path.display(),
-                        sys_path.display(),
-                        out.gap_frames,
-                    ),
-                );
-            } else {
-                // Rate held → the same files continue. Pad BOTH channels with equal silence
-                // for the gap so they stay aligned to each other and the timeline stays
-                // ~wall-clock-consistent.
-                mic_w.write_silence(out.gap_frames);
-                sys_w.write_silence(out.gap_frames);
-                log::info!(
-                    "GAP MARKER rebuild #{rebuilds}: padded {} silence frames into both \
-                     channels at ~{rate} Hz (mic {mic_before}→{}, system {sys_before}→{})",
-                    out.gap_frames,
-                    mic_w.written(),
-                    sys_w.written(),
-                );
+                    if out.rate_changed {
+                        // The new device couldn't hold the original rate → the fixed-header WAV
+                        // can't continue. Finalize the current segment, roll to a fresh pair at
+                        // the new rate, and record the boundary + gap in the manifest.
+                        let (mn, mr, mp) = std::mem::replace(
+                            &mut mic_w,
+                            WavStream::create(
+                                &segment_path(&args.out_dir, "mic", segment + 1),
+                                out.actual_rate,
+                            )
+                            .context("open rolled mic segment")?,
+                        )
+                        .finalize()
+                        .context("finalize rolled mic segment")?;
+                        let (sn, sr, sp) = std::mem::replace(
+                            &mut sys_w,
+                            WavStream::create(
+                                &segment_path(&args.out_dir, "system", segment + 1),
+                                out.actual_rate,
+                            )
+                            .context("open rolled system segment")?,
+                        )
+                        .finalize()
+                        .context("finalize rolled system segment")?;
+                        report("mic seg (rolled)   ", &mic_path, mn, mr, mp, rate);
+                        report("system seg (rolled)", &sys_path, sn, sr, sp, rate);
+
+                        segment += 1;
+                        mic_path = segment_path(&args.out_dir, "mic", segment);
+                        sys_path = segment_path(&args.out_dir, "system", segment);
+                        let old_rate = rate;
+                        rate = out.actual_rate;
+                        log::warn!(
+                            "GAP MARKER rebuild #{rebuilds}: rate {old_rate}→{rate} Hz, \
+                             ~{} frame gap → ROLLED to segment {segment}",
+                            out.gap_frames
+                        );
+                        append_manifest(
+                            &args.out_dir,
+                            &format!(
+                                "seg {segment} mic={} system={} rate={rate} gap_frames={} \
+                                 prev_rate={old_rate} reason=route_change",
+                                mic_path.display(),
+                                sys_path.display(),
+                                out.gap_frames,
+                            ),
+                        );
+                    } else {
+                        // Rate held → the same files continue. A rate-held rebuild can still
+                        // have SWAPPED the input device, so re-latch each WavStream's channel
+                        // count before padding — otherwise a device with a different channel
+                        // count would be downmixed with the stale divisor and misalign the
+                        // channels. Then pad BOTH channels with equal silence for the gap.
+                        mic_w.reset_channels();
+                        sys_w.reset_channels();
+                        mic_w.write_silence(out.gap_frames);
+                        sys_w.write_silence(out.gap_frames);
+                        log::info!(
+                            "GAP MARKER rebuild #{rebuilds}: padded {} silence frames into both \
+                             channels at ~{rate} Hz (mic {mic_before}→{}, system {sys_before}→{})",
+                            out.gap_frames,
+                            mic_w.written(),
+                            sys_w.written(),
+                        );
+                    }
+                }
             }
         }
 
@@ -371,6 +399,15 @@ impl WavStream {
             self.peak = self.peak.max(mono.abs());
         }
         self.pending.drain(..full);
+    }
+
+    /// Forget the latched channel count so the next `write` re-latches from the (possibly
+    /// new) device. Called on a rate-held rebuild in case the input device swapped to a
+    /// different channel count. Drops any sub-frame remainder (< old channels) to avoid
+    /// mixing the old and new channel layouts across the boundary.
+    fn reset_channels(&mut self) {
+        self.channels = 0;
+        self.pending.clear();
     }
 
     /// Write `frames` mono zero-samples — used to pad a rebuild gap equally into both
