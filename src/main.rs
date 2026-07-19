@@ -24,6 +24,7 @@ use anyhow::{Context, Result};
 use capture::DualCapture;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -91,6 +92,42 @@ fn read_wav_any_rate(path: &Path) -> Result<(Vec<f32>, u32)> {
     Ok((samples, spec.sample_rate))
 }
 
+/// Parse `segments.txt` lines into `segment index → inter-segment gap (seconds)`.
+/// Each roll line is `seg <N> mic=… system=… rate=<r> gap_frames=<g> …`; the gap is
+/// the silence the capture layer recorded at the boundary *before* segment N.
+fn parse_segment_gaps(content: &str) -> HashMap<u32, f64> {
+    let mut gaps = HashMap::new();
+    for line in content.lines() {
+        let (mut seg, mut rate, mut gap) = (None, None, None);
+        let mut toks = line.split_whitespace();
+        while let Some(t) = toks.next() {
+            if t == "seg" {
+                seg = toks.next().and_then(|s| s.parse::<u32>().ok());
+            } else if let Some(r) = t.strip_prefix("rate=") {
+                rate = r.parse::<u32>().ok();
+            } else if let Some(g) = t.strip_prefix("gap_frames=") {
+                gap = g.parse::<u64>().ok();
+            }
+        }
+        if let (Some(n), Some(r), Some(g)) = (seg, rate, gap)
+            && r > 0
+        {
+            gaps.insert(n, g as f64 / r as f64);
+        }
+    }
+    gaps
+}
+
+fn read_segment_gaps(dir: &Path) -> Result<HashMap<u32, f64>> {
+    let path = dir.join("segments.txt");
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let content =
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    Ok(parse_segment_gaps(&content))
+}
+
 /// Ordered segment files for a channel base ("mic"/"system"): base.wav, base.001.wav, …
 fn discover_channel(dir: &Path, base: &str) -> Vec<PathBuf> {
     let mut files = Vec::new();
@@ -153,6 +190,9 @@ fn run_transcribe(argv: &[String]) -> Result<()> {
     );
 
     let asr = asr::Asr::load(&model).with_context(|| format!("load model {model}"))?;
+    // Inter-segment gaps the capture layer recorded on rate-roll boundaries (empty for the
+    // common single-segment case). Both channels share the same manifest.
+    let gaps = read_segment_gaps(&dir)?;
 
     let t0 = Instant::now();
     let mut segs: Vec<transcript::TranscriptSegment> = Vec::new();
@@ -162,10 +202,13 @@ fn run_transcribe(argv: &[String]) -> Result<()> {
         (&mic_files, transcript::Speaker::You),
         (&sys_files, transcript::Speaker::Others),
     ] {
-        // Multi-segment (rate-roll) offset: cumulative prior-segment duration. Rebuild gaps
-        // (sub-second, recorded only in segments.txt) are ignored — single-segment is the norm.
+        // Multi-segment (rate-roll) absolute-time offset = cumulative prior-segment duration
+        // + the recorded inter-segment gap before each rolled segment (segments.txt).
         let mut offset = 0.0f64;
-        for path in files {
+        for (i, path) in files.iter().enumerate() {
+            if i >= 1 {
+                offset += gaps.get(&(i as u32)).copied().unwrap_or(0.0);
+            }
             let (samples, rate) = read_wav_any_rate(path)?;
             let audio16 = resample::to_16k_mono(&samples, rate)
                 .with_context(|| format!("resample {}", path.display()))?;
@@ -648,4 +691,29 @@ fn report(label: &str, path: &Path, n: usize, rms: f32, peak: f32, rate: u32) {
         "{label}: {n} samples, {secs:.1}s, RMS={rms:.5}, peak={peak:.5} → {verdict}  [{}]",
         path.display()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn segment_gaps_parse_from_manifest_lines() {
+        // Real manifest shape: `seg N mic=… system=… rate=<r> gap_frames=<g> prev_rate=… reason=…`
+        let content = "\
+seg 1 mic=capture/mic.001.wav system=capture/system.001.wav rate=48000 gap_frames=4800 prev_rate=16000 reason=route_change
+seg 2 mic=capture/mic.002.wav system=capture/system.002.wav rate=16000 gap_frames=1600 prev_rate=48000 reason=route_change";
+        let gaps = parse_segment_gaps(content);
+        assert_eq!(gaps.len(), 2);
+        assert!((gaps[&1] - 0.1).abs() < 1e-9, "4800/48000 = 0.1 s"); // gap before seg 1
+        assert!((gaps[&2] - 0.1).abs() < 1e-9, "1600/16000 = 0.1 s"); // gap before seg 2
+    }
+
+    #[test]
+    fn segment_gaps_empty_and_malformed_are_safe() {
+        assert!(parse_segment_gaps("").is_empty());
+        assert!(parse_segment_gaps("garbage line without fields").is_empty());
+        // rate=0 must not divide-by-zero into the map
+        assert!(parse_segment_gaps("seg 1 rate=0 gap_frames=100").is_empty());
+    }
 }

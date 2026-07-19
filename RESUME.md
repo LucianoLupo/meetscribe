@@ -8,7 +8,7 @@ Resume **meetscribe** — local-first, background macOS meeting transcriber (Gra
 
 ### Phase 3 pickup notes
 - `TranscriptSegment` (`src/transcript.rs`, serde-derived) is the storage contract → persist to sqlx SQLite (`meetings`, `transcript_segments`, 0600). `transcript::merge` already produces the time-ordered list; export = Markdown + JSON per meeting (JSON already emitted).
-- `transcribe` subcommand orchestration is in `main.rs` (`run_transcribe`); it reads the capture WAV contract (single-segment first-class; multi-segment rate-roll handled by cumulative offset, gaps ignored — not driven live yet).
+- `transcribe` subcommand orchestration is in `main.rs` (`run_transcribe`); reads the capture WAV contract (single-segment first-class; multi-segment rate-roll handled by cumulative offset **+ `segments.txt` `gap_frames` now honored** via `parse_segment_gaps` — review fix; parser unit-tested, multi-segment path not driven live yet).
 - CoreML: `transcribe` runs metal-only by default; a `--features coreml` build uses the (now warm) ANE cache for ~2× — wire a runtime toggle in Phase 3/5.
 - silero VadConfig = crate defaults (meetily's tuned config wasn't recoverable); tune later if VAD over/under-segments.
 
