@@ -22,6 +22,10 @@ mod session;
 mod pipeline;
 mod daemon;
 mod launchd;
+mod config;
+mod maintenance;
+mod status;
+mod tray;
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -152,17 +156,23 @@ fn run_transcribe(argv: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `~/.meetscribe` — the app's data/config directory (`None` if `$HOME` is unset). The single
+/// owner of the base-dir join; the daemon/launchd build their own validated-absolute variant.
+pub(crate) fn base_dir() -> Option<PathBuf> {
+    home_dir().map(|h| h.join(".meetscribe"))
+}
+
 /// `~/.meetscribe/meetscribe.db` (falls back to a repo-local path if `$HOME` is unset).
 pub(crate) fn default_db_path() -> PathBuf {
-    home_dir()
-        .map(|h| h.join(".meetscribe/meetscribe.db"))
+    base_dir()
+        .map(|b| b.join("meetscribe.db"))
         .unwrap_or_else(|| PathBuf::from("meetscribe.db"))
 }
 
 /// `~/.meetscribe/exports/` (the default target for `export <id>`).
 pub(crate) fn default_export_dir() -> PathBuf {
-    home_dir()
-        .map(|h| h.join(".meetscribe/exports"))
+    base_dir()
+        .map(|b| b.join("exports"))
         .unwrap_or_else(|| PathBuf::from("exports"))
 }
 
@@ -300,9 +310,22 @@ fn run_export(argv: &[String]) -> Result<()> {
 /// while a real meeting app holds the mic (Active) vs while only music plays (Idle).
 fn run_detect(argv: &[String]) -> Result<()> {
     let watch = argv.iter().any(|a| a == "--watch" || a == "-w");
+    // Mirror the daemon: honor ~/.meetscribe/config.toml so `detect` shows what the daemon sees.
+    // Uses the PURE `Config::load` (no disk writes) — a diagnostic must not materialize config.
+    let base = base_dir();
+    let allowlist: Vec<String> = base
+        .as_deref()
+        .map(|b| config::Config::load(b).effective_allowlist())
+        .unwrap_or_else(|| {
+            detect::DEFAULT_ALLOWLIST
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect()
+        });
+    let al: Vec<&str> = allowlist.iter().map(String::as_str).collect();
     loop {
         let snap = detect::snapshot()?;
-        let active = detect::active_app_in(&snap, detect::DEFAULT_ALLOWLIST);
+        let active = detect::active_app_in(&snap, &al);
         match &active {
             Some(app) => println!("MEETING ACTIVE — {app} holds the mic  ({} processes)", snap.len()),
             None => println!("idle — no allowlisted app holds the mic  ({} processes)", snap.len()),
@@ -314,10 +337,10 @@ fn run_detect(argv: &[String]) -> Result<()> {
             if !p.input && !p.output {
                 continue;
             }
-            let al = detect::is_allowlisted(bid, detect::DEFAULT_ALLOWLIST);
+            let allowed = detect::is_allowlisted(bid, &al);
             println!(
                 "  {:<42} input={:<5} output={:<5} allowlisted={}",
-                bid, p.input, p.output, al
+                bid, p.input, p.output, allowed
             );
         }
         if !watch {
@@ -341,6 +364,7 @@ fn main() -> Result<()> {
         Some("export") => return run_export(&argv[2..]),
         Some("detect") => return run_detect(&argv[2..]),
         Some("daemon") => return daemon::run_daemon(&argv[2..]),
+        Some("tray") => return tray::run_tray(&argv[2..]),
         Some("install") => return launchd::run_install(&argv[2..]),
         Some("uninstall") => return launchd::run_uninstall(&argv[2..]),
         _ => {}

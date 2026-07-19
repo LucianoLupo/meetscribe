@@ -84,24 +84,24 @@ pub fn active_app_in(snapshot: &[ProcAudio], allowlist: &[&str]) -> Option<Strin
 }
 
 /// Poll the audio HAL for the allowlisted app currently holding the mic (the meeting signal).
-pub struct MeetingDetector;
-
-impl Default for MeetingDetector {
-    fn default() -> Self {
-        Self::new()
-    }
+/// Holds the effective allowlist (built-ins ∪ user config extras) so the daemon honors
+/// `~/.meetscribe/config.toml`.
+pub struct MeetingDetector {
+    allowlist: Vec<String>,
 }
 
 impl MeetingDetector {
+    /// A detector over an explicit (config-derived) allowlist.
     #[must_use]
-    pub fn new() -> Self {
-        Self
+    pub fn with_allowlist(allowlist: Vec<String>) -> Self {
+        Self { allowlist }
     }
 
     /// The allowlisted app currently holding the mic, or `None`. `Err` only on a HAL failure to
     /// enumerate processes (transient — the caller keeps polling).
     pub fn active_app(&self) -> anyhow::Result<Option<String>> {
-        Ok(active_app_in(&snapshot()?, DEFAULT_ALLOWLIST))
+        let al: Vec<&str> = self.allowlist.iter().map(String::as_str).collect();
+        Ok(active_app_in(&snapshot()?, &al))
     }
 }
 

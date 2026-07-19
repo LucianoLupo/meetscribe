@@ -62,12 +62,35 @@ covering the full 300 s (verified via `--max-print 200` diff). The `whisper_full
 temperature-fallback logs (occur on both backends), not errors. Both are clearly better than
 the earlier `small`-model reference (`capture/transcript_5min.txt`) on Spanish technical terms.
 
-### Recommendation (the v1 runtime default is a Phase-2 decision)
-- **Metal-only** = zero setup, instant, 0.399× — the safe v1 default.
-- **CoreML** = ~2× faster + lower power/thermal (ANE) — better for an always-on background tool,
-  **but** the ~23-min one-time ANE compile must NOT land on a user's first live meeting. If v1
-  enables CoreML, provisioning must **pre-warm** it (run one throwaway transcription at setup so
-  the compile is cached before any real meeting). Deferred to Phase 2/4.
-- Toggle is a Cargo feature (`--features coreml`) — both paths are proven; neither is a blocker.
+### Recommendation — RESOLVED in Phase 5
+- **Metal-only is the shipped default**, for both the CLI and the background daemon. It needs zero
+  setup, starts instantly, and at 0.399× (300 s of audio in ~120 s) already runs faster than real
+  time — so the daemon keeps up with any meeting without CoreML.
+- **The daemon is metal-only by design and refuses a coreml-built binary** (`meetscribe install`
+  bails on a `--features coreml` build). This is deliberate: an unattended daemon must never eat the
+  one-time ~23-min ANE compile on a user's first live meeting.
+- **CoreML (~2×) is therefore an opt-in for the MANUAL `transcribe` path only** — useful when you
+  batch-transcribe a backlog and want it done in half the wall-clock (or lower power/thermal). See
+  the pre-warm step below so the ~23-min compile is paid deliberately, once, not on real work.
+
+### Opt-in CoreML (~2×) — manual path, with pre-warm
+CoreML is a Cargo feature; the encoder `*.mlmodelc` is already provisioned beside the `.bin`
+(see the CoreML naming contract above), so no extra download is needed.
+
+```
+# 1. Build the CLI with CoreML.
+cargo build --features coreml
+
+# 2. PRE-WARM once: run a throwaway transcription so the one-time ~23-min ANE compile happens
+#    now and caches (into ~/Library/Caches). Use any short capture dir — the output is discarded.
+./target/debug/meetscribe transcribe capture --no-store --export-dir /tmp/coreml-prewarm
+
+# 3. From now on, `--features coreml` transcribes run at ~2× (warm start ≈ 2 s), e.g.:
+./target/debug/meetscribe transcribe <some-session-dir>
+```
+
+The compile cache is keyed to the model + machine; it survives across runs and rebuilds. This is a
+**doc-only** step by choice (Phase 5) — there is no `prewarm` subcommand, because the shipped daemon
+never uses CoreML, so pre-warm only matters when you deliberately opt a manual run into it.
 
 **Provisioned:** 2026-07-19.

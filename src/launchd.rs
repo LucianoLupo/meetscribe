@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const LABEL: &str = "com.lucianolupo.meetscribe";
+pub(crate) const LABEL: &str = "com.lucianolupo.meetscribe";
 /// Frozen signing identity (Apple Development, Team L634X3YJBF) — the TCC grant binds to it.
 const SIGN_IDENTITY: &str = "155971FEAE6B0B537B4BC9C1F216AB3D0EAE304C";
 /// True if THIS binary was compiled with the coreml feature — refused for the unattended daemon.

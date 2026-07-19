@@ -11,13 +11,43 @@ input stream** (`kAudioProcessPropertyIsRunningInput`). Music/YouTube use *outpu
 never trigger it. The mic-holding process is often a helper (e.g. `com.google.Chrome.helper`), so
 matching is by identifier **or dotted sub-identifier**.
 
-**Allowlist (hardcoded in Phase 4; user override is a Phase-5 config item):**
+**Built-in allowlist:**
 Zoom `us.zoom.xos` · Chrome `com.google.Chrome` · Teams `com.microsoft.teams2` / `com.microsoft.teams`
 · Slack `com.tinyspeck.slackmacgap` · Safari `com.apple.Safari` · Arc `company.thebrowser.Browser`
 · Firefox `org.mozilla.firefox` · Brave `com.brave.Browser`.
 
-Tunables (in `src/daemon.rs`): poll every 1.5s · end-debounce 10s (survives a transient route drop)
-· skip sessions under 20s (`--min-secs`, drops mic blips like voice search).
+Tunables: poll every 1.5s · end-debounce 10s (survives a transient route drop) · skip sessions
+under 20s (drops mic blips like voice search). The last two are configurable — see below.
+
+## Configure — `~/.meetscribe/config.toml` (Phase 5)
+The LaunchAgent runs `meetscribe daemon` with **no flags**, so this file is the only way to change
+the background daemon's behavior. It is written with commented defaults on first run and re-read at
+startup — edit it, then restart the daemon:
+
+```
+launchctl kickstart -k gui/$(id -u)/com.lucianolupo.meetscribe
+```
+
+Keys (all optional; unknown keys are warned and ignored, missing keys default):
+- `[detector] allowlist_extra = ["com.example.App"]` — extra meeting apps (identifier or dotted
+  sub-identifier), ADDED to the built-ins. `use_builtin_allowlist = false` uses ONLY your extras.
+- `[daemon] lang = "es"` · `min_secs = 20.0` — transcription language + minimum session length.
+- `[retention] sessions_days = 0` — delete session folders older than N days (**0 = keep forever**,
+  the default; the meeting + transcript stay in the DB, so `export <id>` still works). ·
+  `log_max_mb = 10` — rotate the daemon log over N MB (keeps one `.1` backup; 0 = never).
+
+Disk/log hygiene (session prune + log rotation) runs at daemon startup and once per day.
+
+## Menu-bar tray (Phase 5) — `meetscribe tray`
+An optional, **separate** menu-bar app (its own process; the daemon is untouched). It reads
+`~/.meetscribe/status.json` (which the daemon writes) and shows a coloured dot:
+green = idle · red = recording · amber = paused · gray = daemon stopped. Menu:
+- **Pause / Resume** — toggles `~/.meetscribe/paused`; while present the daemon skips STARTING new
+  recordings (a recording already in progress finishes). `touch`/`rm` that file for the same effect.
+- **Open recordings folder** / **Open config file**, and **Stop background daemon**.
+
+Launch it manually (`meetscribe tray &`) or add a login LaunchAgent for it. The daemon and tray talk
+only through the two files, so the tray never touches audio and adds no risk to capture.
 
 ## Install (enable at login)
 Run from the repo (so the default `--model models/ggml-large-v3.bin` resolves):
