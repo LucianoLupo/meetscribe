@@ -42,6 +42,7 @@ mod imp {
         Down,
         Idle,
         Recording(String),
+        Transcribing(String),
         Paused,
     }
 
@@ -178,7 +179,7 @@ mod imp {
                     self.pause_item.set_text("Resume");
                     self.pause_item.set_enabled(true);
                 }
-                Display::Idle | Display::Recording(_) => {
+                Display::Idle | Display::Recording(_) | Display::Transcribing(_) => {
                     self.pause_item.set_text("Pause");
                     self.pause_item.set_enabled(true);
                 }
@@ -229,6 +230,9 @@ mod imp {
                     DaemonState::Recording => {
                         Display::Recording(s.app.unwrap_or_else(|| "meeting".to_string()))
                     }
+                    DaemonState::Transcribing => {
+                        Display::Transcribing(s.app.unwrap_or_else(|| "meeting".to_string()))
+                    }
                 };
                 (d, Some(s.pid))
             }
@@ -240,6 +244,7 @@ mod imp {
             Display::Down => "meetscribe: daemon stopped".to_string(),
             Display::Idle => "meetscribe: idle (watching)".to_string(),
             Display::Recording(app) => format!("meetscribe: ● recording — {app}"),
+            Display::Transcribing(app) => format!("meetscribe: ◐ transcribing — {app}"),
             Display::Paused => "meetscribe: paused".to_string(),
         }
     }
@@ -251,6 +256,7 @@ mod imp {
             Display::Down => (150u8, 150u8, 150u8),
             Display::Idle => (60, 180, 90),
             Display::Recording(_) => (220, 55, 50),
+            Display::Transcribing(_) => (60, 130, 220),
             Display::Paused => (230, 170, 40),
         };
         let (w, h) = (22u32, 22u32);

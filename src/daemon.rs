@@ -361,6 +361,9 @@ fn record_and_process(cfg: &DaemonConfig, app: &str) -> Result<()> {
         no_store: false,
     };
     log::info!("transcribing {} …", dir.display());
+    // Capture is done but this call blocks for minutes on a long meeting — publish the transition so
+    // the tray stops showing "recording" the moment the call actually ended.
+    publish_status(cfg, status::DaemonState::Transcribing, Some(label.to_string()));
     match pipeline::transcribe_and_store(&dir, &opts) {
         Ok(out) => log::info!(
             "stored{} → {} ({} segments)",

@@ -20,6 +20,10 @@ pub const PAUSE_FILE: &str = "paused";
 pub enum DaemonState {
     Idle,
     Recording,
+    /// Capture has ended; whisper is still running. Distinct from `Recording` because transcription
+    /// of a long meeting blocks the daemon for many minutes — without this the tray would keep
+    /// showing "recording" long after the call ended.
+    Transcribing,
     Paused,
 }
 
@@ -94,6 +98,23 @@ mod tests {
         assert!(!tmp.join(".status.json.tmp").exists());
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The tray parses this file with serde; an unrecognised `state` makes `read` return `None`,
+    /// which the tray renders as "daemon stopped". Pin the wire spelling so a rename can't silently
+    /// turn a live transcribe into a phantom crash.
+    #[test]
+    fn transcribing_state_roundtrips_as_snake_case() {
+        let s = Status {
+            state: DaemonState::Transcribing,
+            app: Some("Teams".to_string()),
+            since_epoch: 1_700_000_000,
+            updated_epoch: 1_700_000_000,
+            pid: 4242,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""state":"transcribing""#), "unexpected wire form: {json}");
+        assert_eq!(serde_json::from_str::<Status>(&json).unwrap(), s);
     }
 
     #[test]
