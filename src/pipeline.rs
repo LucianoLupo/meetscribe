@@ -67,7 +67,7 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
         .model
         .to_str()
         .with_context(|| format!("model path not valid UTF-8: {}", opts.model.display()))?;
-    let asr = asr::Asr::load(model_str).with_context(|| format!("load model {model_str}"))?;
+    let mut asr = asr::Asr::load(model_str).with_context(|| format!("load model {model_str}"))?;
     // Inter-segment gaps the capture layer recorded on rate-roll boundaries (empty for the common
     // single-segment case). Both channels share the same manifest.
     let gaps = read_segment_gaps(dir)?;
