@@ -2,6 +2,19 @@
 name = "meetscribe"
 version = "0.1.0"
 edition = "2024"
+# Dependency floor, NOT the edition floor. Edition 2024 stabilized in 1.85, but cidre,
+# home, and the time crates each declare rust-version 1.88 — and cargo hard-errors when a
+# dependency's floor exceeds the toolchain, so 1.85 would fail on the first build.
+rust-version = "1.88"
+authors = ["Luciano Lupo"]
+license = "MIT"
+description = "Local-first background macOS meeting transcriber. No bots, no cloud, no telemetry — speaker-labeled transcripts, fully on-device."
+repository = "https://github.com/LucianoLupo/meetscribe"
+readme = "README.md"
+keywords = ["transcription", "whisper", "meetings", "macos", "core-audio"]
+categories = ["multimedia::audio", "command-line-utilities"]
+# NOT publishable to crates.io: cidre and silero are pinned git revs, which crates.io forbids.
+publish = false
 
 [dependencies]
 anyhow = "1.0"

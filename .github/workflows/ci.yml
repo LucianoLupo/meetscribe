@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Apple Silicon: the capture layer is Core Audio + cidre, and whisper-rs builds with Metal.
+  test:
+    name: clippy + test (stable)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # The cold build is the expensive part: silero fetches ONNX Runtime and whisper.cpp
+      # compiles with Metal. rust-cache keys on the toolchain + Cargo.lock automatically.
+      - uses: Swatinem/rust-cache@v2
+
+      # clippy --all-targets subsumes a bare `cargo check` — no separate check step.
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Full suite, deliberately unfiltered. All 36 tests are pure — none touches audio
+      # hardware, a TCC grant, or a signing certificate — so there is nothing to skip.
+      - name: Test
+        run: cargo test
+
+  msrv:
+    # Validates the rust-version floor declared in Cargo.toml. @stable structurally cannot:
+    # cidre and home require 1.88, and cargo hard-errors below that. Verified locally —
+    # 1.88 checks clean, 1.87 fails with "rustc 1.87.0 is not supported by the following
+    # packages". check-only, so it costs far less than the stable job.
+    name: check (MSRV 1.88)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets
