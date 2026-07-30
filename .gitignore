@@ -1,7 +1,9 @@
 /target
 
-# Captured meeting audio — NEVER commit (private recordings)
-/capture
+# Captured meeting audio — NEVER commit (private recordings).
+# Glob the directory, not just *.wav: a scratch capture dir also accumulates transcripts
+# and run logs, which the *.wav rule would not cover.
+/capture*
 *.wav
 
 # Local SQLite store — default lives in ~/.meetscribe/; guard any repo-local --db override
