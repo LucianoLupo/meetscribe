@@ -29,8 +29,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      # Full suite, deliberately unfiltered. All 36 tests are pure — none touches audio
+      # Full suite, deliberately unfiltered. Every test is pure — none touches audio
       # hardware, a TCC grant, or a signing certificate — so there is nothing to skip.
+      # Keep it that way: a test needing real hardware belongs behind #[ignore], not here.
       - name: Test
         run: cargo test
 
