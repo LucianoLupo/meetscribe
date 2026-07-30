@@ -54,11 +54,20 @@ Run from the repo (so the default `--model models/ggml-large-v3.bin` resolves):
 
 ```
 cargo build
-codesign --remove-signature target/debug/meetscribe \
-  && codesign --sign 155971FEAE6B0B537B4BC9C1F216AB3D0EAE304C \
-     --identifier com.lucianolupo.meetscribe --timestamp=none target/debug/meetscribe
 ./target/debug/meetscribe install
 ```
+
+No manual `codesign` step: `install` re-signs the copy it places in `~/.meetscribe/bin/`,
+which is the binary the daemon actually runs. It picks the identity in this order —
+
+1. `meetscribe install --identity <sha1>`
+2. `$MEETSCRIBE_SIGN_IDENTITY`
+3. the sole identity from `security find-identity -v -p codesigning`
+4. otherwise it errors, listing what it found
+
+— and resolves it *before* booting out the running daemon, so a signing problem leaves the
+existing install untouched. (Sign `target/debug/meetscribe` by hand only if you want to run
+the **manual capture** flow directly from it, which needs its own TCC grant.)
 
 `install` is **idempotent** and does, in order:
 1. `launchctl bootout` any running instance (so the rebuild→reinstall loop never leaves a stale inode);
@@ -78,9 +87,7 @@ overwrites `target/debug/meetscribe`, but the daemon runs the stable `~/.meetscr
 keeps running the OLD code until you reinstall):
 
 ```
-cargo build && codesign --remove-signature target/debug/meetscribe \
-  && codesign --sign 155971FEAE6B0B537B4BC9C1F216AB3D0EAE304C \
-     --identifier com.lucianolupo.meetscribe --timestamp=none target/debug/meetscribe
+cargo build
 ./target/debug/meetscribe install     # boots out the old, copies+resigns+reloads the new
 ```
 
@@ -107,9 +114,16 @@ meetscribe uninstall     # unloads + removes the plist; KEEPS all data in ~/.mee
 To also remove data: `rm -rf ~/.meetscribe` (deletes the DB, sessions, exports, and model symlink).
 
 ## Frozen invariants (a re-sign with a different identity zeroes the TCC grants)
-- Bundle-id / launchd label: `com.lucianolupo.meetscribe`
-- Signing identity: `155971FEAE6B0B537B4BC9C1F216AB3D0EAE304C` (Apple Development, Team `L634X3YJBF`)
-- Re-sign after every build: **remove-then-sign** with an explicit `--identifier`.
+- Bundle-id / launchd label: `com.lucianolupo.meetscribe` — **permanently frozen.** It binds
+  the TCC grant of every installation; changing it would need a legacy-label migration plus a
+  documented re-approval step. See the note above `LABEL` in `src/launchd.rs`.
+- Signing identity: **not frozen, and not hardcoded** — resolved per-machine at install time
+  (flag → `$MEETSCRIBE_SIGN_IDENTITY` → sole auto-detected identity → error). What must stay
+  stable is *your* identity across installs on a given machine: re-signing with a different
+  one zeroes that machine's TCC grants. `security find-identity -v -p codesigning` lists them.
+- Re-sign after every build: **remove-then-sign** with an explicit `--identifier` — `install`
+  does this for you. The explicit identifier is mandatory because rustc's default embeds a
+  per-build hash, which would change the signed identifier on every rebuild and break TCC.
 - Model: `ggml-large-v3` (multilingual — meetings are in Spanish), metal-only for the daemon.
 
 ## Signals
