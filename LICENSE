@@ -2,10 +2,6 @@ MIT License
 
 Copyright (c) 2026 Luciano Lupo
 
-SCOPE: This license covers meetscribe's own source. It does NOT cover the third-party
-reference source redistributed under docs/meetily-ref/ and docs/swift-ref/, which remains
-under its respective upstream copyrights. See THIRD-PARTY-NOTICES.md for those licenses.
-
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
 in the Software without restriction, including without limitation the rights
@@ -23,3 +19,9 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+NOTE: The above covers meetscribe's own source. Third-party reference source
+redistributed under docs/meetily-ref/ and docs/swift-ref/ remains under its
+respective upstream copyrights — see THIRD-PARTY-NOTICES.md.
