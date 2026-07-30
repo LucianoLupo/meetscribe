@@ -335,15 +335,15 @@ mod tests {
     use super::*;
 
     /// Verbatim shape of `security find-identity -v -p codesigning` on a machine with one cert.
-    const ONE: &str = "  1) 155971FEAE6B0B537B4BC9C1F216AB3D0EAE304C \"Apple Development: someone@example.com (L634X3YJBF)\"\n     1 valid identities found\n";
+    const ONE: &str = "  1) 1111222233334444555566667777888899990000 \"Apple Development: someone@example.com (TEAMID1234)\"\n     1 valid identities found\n";
 
-    const TWO: &str = "  1) 155971FEAE6B0B537B4BC9C1F216AB3D0EAE304C \"Apple Development: someone@example.com (L634X3YJBF)\"\n  2) AAAA1111BBBB2222CCCC3333DDDD4444EEEE5555 \"Apple Distribution: Someone (L634X3YJBF)\"\n     2 valid identities found\n";
+    const TWO: &str = "  1) 1111222233334444555566667777888899990000 \"Apple Development: someone@example.com (TEAMID1234)\"\n  2) AAAA1111BBBB2222CCCC3333DDDD4444EEEE5555 \"Apple Distribution: Someone (TEAMID1234)\"\n     2 valid identities found\n";
 
     #[test]
     fn parses_a_single_identity() {
         assert_eq!(
             parse_identities(ONE),
-            ["155971FEAE6B0B537B4BC9C1F216AB3D0EAE304C"]
+            ["1111222233334444555566667777888899990000"]
         );
     }
 
@@ -352,7 +352,7 @@ mod tests {
         assert_eq!(
             parse_identities(TWO),
             [
-                "155971FEAE6B0B537B4BC9C1F216AB3D0EAE304C",
+                "1111222233334444555566667777888899990000",
                 "AAAA1111BBBB2222CCCC3333DDDD4444EEEE5555"
             ]
         );
@@ -375,7 +375,7 @@ mod tests {
         let found = parse_identities(ONE);
         assert_eq!(
             resolve_identity(None, None, &found).unwrap(),
-            "155971FEAE6B0B537B4BC9C1F216AB3D0EAE304C"
+            "1111222233334444555566667777888899990000"
         );
     }
 
