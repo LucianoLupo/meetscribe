@@ -168,12 +168,17 @@ the auto-detect tier resolves to the identical value and TCC cannot be disturbed
    the same dated banner rather than editing five historical files.
 
 **Verify — two greps, not one:**
-- `git grep -i 155971FEAE -- src/ docs/ Info.plist README.md CONTRIBUTING.md` → empty.
-  **Allowlist, not repo-wide.** Repo-wide is unsatisfiable and contradicts §2.4: 7 of the
-  11 `155971FEAE` hits live under `plans/`, which is a historical record kept verbatim
-  under a dated banner — it is *expected* to retain the old hash and is exempt by design.
-  The allowlist expresses the actual intent: no personal signing hash in anything a
-  stranger reads. `L634X3YJBF` is **not** in this gate — it is a correct value that stays.
+- `git grep -i 155971FEAE -- . ':!plans/'` → empty.
+  **Denylist of the one exempt directory — NOT an allowlist of named paths.** Repo-wide is
+  unsatisfiable and contradicts §2.4: 7 of the 11 `155971FEAE` hits live under `plans/`,
+  a historical record kept verbatim under a dated banner, expected to retain the old hash.
+  `L634X3YJBF` is **not** in this gate — it is a correct value that stays.
+  - ⚠️ **This started life as an allowlist (`-- src/ docs/ Info.plist README.md
+    CONTRIBUTING.md`) and that was a bug.** It named directories but not the repo root's
+    other files, so `RESUME.md` — a personal work log carrying the hash and a now-broken
+    `codesign --sign` recipe — sat at the root of the **already-public** repo while the gate
+    reported PASS. A gate that enumerates what to check will always miss what nobody thought
+    to enumerate. Exempt the known exception; scan everything else.
 - `git grep -in lucianolupo -- . ':!Cargo.toml' ':!LICENSE' ':!THIRD-PARTY-NOTICES.md' ':!plans/'`
   → only legitimate `LucianoLupo/meetscribe` URLs. The exclusions matter: Phase 1.3
   legitimately adds the name to `Cargo.toml` `authors`/`repository`, and the bundle-id
