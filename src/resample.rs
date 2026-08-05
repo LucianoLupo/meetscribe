@@ -9,14 +9,27 @@ use rubato::{FftFixedIn, Resampler};
 
 pub const TARGET_RATE: u32 = 16_000;
 
+/// Force a sample into the [-1, 1] range silero and whisper require.
+///
+/// Capture can land a hair outside full scale: the aggregate device's drift-compensating
+/// resampler overshoots on transients, so a 64-minute meeting may hold a single sample at
+/// e.g. 1.008. silero's `validate_input` rejects the WHOLE buffer on ONE out-of-range
+/// sample (`VadError::InvalidData`) — and that check is `#[cfg(debug_assertions)]`, which
+/// the daemon binary is built with. Clamping here costs nothing and can't lose speech.
+fn normalize(sample: f32) -> f32 {
+    if sample.is_finite() { sample.clamp(-1.0, 1.0) } else { 0.0 }
+}
+
 /// Resample mono f32 `input` from `src_rate` to 16 kHz. Passthrough copy when already 16 kHz.
 ///
 /// Uses an FFT resampler over fixed-size chunks; the final partial chunk is zero-padded.
 /// FFT resamplers add a small constant startup delay (sub-20 ms) — negligible for
 /// speaker-labeled batch transcription.
+///
+/// Output is always in [-1, 1] — see [`normalize`].
 pub fn to_16k_mono(input: &[f32], src_rate: u32) -> Result<Vec<f32>> {
     if src_rate == TARGET_RATE {
-        return Ok(input.to_vec());
+        return Ok(input.iter().copied().map(normalize).collect());
     }
     if input.is_empty() {
         return Ok(Vec::new());
@@ -35,14 +48,17 @@ pub fn to_16k_mono(input: &[f32], src_rate: u32) -> Result<Vec<f32>> {
     while pos < input.len() {
         let end = (pos + need).min(input.len());
         let n = end - pos;
-        frame[..n].copy_from_slice(&input[pos..end]);
+        // Sanitize on the way IN as well: rubato's FFT path *panics* on a non-finite sample.
+        for (dst, &src) in frame[..n].iter_mut().zip(&input[pos..end]) {
+            *dst = normalize(src);
+        }
         if n < need {
             frame[n..].fill(0.0); // zero-pad the final chunk
         }
         let wave_out = resampler
             .process(&[frame.as_slice()], None)
             .context("resample chunk")?;
-        out.extend_from_slice(&wave_out[0]);
+        out.extend(wave_out[0].iter().copied().map(normalize));
         pos += need;
     }
     Ok(out)
@@ -79,5 +95,29 @@ mod tests {
     #[test]
     fn empty_input_is_empty() {
         assert!(to_16k_mono(&[], 48_000).unwrap().is_empty());
+    }
+
+    /// One sample past full scale used to abort a whole meeting at the VAD (silero rejects
+    /// the entire buffer on a single out-of-range sample). Both paths must clamp.
+    #[test]
+    fn output_always_within_unit_range() {
+        let mut input = vec![0.1f32; 16_000];
+        input[7] = 1.007_948_2; // observed in a real 64-minute capture
+        input[9] = -1.5;
+        input[11] = f32::NAN;
+
+        for rate in [16_000u32, 48_000] {
+            let out = to_16k_mono(&input, rate).unwrap();
+            assert!(
+                out.iter().all(|s| s.is_finite() && (-1.0..=1.0).contains(s)),
+                "{rate} Hz path left a sample outside [-1, 1]"
+            );
+        }
+        // Passthrough clamps rather than mangles: only the offending samples change.
+        let out = to_16k_mono(&input, 16_000).unwrap();
+        assert_eq!(out[7], 1.0);
+        assert_eq!(out[9], -1.0);
+        assert_eq!(out[11], 0.0);
+        assert_eq!(out[0], 0.1);
     }
 }
