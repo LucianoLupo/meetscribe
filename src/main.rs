@@ -144,7 +144,7 @@ fn run_transcribe(argv: &[String]) -> Result<()> {
             "[{:7.2}-{:7.2}] {:<7} {}",
             s.t_start,
             s.t_end,
-            s.speaker.label(),
+            s.display_label(),
             s.text
         );
     }
@@ -377,20 +377,38 @@ fn run_rerender(argv: &[String]) -> Result<()> {
         anyhow::bail!("db {} does not exist", db_path.display());
     }
 
-    if all {
-        let rt = new_runtime()?;
-        let meetings = rt.block_on(async {
-            let mut database = db::Db::open(&db_path).await?;
-            let m = database.list_meetings().await?;
-            database.close().await?;
-            anyhow::Ok(m)
-        })?;
-        ids = meetings.iter().map(|m| m.id).collect();
+    // ONE connection and ONE compiled vocabulary for the whole run — `--all` over a few dozen
+    // meetings would otherwise reopen the database and recompile every rule once per meeting.
+    let rt = new_runtime()?;
+    let (meetings, vocab_rows) = rt.block_on(async {
+        let mut database = db::Db::open(&db_path).await?;
+        let wanted: Vec<i64> = if all {
+            database.list_meetings().await?.iter().map(|m| m.id).collect()
+        } else {
+            std::mem::take(&mut ids)
+        };
+        let mut out = Vec::with_capacity(wanted.len());
+        for id in wanted {
+            let row = database.get_meeting(id).await?.ok_or_else(|| {
+                anyhow::anyhow!("no meeting with id {id} in {}", db_path.display())
+            })?;
+            let segs = database.load_segments(id).await?;
+            out.push((row, segs));
+        }
+        let vocab = database.load_enabled_vocab().await?;
+        database.close().await?;
+        anyhow::Ok((out, vocab))
+    })?;
+
+    let (vocab, warnings) = render::Vocab::compile(&vocab_rows);
+    for w in &warnings {
+        log::warn!("{w}");
     }
 
     let (mut changed, mut unchanged, mut skipped) = (0usize, 0usize, 0usize);
-    for id in ids {
-        let (row, rendered) = load_rendered(&db_path, id, false)?;
+    for (row, segs) in &meetings {
+        let id = row.id;
+        let rendered = render::render(segs, &render::IdentityMap::empty(), &vocab);
 
         // source_dir is untrusted historical data: early rows hold a relative path long since
         // overwritten. Skip with a log rather than failing the whole run.
@@ -404,7 +422,7 @@ fn run_rerender(argv: &[String]) -> Result<()> {
             continue;
         }
 
-        let md = export::to_markdown(&row, &rendered);
+        let md = export::to_markdown(row, &rendered);
         let json = export::to_json(&rendered)?;
         let md_path = dir.join("transcript.md");
         let json_path = dir.join("transcript.json");
@@ -486,6 +504,11 @@ fn run_vocab(argv: &[String]) -> Result<()> {
         }
     }
     let sub = *positional.first().context(VOCAB_USAGE)?;
+    // Every other `--db` subcommand refuses to conjure a database out of a typo'd path; only
+    // `add` legitimately creates one.
+    if sub != "add" && !db_path.exists() {
+        anyhow::bail!("db {} does not exist", db_path.display());
+    }
 
     let rt = new_runtime()?;
     match sub {
@@ -494,6 +517,12 @@ fn run_vocab(argv: &[String]) -> Result<()> {
                 .get(1)
                 .context("vocab add: missing <pattern>\n\nexample: vocab add \"Cloud Code\" \"Claude Code\"")?;
             let replacement = positional.get(2).context("vocab add: missing <replacement>")?;
+            // An empty pattern matches the zero-width position between every character. A shell
+            // quoting slip (`vocab add "" Postgres`) is all it takes, so refuse it explicitly —
+            // `.get(1)` returns Some("") and would otherwise sail straight through.
+            if pattern.trim().is_empty() {
+                anyhow::bail!("vocab add: <pattern> must not be empty");
+            }
             // Compile before storing: a rule that cannot compile is a typo, and catching it here
             // beats discovering it as a warning on every future export.
             let probe = db::VocabRow {
@@ -613,6 +642,15 @@ fn run_vocab_test(db_path: &Path, only: Option<i64>) -> Result<()> {
                 return Ok(());
             }
         }
+    }
+    if let Some(id) = only {
+        // Testing one rule shows it ALONE. `rerender` applies every enabled rule in id order, and
+        // rules compose (a later rule sees an earlier one's output), so this preview is not
+        // necessarily what lands on disk. Say so rather than let the two quietly disagree.
+        println!(
+            "previewing rule {id} in isolation — `vocab test --all` shows what `rerender` will \
+             actually write\n"
+        );
     }
     let (vocab, warnings) = render::Vocab::compile(&rows);
     for w in &warnings {

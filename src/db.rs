@@ -149,8 +149,10 @@ impl Db {
         read_user_version(&mut self.conn).await
     }
 
-    /// `PRAGMA table_info` as `(name, type, notnull, dflt, pk)` tuples — used to assert a fresh
-    /// database and a migrated legacy one are structurally identical.
+    /// `PRAGMA table_info` as `name|type|notnull|pk` rows — used to assert a fresh database and a
+    /// migrated legacy one are structurally identical. Column DEFAULTS are deliberately not
+    /// compared: `dflt_value` comes back as a nullable string and adds a decoding branch for a
+    /// property the ladder's additive-only rule already constrains.
     #[cfg(test)]
     pub async fn table_info(&mut self, table: &str) -> Result<Vec<String>> {
         let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
@@ -398,7 +400,7 @@ async fn apply_migrations(conn: &mut SqliteConnection) -> Result<()> {
             return Ok(());
         }
         match v {
-            0 => migrate_v0_to_v1(conn).await?,
+            0 => run_migration(conn, 0, 1, MIGRATION_V1).await?,
             other => anyhow::bail!("no migration registered from schema v{other}"),
         }
     }
@@ -408,26 +410,21 @@ async fn apply_migrations(conn: &mut SqliteConnection) -> Result<()> {
 ///
 /// Deliberately contains NO speaker tables — that rung ships with the speaker-ID work, so a
 /// database never carries dead tables for a feature that might not pass its calibration gate.
-async fn migrate_v0_to_v1(conn: &mut SqliteConnection) -> Result<()> {
-    run_migration(conn, 0, 1, |c| {
-        Box::pin(async move {
-            sqlx::query(
-                "CREATE TABLE IF NOT EXISTS vocab_corrections (\
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT, \
-                    pattern     TEXT    NOT NULL, \
-                    replacement TEXT    NOT NULL, \
-                    is_regex    INTEGER NOT NULL DEFAULT 0 CHECK (is_regex IN (0,1)), \
-                    enabled     INTEGER NOT NULL DEFAULT 1 CHECK (enabled  IN (0,1)), \
-                    created_at  INTEGER NOT NULL)",
-            )
-            .execute(&mut *c)
-            .await
-            .context("create vocab_corrections table")?;
-            Ok(())
-        })
-    })
-    .await
-}
+/// The statements for v0 → v1, applied IN ORDER.
+///
+/// Order is load-bearing for any future rung: a `CREATE TABLE` must precede any `ALTER TABLE …
+/// REFERENCES` that names it, or the ALTER succeeds and every later INSERT fails at prepare
+/// (see the module docs). Expressing a rung as an ordered statement list rather than a closure
+/// keeps that requirement visible as the literal order of this array.
+const MIGRATION_V1: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS vocab_corrections (\
+        id          INTEGER PRIMARY KEY AUTOINCREMENT, \
+        pattern     TEXT    NOT NULL, \
+        replacement TEXT    NOT NULL, \
+        is_regex    INTEGER NOT NULL DEFAULT 0 CHECK (is_regex IN (0,1)), \
+        enabled     INTEGER NOT NULL DEFAULT 1 CHECK (enabled  IN (0,1)), \
+        created_at  INTEGER NOT NULL)",
+];
 
 /// Run one ladder rung inside `BEGIN IMMEDIATE`, re-checking the version inside the transaction
 /// and bumping it before COMMIT.
@@ -436,14 +433,12 @@ async fn migrate_v0_to_v1(conn: &mut SqliteConnection) -> Result<()> {
 /// re-read below cannot race another process that migrates between our check and our first write.
 /// Bumping `user_version` inside the same transaction is what makes a partial migration
 /// impossible: without it, an applied DDL plus a lost version write bricks every later open.
-async fn run_migration<F>(conn: &mut SqliteConnection, from: i32, to: i32, body: F) -> Result<()>
-where
-    F: for<'c> FnOnce(
-        &'c mut SqliteConnection,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<()>> + Send + 'c>,
-    >,
-{
+async fn run_migration(
+    conn: &mut SqliteConnection,
+    from: i32,
+    to: i32,
+    stmts: &[&str],
+) -> Result<()> {
     sqlx::query("BEGIN IMMEDIATE")
         .execute(&mut *conn)
         .await
@@ -451,11 +446,15 @@ where
 
     let res = async {
         // Another process may have won the race while we waited for the write lock.
-        let current = read_user_version(conn).await?;
-        if current != from {
+        if read_user_version(conn).await? != from {
             return Ok(false);
         }
-        body(conn).await?;
+        for (i, sql) in stmts.iter().enumerate() {
+            sqlx::query(sql)
+                .execute(&mut *conn)
+                .await
+                .with_context(|| format!("migration v{from}→v{to} statement {i}"))?;
+        }
         sqlx::query(&format!("PRAGMA user_version = {to}"))
             .execute(&mut *conn)
             .await

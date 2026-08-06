@@ -70,6 +70,8 @@ struct Rule {
     id: i64,
     re: Regex,
     replacement: String,
+    /// Literal rules must NOT expand `$1`/`$name` in the replacement — see [`Vocab::apply`].
+    literal: bool,
 }
 
 /// Compiled vocabulary corrections, applied in `id` order.
@@ -81,11 +83,6 @@ pub struct Vocab {
 impl Vocab {
     pub fn empty() -> Self {
         Self::default()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.rules.is_empty()
     }
 
     /// Compile rules in `id` order, skipping (and reporting) any that do not compile.
@@ -101,8 +98,23 @@ impl Vocab {
             } else {
                 word_bounded(&row.pattern)
             };
+            // An empty source compiles fine and matches the zero-width position between EVERY
+            // character, so one such row would shred every segment of every transcript. Refuse it
+            // here as well as at `vocab add`, so a row that predates that guard cannot do damage.
+            if source.is_empty() {
+                warnings.push(format!(
+                    "vocab rule {} has an empty pattern and was skipped (it would match everywhere)",
+                    row.id
+                ));
+                continue;
+            }
             match Regex::new(&source) {
-                Ok(re) => rules.push(Rule { id: row.id, re, replacement: row.replacement.clone() }),
+                Ok(re) => rules.push(Rule {
+                    id: row.id,
+                    re,
+                    replacement: row.replacement.clone(),
+                    literal: !row.is_regex,
+                }),
                 Err(e) => warnings.push(format!(
                     "vocab rule {} ('{}') does not compile and was skipped: {e}",
                     row.id, row.pattern
@@ -114,11 +126,23 @@ impl Vocab {
 
     /// Apply every rule in order. Later rules see earlier rules' output — deliberate, so a rule
     /// can build on another, and the reason ordering is pinned to `id` rather than hash order.
+    ///
+    /// Literal rules substitute through [`regex::NoExpand`]. The `&str` replacer expands `$1` and
+    /// `$name` as capture references, which is right for a `--regex` rule but silently DELETES
+    /// text for a literal one: the pattern is escaped by `word_bounded` while the replacement is
+    /// not, so a replacement like `$USD` would resolve to a group that does not exist and
+    /// substitute nothing.
     #[must_use]
     pub fn apply(&self, text: &str) -> String {
         let mut out = text.to_string();
         for rule in &self.rules {
-            out = rule.re.replace_all(&out, rule.replacement.as_str()).into_owned();
+            out = if rule.literal {
+                rule.re
+                    .replace_all(&out, regex::NoExpand(rule.replacement.as_str()))
+                    .into_owned()
+            } else {
+                rule.re.replace_all(&out, rule.replacement.as_str()).into_owned()
+            };
         }
         out
     }
@@ -178,8 +202,7 @@ fn render_one(
 ) -> RenderedSegment {
     RenderedSegment {
         speaker: seg.speaker,
-        // Cheap identity path when no corrections exist — the overwhelmingly common case.
-        text: if vocab.is_empty() { seg.text.clone() } else { vocab.apply(&seg.text) },
+        text: vocab.apply(&seg.text),
         t_start: seg.t_start,
         t_end: seg.t_end,
         confidence: seg.confidence,
@@ -267,6 +290,40 @@ mod tests {
     fn punctuation_edges_do_not_get_word_boundaries() {
         let (v, _) = Vocab::compile(&[row(1, "C++", "Rust", false)]);
         assert_eq!(v.apply("we use C++ here"), "we use Rust here");
+    }
+
+    /// `Regex::replace_all` with a `&str` replacer expands `$name`/`$1` as capture references.
+    /// For a LITERAL rule that silently deletes the matched text instead of replacing it.
+    #[test]
+    fn literal_replacements_do_not_expand_dollar_signs() {
+        let (v, _) = Vocab::compile(&[row(1, "dolares", "$USD", false)]);
+        assert_eq!(v.apply("cuesta cinco dolares hoy"), "cuesta cinco $USD hoy");
+
+        let (v, _) = Vocab::compile(&[row(1, "precio", "US$5", false)]);
+        assert_eq!(v.apply("el precio"), "el US$5");
+
+        let (v, _) = Vocab::compile(&[row(1, "x", "${braced}", false)]);
+        assert_eq!(v.apply("x"), "${braced}");
+    }
+
+    /// …but a --regex rule still gets capture expansion, which is the point of opting in.
+    /// Note `${1}` not `$1`: `$1QL` names a group "1QL", which does not exist and expands to
+    /// nothing — the same footgun the literal path is protected from.
+    #[test]
+    fn regex_rules_keep_capture_expansion() {
+        let (v, _) = Vocab::compile(&[row(1, r"(\w+)ql", "${1}QL", true)]);
+        assert_eq!(v.apply("postgresql"), "postgresQL");
+    }
+
+    /// An empty pattern compiles and matches the zero-width position between every character —
+    /// one such row would shred every segment of every transcript.
+    #[test]
+    fn empty_patterns_are_skipped_not_applied() {
+        let (v, warnings) = Vocab::compile(&[row(1, "", "BOOM", false), row(2, "ok", "fine", false)]);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("empty pattern"));
+        assert_eq!(v.apply("ok text"), "fine text", "only the valid rule may fire");
+        assert_eq!(v.matching_rules("anything"), Vec::<i64>::new());
     }
 
     #[test]

@@ -31,8 +31,13 @@ pub(crate) struct PipelineOpts {
 
 /// Result of the pipeline. `segments`/`meeting_secs`/`rtf`/`wall_secs` let the CLI wrapper print
 /// the same transcript+RTF summary it always did; `stored_id` is `Some` only when persisted.
+///
+/// `segments` are RENDERED, not raw: the CLI prints exactly what was written to disk. Handing
+/// back raw segments here would make the terminal disagree with the file for anyone using
+/// vocabulary corrections — two presentations of one transcript, which is the thing `render`
+/// exists to prevent.
 pub(crate) struct PipelineOutput {
-    pub segments: Vec<transcript::TranscriptSegment>,
+    pub segments: Vec<render::RenderedSegment>,
     pub stored_id: Option<i64>,
     pub md_path: PathBuf,
     pub json_path: PathBuf,
@@ -195,7 +200,7 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
         export::write_exports(&opts.export_dir, "transcript", &row, &rendered)?;
 
     Ok(PipelineOutput {
-        segments: merged,
+        segments: rendered,
         stored_id,
         md_path,
         json_path,
