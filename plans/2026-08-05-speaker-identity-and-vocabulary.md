@@ -3,10 +3,11 @@
 **Plan date:** 2026-08-05 · **Status:** AUDITED (`/audit-plan` → `revise-major`, all deltas folded)
 **Roadmap:** post-v1 feature work
 **Baseline:** master `414d1b0`, 47 tests green.
-**PREREQUISITE for Batch D:** `fix/clamp-audio-range-vad` is currently uncommitted on the working
-tree (`src/resample.rs` modified). Commit/merge it, or branch the D spike from it, **before** the
-probe runs — silero rejects an entire buffer on one out-of-range sample, so an unclamped meeting
-silently drops out of the calibration set and biases the EER.
+**PREREQUISITE for Batch D:** `fix/clamp-audio-range-vad` is committed and pushed —
+`origin/fix/clamp-audio-range-vad` @ `840653f`, `src/resample.rs` only. **Branch the D spike from
+that ref, not from `master`.** Silero rejects an entire buffer on one out-of-range sample, so an
+unclamped meeting silently drops out of the calibration set and biases the EER *toward a falsely
+clean number* — the failure is invisible in the result.
 
 Goal: the transcript gets **better every time you use it**. Two learning loops, both retroactive:
 
@@ -196,10 +197,19 @@ several mics and codecs:
   **codec drift** that is the #1 speaker-ID failure mode. Zero labels.
 - **Different-speaker** = `you` vs `others` pairs. Zero labels.
 - Together: a full ROC and an **empirical threshold + EER**, not a guessed `0.7`.
-- ⚠️ **35 meetings, not 36** — meeting id 1's `source_dir` is the relative string `capture/`, long
-  since overwritten. Treat `source_dir` as **untrusted historical data**: resolve it, **skip-with-a-
-  log** (not error) on relative/missing paths, and report coverage as "N of M meetings had
-  recoverable audio, K errored".
+- ⚠️ **35 of 36 meetings — MEASURED 2026-08-05, no longer an estimate.** 35 resolve to a directory
+  holding both WAVs; **0** directories missing, **0** partial pairs. Only meeting id 1 is lost: its
+  `source_dir` is the relative string `capture/`, long since overwritten. Treat `source_dir` as
+  **untrusted historical data**: resolve it, **skip-with-a-log** (not error) on relative/missing
+  paths, and report coverage as "N of M meetings had recoverable audio, K errored".
+- **+4 recordings that have audio but no DB row** — `20260722-210911` (14.4 s) and `20260729-212051`
+  (14.1 s), both correctly skipped by `min_secs = 20.0`; `20260730-135249` (21.4 min, cause
+  unexplained); `20260801-234127` (47.4 min, the clamp-bug casualty). They cannot be re-rendered —
+  there is no stored transcript — but for **embeddings they are ordinary material**, and the last
+  two are substantial. ⚠️ **The probe must walk `sessions/` directly rather than driving off the
+  `meetings` table**, or it silently discards ~69 minutes of usable calibration audio. Their
+  `you`/`others` split is unavailable (no segment rows), so use them for **same-speaker `you`
+  pairs only if the channel WAVs are read separately** — `mic.wav` is `you` by construction.
 
 **Exit criteria** (all must hold, else stop and reconsider):
 
