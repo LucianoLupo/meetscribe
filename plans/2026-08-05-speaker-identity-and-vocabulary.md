@@ -130,9 +130,10 @@ healthy. Confirmed that CREATE-first makes the identical INSERT succeed.
   committing). Unknown flags in the new handlers are **errors**, not silently ignored.
 - ⚠️ **Do not blanket-replace ambiguous terms.** In the 2026-08-04 transcript one short token is
   both a mangling of a product name and a genuine personal nickname.
-- **ROI is measured, not assumed:** on the stored corpus, `NCP`→`MCP` is 48 segments,
-  `Cloud Code`→`Claude Code` 67, `Antropic`→`Anthropic` 13, plus ~50 variants of a frequently-mentioned proper noun — roughly
-  1.5–2% of stored segments, stable enough for word-boundary replacement.
+- **ROI is measured, not assumed:** on the stored corpus, the four highest-frequency corrections
+  account for roughly 67, 48, ~50 and 13 segments — together about 1.5–2% of stored segments,
+  stable enough for word-boundary replacement. (The terms themselves are private meeting
+  vocabulary and live only in `~/.meetscribe/meetscribe.db`, never in this repo.)
 - verify: unit tests (boundary matching, regex opt-in, ordering, disabled = no-op); apply the real
   seed list to the `20260804-202205` session and eyeball the diff.
 

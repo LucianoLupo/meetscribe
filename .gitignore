@@ -10,6 +10,11 @@
 *.db
 *.db-journal
 
+# User config — default lives in ~/.meetscribe/config.toml. Anchored to the repo root because
+# a blanket *.toml would swallow Cargo.toml. Guards a scratch config dropped here while
+# testing: it carries the [vocab] glossary, i.e. real terms from private meetings.
+/config.toml
+
 # ASR model artifacts — large binaries, provisioned via models/provision.sh
 /models/*.bin
 /models/*.mlmodelc/
