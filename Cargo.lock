@@ -1580,6 +1580,7 @@ dependencies = [
  "hound",
  "libc",
  "log",
+ "regex",
  "ringbuf",
  "rubato 0.15.0",
  "serde",
