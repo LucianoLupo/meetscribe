@@ -4,6 +4,9 @@
 //!   - default (no subcommand) = a capture session (mic "You" + system-tap "Others", one clock);
 //!   - `transcribe <dir>`      = batch resample → VAD → whisper → merge → store + export;
 //!   - `list` / `export <id>`  = read back stored meetings;
+//!   - `vocab …`               = correction rules applied at RENDER time (never to stored text);
+//!   - `rerender [--all]`      = re-render stored meetings into their session dirs, preview by
+//!     default — how a new correction reaches past transcripts;
 //!   - `detect [--watch]`      = which allowlisted app (if any) holds the mic (Phase-4 detector).
 //!
 //! Capture usage:
@@ -16,6 +19,7 @@ mod vad;
 mod asr;
 mod transcript;
 mod db;
+mod render;
 mod export;
 mod detect;
 mod session;
@@ -28,7 +32,7 @@ mod status;
 mod tray;
 
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -248,12 +252,41 @@ fn run_list(argv: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `meetscribe export <id> [--db <path>] [--export-dir <dir>]` — re-export from the DB.
+/// Load a meeting's row plus its segments rendered with the current vocabulary (and, later,
+/// speaker names). `raw` skips rendering entirely — the escape hatch for diffing what changed.
+fn load_rendered(
+    db_path: &Path,
+    id: i64,
+    raw: bool,
+) -> Result<(db::MeetingRow, Vec<render::RenderedSegment>)> {
+    let rt = new_runtime()?;
+    let (row, segs, vocab_rows) = rt.block_on(async {
+        let mut database = db::Db::open(db_path).await?;
+        let row = database
+            .get_meeting(id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no meeting with id {id} in {}", db_path.display()))?;
+        let segs = database.load_segments(id).await?;
+        let vocab = if raw { Vec::new() } else { database.load_enabled_vocab().await? };
+        database.close().await?;
+        anyhow::Ok((row, segs, vocab))
+    })?;
+
+    let (vocab, warnings) = render::Vocab::compile(&vocab_rows);
+    for w in &warnings {
+        log::warn!("{w}");
+    }
+    let rendered = render::render(&segs, &render::IdentityMap::empty(), &vocab);
+    Ok((row, rendered))
+}
+
+/// `meetscribe export <id> [--db <path>] [--export-dir <dir>] [--raw]` — re-export from the DB.
 /// This exercises the real DB read path (round-trip proof).
 fn run_export(argv: &[String]) -> Result<()> {
     let mut id: Option<i64> = None;
     let mut db_path = default_db_path();
     let mut export_dir: Option<PathBuf> = None;
+    let mut raw = false;
     let mut it = argv.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -267,8 +300,11 @@ fn run_export(argv: &[String]) -> Result<()> {
                     export_dir = Some(PathBuf::from(v));
                 }
             }
+            "--raw" => raw = true,
             "-h" | "--help" => {
-                eprintln!("usage: meetscribe export <id> [--db <path>] [--export-dir <dir>]");
+                eprintln!(
+                    "usage: meetscribe export <id> [--db <path>] [--export-dir <dir>] [--raw]"
+                );
                 return Ok(());
             }
             s if !s.starts_with('-') && id.is_none() => {
@@ -286,22 +322,342 @@ fn run_export(argv: &[String]) -> Result<()> {
         anyhow::bail!("db {} does not exist — nothing to export", db_path.display());
     }
 
-    let rt = new_runtime()?;
-    let (row, segs) = rt.block_on(async {
-        let mut database = db::Db::open(&db_path).await?;
-        let row = database
-            .get_meeting(id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("no meeting with id {id} in {}", db_path.display()))?;
-        let segs = database.load_segments(id).await?;
-        database.close().await?;
-        anyhow::Ok((row, segs))
-    })?;
-
+    let (row, rendered) = load_rendered(&db_path, id, raw)?;
     let (md_path, json_path) =
-        export::write_exports(&export_dir, &format!("meeting-{id}"), &row, &segs)?;
+        export::write_exports(&export_dir, &format!("meeting-{id}"), &row, &rendered)?;
     println!("wrote {}", md_path.display());
     println!("wrote {}", json_path.display());
+    Ok(())
+}
+
+/// `meetscribe rerender [--all | <id>…] [--db <path>] [--write]` — re-render stored meetings
+/// into their ORIGINAL session directories, where the transcripts people actually read live
+/// (`~/.meetscribe/exports/` is only ever written by an explicit `export <id>`).
+///
+/// This is what makes the corrections loop retroactive: one rule, then every past meeting
+/// improves — with no whisper re-run. Preview by default; `--write` commits. Overwriting dozens
+/// of real session files deserves at least the caution `vocab test` gives a single rule.
+fn run_rerender(argv: &[String]) -> Result<()> {
+    let mut db_path = default_db_path();
+    let mut ids: Vec<i64> = Vec::new();
+    let mut all = false;
+    let mut write = false;
+    let mut it = argv.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--db" => {
+                if let Some(v) = it.next() {
+                    db_path = PathBuf::from(v);
+                }
+            }
+            "--all" => all = true,
+            "--write" => write = true,
+            "-h" | "--help" => {
+                eprintln!(
+                    "usage: meetscribe rerender [--all | <id>…] [--db <path>] [--write]\n\
+                     \n\
+                     Re-renders stored meetings into their session directories using the current\n\
+                     vocabulary. Previews by default; pass --write to overwrite the files."
+                );
+                return Ok(());
+            }
+            s if !s.starts_with('-') => {
+                ids.push(
+                    s.parse::<i64>()
+                        .with_context(|| format!("rerender: invalid id '{s}'"))?,
+                );
+            }
+            other => anyhow::bail!("rerender: unknown flag '{other}'"),
+        }
+    }
+    if !all && ids.is_empty() {
+        anyhow::bail!("rerender: pass --all or one or more meeting ids");
+    }
+    if !db_path.exists() {
+        anyhow::bail!("db {} does not exist", db_path.display());
+    }
+
+    if all {
+        let rt = new_runtime()?;
+        let meetings = rt.block_on(async {
+            let mut database = db::Db::open(&db_path).await?;
+            let m = database.list_meetings().await?;
+            database.close().await?;
+            anyhow::Ok(m)
+        })?;
+        ids = meetings.iter().map(|m| m.id).collect();
+    }
+
+    let (mut changed, mut unchanged, mut skipped) = (0usize, 0usize, 0usize);
+    for id in ids {
+        let (row, rendered) = load_rendered(&db_path, id, false)?;
+
+        // source_dir is untrusted historical data: early rows hold a relative path long since
+        // overwritten. Skip with a log rather than failing the whole run.
+        let dir = PathBuf::from(&row.source_dir);
+        if !dir.is_absolute() || !dir.is_dir() {
+            log::warn!(
+                "meeting {id}: source dir '{}' is not a usable absolute directory — skipped",
+                row.source_dir
+            );
+            skipped += 1;
+            continue;
+        }
+
+        let md = export::to_markdown(&row, &rendered);
+        let json = export::to_json(&rendered)?;
+        let md_path = dir.join("transcript.md");
+        let json_path = dir.join("transcript.json");
+
+        let md_differs = std::fs::read_to_string(&md_path).map(|c| c != md).unwrap_or(true);
+        let json_differs = std::fs::read_to_string(&json_path).map(|c| c != json).unwrap_or(true);
+        if !md_differs && !json_differs {
+            unchanged += 1;
+            continue;
+        }
+        changed += 1;
+
+        if write {
+            std::fs::write(&md_path, &md).with_context(|| format!("write {}", md_path.display()))?;
+            std::fs::write(&json_path, &json)
+                .with_context(|| format!("write {}", json_path.display()))?;
+            println!("meeting {id}: rewrote {}", dir.display());
+        } else {
+            println!("meeting {id}: would rewrite {}", dir.display());
+            if let Some((before, after)) = first_difference(&md_path, &md) {
+                println!("    - {before}");
+                println!("    + {after}");
+            }
+        }
+    }
+
+    let hint = match (write, changed) {
+        (true, _) => " (written)",
+        (false, 0) => "",
+        (false, _) => " — re-run with --write to apply",
+    };
+    println!("\n{changed} to change · {unchanged} already current · {skipped} skipped{hint}");
+    Ok(())
+}
+
+/// First differing non-empty line between a file on disk and the freshly rendered text.
+fn first_difference(path: &Path, fresh: &str) -> Option<(String, String)> {
+    let old = std::fs::read_to_string(path).ok()?;
+    old.lines()
+        .zip(fresh.lines())
+        .find(|(a, b)| a != b && !a.trim().is_empty())
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+}
+
+const VOCAB_USAGE: &str = "usage: meetscribe vocab <add|list|enable|disable|test> [...]\n\
+    \n\
+    \x20 add <pattern> <replacement> [--regex]   add a correction rule\n\
+    \x20 list                                    all rules, in application order\n\
+    \x20 enable <id> | disable <id>              toggle a rule (rules are never deleted)\n\
+    \x20 test [<id> | --all]                     preview affected segments before committing\n\
+    \n\
+    common: [--db <path>]";
+
+/// `meetscribe vocab …` — manage the correction rules applied at render time.
+///
+/// Rules are disabled, never deleted, so ids never shift and the documented "applied in id
+/// order" guarantee holds permanently.
+fn run_vocab(argv: &[String]) -> Result<()> {
+    let mut db_path = default_db_path();
+    let mut is_regex = false;
+    let mut all = false;
+    let mut positional: Vec<&str> = Vec::new();
+    let mut it = argv.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--db" => {
+                if let Some(v) = it.next() {
+                    db_path = PathBuf::from(v);
+                }
+            }
+            "--regex" => is_regex = true,
+            "--all" => all = true,
+            "-h" | "--help" => {
+                eprintln!("{VOCAB_USAGE}");
+                return Ok(());
+            }
+            s if !s.starts_with('-') => positional.push(s),
+            other => anyhow::bail!("vocab: unknown flag '{other}'\n\n{VOCAB_USAGE}"),
+        }
+    }
+    let sub = *positional.first().context(VOCAB_USAGE)?;
+
+    let rt = new_runtime()?;
+    match sub {
+        "add" => {
+            let pattern = positional
+                .get(1)
+                .context("vocab add: missing <pattern>\n\nexample: vocab add \"Cloud Code\" \"Claude Code\"")?;
+            let replacement = positional.get(2).context("vocab add: missing <replacement>")?;
+            // Compile before storing: a rule that cannot compile is a typo, and catching it here
+            // beats discovering it as a warning on every future export.
+            let probe = db::VocabRow {
+                id: 0,
+                pattern: (*pattern).to_string(),
+                replacement: (*replacement).to_string(),
+                is_regex,
+                enabled: true,
+                created_at: 0,
+            };
+            let (_, warnings) = render::Vocab::compile(std::slice::from_ref(&probe));
+            if let Some(w) = warnings.first() {
+                anyhow::bail!("{w}");
+            }
+            let id = rt.block_on(async {
+                let mut database = db::Db::open(&db_path).await?;
+                let id = database
+                    .add_vocab(pattern, replacement, is_regex, now_epoch())
+                    .await?;
+                database.close().await?;
+                anyhow::Ok(id)
+            })?;
+            println!(
+                "added rule {id}: '{pattern}' → '{replacement}'{}",
+                if is_regex { " (regex)" } else { "" }
+            );
+            println!("preview it with:  meetscribe vocab test {id}");
+        }
+        "list" => {
+            let rows = rt.block_on(async {
+                let mut database = db::Db::open(&db_path).await?;
+                let r = database.list_vocab().await?;
+                database.close().await?;
+                anyhow::Ok(r)
+            })?;
+            if rows.is_empty() {
+                println!("no vocabulary rules yet — add one with `meetscribe vocab add`");
+                return Ok(());
+            }
+            println!("{:>4}  {:<5}  {:<20}  {:<24}  REPLACEMENT", "ID", "STATE", "ADDED", "PATTERN");
+            for r in &rows {
+                println!(
+                    "{:>4}  {:<5}  {:<20}  {:<24}  {}{}",
+                    r.id,
+                    if r.enabled { "on" } else { "off" },
+                    export::fmt_utc(r.created_at),
+                    r.pattern,
+                    r.replacement,
+                    if r.is_regex { "   (regex)" } else { "" }
+                );
+            }
+        }
+        "enable" | "disable" => {
+            let want = sub == "enable";
+            let id: i64 = positional
+                .get(1)
+                .context("vocab enable/disable: missing <id>")?
+                .parse()
+                .context("vocab: <id> must be a number")?;
+            let found = rt.block_on(async {
+                let mut database = db::Db::open(&db_path).await?;
+                let found = database.set_vocab_enabled(id, want).await?;
+                database.close().await?;
+                anyhow::Ok(found)
+            })?;
+            if found {
+                println!("rule {id} {}", if want { "enabled" } else { "disabled" });
+            } else {
+                anyhow::bail!("no vocabulary rule with id {id}");
+            }
+        }
+        "test" => {
+            let only: Option<i64> = match positional.get(1) {
+                Some(s) => Some(s.parse().context("vocab test: <id> must be a number")?),
+                None if all => None,
+                None => anyhow::bail!("vocab test: pass an <id> or --all"),
+            };
+            run_vocab_test(&db_path, only)?;
+        }
+        other => anyhow::bail!("vocab: unknown subcommand '{other}'\n\n{VOCAB_USAGE}"),
+    }
+    Ok(())
+}
+
+/// Preview which stored segments a rule (or all rules) would change. Read-only: nothing on disk
+/// moves until `rerender --write`.
+fn run_vocab_test(db_path: &Path, only: Option<i64>) -> Result<()> {
+    if !db_path.exists() {
+        anyhow::bail!("db {} does not exist", db_path.display());
+    }
+    // One DB open for the whole preview — segments come back raw (never rendered), so what is
+    // compared is the stored text, not the output of some other rule.
+    let rt = new_runtime()?;
+    let (meetings, rows) = rt.block_on(async {
+        let mut database = db::Db::open(db_path).await?;
+        let meta = database.list_meetings().await?;
+        let mut meetings = Vec::with_capacity(meta.len());
+        for m in meta {
+            let segs = database.load_segments(m.id).await?;
+            meetings.push((m.id, segs));
+        }
+        let mut rows = database.list_vocab().await?;
+        if let Some(id) = only {
+            rows.retain(|r| r.id == id);
+        } else {
+            rows.retain(|r| r.enabled);
+        }
+        database.close().await?;
+        anyhow::Ok((meetings, rows))
+    })?;
+
+    if rows.is_empty() {
+        match only {
+            Some(id) => anyhow::bail!("no vocabulary rule with id {id}"),
+            None => {
+                println!("no enabled vocabulary rules to test");
+                return Ok(());
+            }
+        }
+    }
+    let (vocab, warnings) = render::Vocab::compile(&rows);
+    for w in &warnings {
+        log::warn!("{w}");
+    }
+
+    let mut hits = 0usize;
+    let mut shown = 0usize;
+    let mut touched_meetings = 0usize;
+    const MAX_SHOWN: usize = 20;
+    for (meeting_id, segs) in &meetings {
+        let before = hits;
+        for s in segs {
+            let after = vocab.apply(&s.seg.text);
+            if after == s.seg.text {
+                continue;
+            }
+            hits += 1;
+            if shown < MAX_SHOWN {
+                shown += 1;
+                println!(
+                    "meeting {meeting_id} segment {} [{}] rules {:?}",
+                    s.id,
+                    export::fmt_timestamp(s.seg.t_start),
+                    vocab.matching_rules(&s.seg.text)
+                );
+                println!("    - {}", s.seg.text.trim());
+                println!("    + {}", after.trim());
+            }
+        }
+        if hits > before {
+            touched_meetings += 1;
+        }
+    }
+    if hits > shown {
+        println!("\n… and {} more affected segment(s)", hits - shown);
+    }
+    if hits == 0 {
+        println!("no stored segment would change");
+        return Ok(());
+    }
+    println!(
+        "\n{hits} segment(s) across {touched_meetings} meeting(s) would change. \
+         Apply with: meetscribe rerender --all --write"
+    );
     Ok(())
 }
 
@@ -362,6 +718,8 @@ fn main() -> Result<()> {
         Some("transcribe") => return run_transcribe(&argv[2..]),
         Some("list") => return run_list(&argv[2..]),
         Some("export") => return run_export(&argv[2..]),
+        Some("rerender") => return run_rerender(&argv[2..]),
+        Some("vocab") => return run_vocab(&argv[2..]),
         Some("detect") => return run_detect(&argv[2..]),
         Some("daemon") => return daemon::run_daemon(&argv[2..]),
         Some("tray") => return tray::run_tray(&argv[2..]),

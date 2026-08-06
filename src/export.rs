@@ -1,9 +1,13 @@
 //! Per-meeting export (Phase 3) — human-readable Markdown + machine JSON.
 //!
-//! JSON is the same `serde_json::to_string_pretty(&[TranscriptSegment])` the pipeline
-//! already emitted (so a DB re-export byte-matches the pipeline output). Markdown adds a
-//! metadata header + `**[mm:ss] Speaker:** text` lines. Dates are UTC-labeled (no local
-//! offset — that's a `time` soundness footgun and the transcript body uses relative times).
+//! JSON is `serde_json::to_string_pretty(&[RenderedSegment])`, which is byte-identical to the
+//! old `&[TranscriptSegment]` output while no speaker labels exist (the identity fields are
+//! `Option` + skipped when `None`). Markdown adds a metadata header + `**[mm:ss] Speaker:** text`
+//! lines. Dates are UTC-labeled (no local offset — that's a `time` soundness footgun and the
+//! transcript body uses relative times).
+//!
+//! Export never decides what the text says: it receives already-rendered segments from
+//! [`crate::render`], the single place corrections and names are applied.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -11,7 +15,7 @@ use time::OffsetDateTime;
 use time::macros::format_description;
 
 use crate::db::MeetingRow;
-use crate::transcript::TranscriptSegment;
+use crate::render::RenderedSegment;
 
 /// `mm:ss`, or `h:mm:ss` past an hour. Floored to whole seconds.
 pub fn fmt_timestamp(secs: f64) -> String {
@@ -57,12 +61,12 @@ pub fn stamp_compact(epoch: i64) -> String {
 }
 
 /// Pretty JSON — identical to the pipeline's transcript.json shape.
-pub fn to_json(segs: &[TranscriptSegment]) -> Result<String> {
+pub fn to_json(segs: &[RenderedSegment]) -> Result<String> {
     serde_json::to_string_pretty(segs).context("serialize transcript json")
 }
 
 /// Speaker-labeled, timestamped Markdown for one meeting.
-pub fn to_markdown(m: &MeetingRow, segs: &[TranscriptSegment]) -> String {
+pub fn to_markdown(m: &MeetingRow, segs: &[RenderedSegment]) -> String {
     let mut out = String::new();
     out.push_str(&format!("# {}\n\n", m.title));
     out.push_str(&format!("- **Date:** {}\n", fmt_utc(m.started_at)));
@@ -77,7 +81,7 @@ pub fn to_markdown(m: &MeetingRow, segs: &[TranscriptSegment]) -> String {
             out.push_str(&format!(
                 "**[{}] {}:** {}\n\n",
                 fmt_timestamp(s.t_start),
-                s.speaker.label(),
+                s.display_label(),
                 s.text.trim()
             ));
         }
@@ -95,7 +99,7 @@ pub fn write_exports(
     dir: &Path,
     basename: &str,
     meeting: &MeetingRow,
-    segs: &[TranscriptSegment],
+    segs: &[RenderedSegment],
 ) -> Result<(PathBuf, PathBuf)> {
     std::fs::create_dir_all(dir).with_context(|| format!("create export dir {}", dir.display()))?;
     let md_path = dir.join(format!("{basename}.md"));
@@ -110,7 +114,8 @@ pub fn write_exports(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transcript::Speaker;
+    use crate::render::{IdentityMap, Vocab, render_fresh};
+    use crate::transcript::{Speaker, TranscriptSegment};
 
     fn row() -> MeetingRow {
         MeetingRow {
@@ -126,8 +131,17 @@ mod tests {
         }
     }
 
-    fn seg(sp: Speaker, t: f64, text: &str) -> TranscriptSegment {
-        TranscriptSegment { speaker: sp, text: text.into(), t_start: t, t_end: t + 1.0, confidence: 0.9 }
+    fn seg(sp: Speaker, t: f64, text: &str) -> RenderedSegment {
+        let raw = TranscriptSegment {
+            speaker: sp,
+            text: text.into(),
+            t_start: t,
+            t_end: t + 1.0,
+            confidence: 0.9,
+        };
+        render_fresh(&[raw], &IdentityMap::empty(), &Vocab::empty())
+            .pop()
+            .expect("one in, one out")
     }
 
     #[test]

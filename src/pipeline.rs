@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::{asr, db, export, resample, transcript, vad};
+use crate::{asr, db, export, render, resample, transcript, vad};
 
 /// Inputs for one transcribe+store+export run. Designed against BOTH callers (CLI + daemon):
 /// the daemon supplies an ABSOLUTE `model` path (under launchd `cwd=/`, a repo-relative path
@@ -139,8 +139,15 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
 
     // Persist to the DB, then export. A storage failure must NOT discard the transcript: on error
     // we log and fall back to a synthetic row so the Markdown/JSON still get written.
-    let (row, stored_id) = if opts.no_store {
-        (synth_row(&meta, merged.len()), None)
+    //
+    // Vocabulary is loaded INSIDE this block_on, before `close()` — these exports are the files
+    // the daemon writes for every captured meeting, so rendering them without corrections would
+    // mean the feature never reaches the surface people actually read.
+    let (row, stored_id, vocab_rows) = if opts.no_store {
+        // No DB handle on this path: render raw, and say so rather than silently differing from
+        // what `export <id>` would produce.
+        log::info!("--no-store: exporting without vocabulary corrections (no database opened)");
+        (synth_row(&meta, merged.len()), None, Vec::new())
     } else {
         let rt = crate::new_runtime()?;
         let stored = rt.block_on(async {
@@ -150,22 +157,42 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
                 .get_meeting(id)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("meeting {id} vanished after insert"))?;
+            let vocab = database.load_enabled_vocab().await?;
             database.close().await?;
-            anyhow::Ok((id, row))
+            anyhow::Ok((id, row, vocab))
         });
         match stored {
-            Ok((id, row)) => {
+            Ok((id, row, vocab)) => {
                 log::info!("stored meeting id {id} → {}", opts.db_path.display());
-                (row, Some(id))
+                (row, Some(id), vocab)
             }
             Err(e) => {
-                log::warn!("could not persist meeting ({e:#}); exporting without storage");
-                (synth_row(&meta, merged.len()), None)
+                // Same rendering inputs as the --no-store branch, deliberately: if these two
+                // diverged, a store failure would produce an on-disk transcript that no later
+                // `export <id>` could reproduce.
+                log::warn!(
+                    "could not persist meeting ({e:#}); exporting without storage \
+                     and without vocabulary corrections"
+                );
+                (synth_row(&meta, merged.len()), None, Vec::new())
             }
         }
     };
 
-    let (md_path, json_path) = export::write_exports(&opts.export_dir, "transcript", &row, &merged)?;
+    let vocab = if vocab_rows.is_empty() {
+        render::Vocab::empty()
+    } else {
+        let (v, warnings) = render::Vocab::compile(&vocab_rows);
+        for w in &warnings {
+            log::warn!("{w}");
+        }
+        log::info!("applying {} vocabulary correction(s)", vocab_rows.len() - warnings.len());
+        v
+    };
+    // Identity is empty until the speaker-ID work lands; render already handles it.
+    let rendered = render::render_fresh(&merged, &render::IdentityMap::empty(), &vocab);
+    let (md_path, json_path) =
+        export::write_exports(&opts.export_dir, "transcript", &row, &rendered)?;
 
     Ok(PipelineOutput {
         segments: merged,

@@ -38,6 +38,48 @@ Keys (all optional; unknown keys are warned and ignored, missing keys default):
 
 Disk/log hygiene (session prune + log rotation) runs at daemon startup and once per day.
 
+⚠️ **`retention.sessions_days > 0` deletes the audio permanently**, with no confirmation and no
+error. Transcripts survive in the DB, but anything that needs the WAVs again — re-transcribing with
+a better model, or the planned speaker enrollment — is gone for those meetings. `0` is the default
+for that reason.
+
+## Vocabulary corrections — stored text vs written text
+
+`transcript_segments.text` is **raw ASR output and is never rewritten in place.** Corrections
+(`meetscribe vocab …`) are applied when a transcript is rendered — by the daemon after each
+meeting, by `export <id>`, and by `rerender`. Three consequences worth knowing as an operator:
+
+- A correction added today fixes **every past meeting** on the next `rerender --all --write`, with
+  no whisper re-run (~18 min/meeting).
+- Corrections are reversible: `vocab disable <id>` then re-render. Nothing was ever destroyed.
+- `--no-store`, and a run where the DB write **fails**, both render with NO corrections (there is
+  no database to read them from) and log that they did. Their on-disk transcript is therefore raw,
+  and re-running `export <id>` later will legitimately differ. Both paths behave identically on
+  purpose — a store failure must not produce a file no later export can reproduce.
+
+The daemon applies whatever rules are enabled at the moment it finishes a meeting; it does not need
+a restart after `vocab add`, because the rules are read from the DB on each run.
+
+## Schema migrations
+
+The database carries a `PRAGMA user_version` and upgrades itself on first open by a newer binary.
+Before installing a build that bumps it:
+
+```
+cp ~/.meetscribe/meetscribe.db ~/.meetscribe/meetscribe.db.pre-vN   # 1. back up
+launchctl bootout gui/$(id -u)/com.lucianolupo.meetscribe           # 2. stop the daemon
+meetscribe list                                                     # 3. migrate + smoke-read
+sqlite3 ~/.meetscribe/meetscribe.db 'PRAGMA user_version'           # 4. confirm the bump
+```
+
+Then rebuild → re-sign → `meetscribe install` as usual. To revert, restore the backup and reinstall
+the old binary — migrations are additive (never a NOT NULL column, never a rename), so an older
+binary can still read a newer database.
+
+⚠️ Migrating turns `list` and `export` into **writers** on their first run under a new binary. The
+database uses SQLite's default rollback journal (no WAL), so writers serialize — run the migration
+with the daemon stopped rather than alongside a meeting being stored.
+
 ## Menu-bar tray (Phase 5) — `meetscribe tray`
 An optional, **separate** menu-bar app (its own process; the daemon is untouched). It reads
 `~/.meetscribe/status.json` (which the daemon writes) and shows a coloured dot:

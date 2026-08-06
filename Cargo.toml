@@ -42,6 +42,9 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
 # time: UTC date formatting for the Markdown export metadata (no local-offset — soundness footgun).
 time = { version = "0.3", features = ["formatting", "macros"] }
+# regex: vocabulary corrections applied at render time (word-boundary matching, opt-in raw regex).
+# Already compiled in-tree via env_logger → env_filter, so this is a declaration, not build weight.
+regex = "1"
 
 # macOS single-aggregate capture layer.
 # cidre pinned to meetily's verified rev — the ported core_audio recipe compiles only against this API surface.

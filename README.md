@@ -41,6 +41,27 @@ meetscribe export <id>   # save a transcript to a file
 meetscribe uninstall     # stop it; your recordings stay
 ```
 
+## Teaching it your words
+
+Whisper mangles names it has never heard — company names, product names, jargon. Tell it
+the right spelling once and every transcript it has ever written can be fixed:
+
+```bash
+meetscribe vocab add "Cloud Code" "Claude Code"   # add a correction
+meetscribe vocab test --all                       # preview what would change
+meetscribe rerender --all                         # preview again, per meeting
+meetscribe rerender --all --write                 # apply it to every past transcript
+```
+
+Corrections are applied when a transcript is **written**, never to what is stored. The
+database keeps exactly what the model heard, so a correction is always reversible
+(`meetscribe vocab disable <id>`, then `rerender --all --write`) and you can add one years
+later and still fix old meetings — no re-transcribing, which would cost ~18 minutes each.
+
+Matching is on whole words, so `NCP` will not rewrite `NCPX`. Pass `--regex` if you want a
+real pattern. Both `vocab test` and `rerender` preview by default and change nothing until
+you add `--write`.
+
 ## Before you start, you need
 
 | | |
