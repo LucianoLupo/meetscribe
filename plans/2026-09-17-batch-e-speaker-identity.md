@@ -141,7 +141,7 @@ CREATE INDEX IF NOT EXISTS idx_voice_clusters_meeting ON voice_clusters(meeting_
   nearest-in-time within `INHERIT_MAX_SECS = 30`, else `None`. Pure, deterministic.
 - `auto_match(centroid, n_windows, enrolled: &[(speaker_id, Vec<Vec<f32>>)]) -> Option<(speaker_id, score)>`
   — score per speaker = **max** cosine over that speaker's voiceprints; assign iff
-  `n_windows >= MIN_WINDOWS (5)`, `best >= MATCH_THRESHOLD (0.55)`, and
+  `n_windows >= MIN_WINDOWS (5)`, `best >= MATCH_THRESHOLD (0.70, raised from 0.55 after day-one labelling: wrong matches 0.55–0.62, right ones ≥ 0.76)`, and
   `best - second >= MATCH_MARGIN (0.05)` where `second = 0.0` when only one speaker is enrolled.
 - Constants are `pub const` with a one-line provenance comment each (from the Batch D addendum).
 - Tests: `cluster`, `centroid`, `label_clusters`, `inherit_short`, `auto_match` on synthetic

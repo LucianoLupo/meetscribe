@@ -23,8 +23,9 @@ pub const MIN_WINDOW_MS: usize = 1500;
 /// cosine between two groups is ≥ 0.55. Six of seven groups were one person each at this cut.
 pub const CLUSTER_CUT: f32 = 0.45;
 /// Cross-meeting recall: a cluster centroid needs at least this cosine to an enrolled voiceprint.
-/// A 0.62 pair was the same person, 0.30 pairs were different; 0.55 is the working point.
-pub const MATCH_THRESHOLD: f32 = 0.55;
+/// Set from the first day of real labelling (12 people, 8 meetings): every automatic match the
+/// owner judged wrong scored 0.55–0.62, every right one 0.76 or above. 0.70 sits in the gap.
+pub const MATCH_THRESHOLD: f32 = 0.70;
 /// The best speaker must beat the runner-up by this much, or the cluster stays unassigned.
 pub const MATCH_MARGIN: f32 = 0.05;
 /// Clusters with fewer embedded windows are never auto-named: the one mixed group in the

@@ -73,8 +73,9 @@ result lives in its own tables (`speakers`, `voice_clusters`, `segment_voices`, 
   transcribes without speaker identity. Provision it with `bash models/provision.sh`, then re-run
   `meetscribe install` (which copies/links it under `~/.meetscribe/models/speaker/`).
 - **Only manual labels enrol a voiceprint.** An automatic match never does, so one wrong match
-  cannot seed the next. A match needs cosine ≥ 0.55, a 0.05 margin over the runner-up, and at
-  least 5 embedded windows; anything less stays unnamed.
+  cannot seed the next. A match needs cosine ≥ 0.70, a 0.05 margin over the runner-up, and at
+  least 5 embedded windows; anything less stays unnamed (0.70 was set after the first day of
+  labelling: wrong matches scored 0.55–0.62, right ones 0.76+).
 - **The owner's loop for meetings stored before this feature:** `meetscribe speakers cluster --all`
   (reads each session's `system.wav` once; skips meetings whose recording is gone, and meetings
   already clustered) → `speakers list --pending` → `play` + `label` a few → `speakers match --all`
