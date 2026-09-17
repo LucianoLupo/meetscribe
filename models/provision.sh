@@ -16,8 +16,12 @@
 set -euo pipefail
 
 MODEL="large-v3"
-HF="https://huggingface.co/ggerganov/whisper.cpp/resolve/main"
-HF_RAW="https://huggingface.co/ggerganov/whisper.cpp/raw/main"
+WHISPER_REPO="ggerganov/whisper.cpp"
+# Speaker-embedding model (speaker identity): 3D-Speaker CAM++ zh/en "common advanced", exported
+# to bare ONNX by the sherpa-onnx maintainers. Input = 80-bin Kaldi fbank, mean-normalised;
+# output = 192-d embedding. 28 MB.
+SPEAKER_REPO="csukuangfj/speaker-embedding-models"
+SPEAKER_MODEL="3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx"
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 BIN="$DIR/ggml-${MODEL}.bin"
@@ -27,17 +31,18 @@ ENC_DIR="$DIR/ggml-${MODEL}-encoder.mlmodelc"
 log() { printf '[provision] %s\n' "$*"; }
 
 # Expected sha256 for an LFS file, read from its git-lfs pointer at /raw/main/.
+# $1 = HF repo (owner/name), $2 = remote filename
 expected_sha() {
-  curl -sL --fail --max-time 30 "$HF_RAW/$1" \
+  curl -sL --fail --max-time 30 "https://huggingface.co/$1/raw/main/$2" \
     | awk '/^oid sha256:/{sub("sha256:","",$2); print $2}'
 }
 
 sha_of() { shasum -a 256 "$1" | awk '{print $1}'; }
 
 download_verified() {
-  # $1 = remote filename, $2 = local path
-  local name="$1" out="$2" want have
-  want="$(expected_sha "$name")"
+  # $1 = HF repo (owner/name), $2 = remote filename, $3 = local path
+  local repo="$1" name="$2" out="$3" want have
+  want="$(expected_sha "$repo" "$name")"
   [ -n "$want" ] || { log "ERROR: could not read expected sha256 for $name"; exit 1; }
   if [ -f "$out" ]; then
     have="$(sha_of "$out")"
@@ -45,7 +50,7 @@ download_verified() {
     log "$name sha mismatch (have $have) — re-downloading"
   fi
   log "downloading $name ..."
-  curl -L --fail --progress-bar -o "$out.tmp" "$HF/$name"
+  curl -L --fail --progress-bar -o "$out.tmp" "https://huggingface.co/$repo/resolve/main/$name"
   have="$(sha_of "$out.tmp")"
   [ "$have" = "$want" ] || { log "ERROR: sha256 mismatch for $name (got $have want $want)"; rm -f "$out.tmp"; exit 1; }
   mv "$out.tmp" "$out"
@@ -53,13 +58,13 @@ download_verified() {
 }
 
 # --- model weights ---
-download_verified "ggml-${MODEL}.bin" "$BIN"
+download_verified "$WHISPER_REPO" "ggml-${MODEL}.bin" "$BIN"
 
 # --- CoreML encoder (pre-converted; sha-verified zip, then unzip + structural check) ---
 if [ -d "$ENC_DIR" ] && [ -f "$ENC_DIR/coremldata.bin" ]; then
   log "encoder $ENC_DIR present — skip"
 else
-  download_verified "ggml-${MODEL}-encoder.mlmodelc.zip" "$ENC_ZIP"
+  download_verified "$WHISPER_REPO" "ggml-${MODEL}-encoder.mlmodelc.zip" "$ENC_ZIP"
   log "unzipping encoder ..."
   rm -rf "$ENC_DIR"
   unzip -q -o "$ENC_ZIP" -x "__MACOSX/*" -d "$DIR"
@@ -68,6 +73,11 @@ else
   log "encoder unpacked + structurally verified"
 fi
 
+# --- speaker-embedding model (speaker identity) ---
+mkdir -p "$DIR/speaker"
+download_verified "$SPEAKER_REPO" "$SPEAKER_MODEL" "$DIR/speaker/$SPEAKER_MODEL"
+
 log "done."
+log "speaker: $DIR/speaker/$SPEAKER_MODEL ($(du -h "$DIR/speaker/$SPEAKER_MODEL" | awk '{print $1}'))"
 log "model:   $BIN ($(du -h "$BIN" | awk '{print $1}'))"
 log "encoder: $ENC_DIR ($(du -sh "$ENC_DIR" | awk '{print $1}'))"

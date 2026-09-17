@@ -20,3 +20,6 @@
 /models/*.mlmodelc/
 /models/*.zip
 /models/__MACOSX/
+
+# Speaker-embedding model — provisioned via models/provision.sh (never committed)
+/models/speaker/

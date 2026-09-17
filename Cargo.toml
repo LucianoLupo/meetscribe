@@ -45,6 +45,13 @@ time = { version = "0.3", features = ["formatting", "macros"] }
 # regex: vocabulary corrections applied at render time (word-boundary matching, opt-in raw regex).
 # Already compiled in-tree via env_logger → env_filter, so this is a declaration, not build weight.
 regex = "1"
+# Speaker embeddings (spike D): ONNX Runtime + Kaldi fbank front-end for the 3D-Speaker CAM++
+# model. ort is an EXACT pin matching silero's transitive requirement — a floating pre-release
+# req could resolve to a second rc and link two ONNX Runtimes. Default features = same set silero
+# already pulls (download-binaries at build time; no runtime download).
+ort = "=2.0.0-rc.10"
+ndarray = "0.16"        # ort tensor views + fbank matrices (already in-tree via silero)
+knf-rs = "0.3.2"        # kaldi-native-fbank (C++ via cmake): 80-bin, dither 0, mean-normalised
 
 # macOS single-aggregate capture layer.
 # cidre pinned to meetily's verified rev — the ported core_audio recipe compiles only against this API surface.
