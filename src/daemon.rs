@@ -83,6 +83,8 @@ struct DaemonConfig {
     logs_dir: PathBuf,
     db_path: PathBuf,
     model: PathBuf,
+    /// Speaker-embedding model (absolute). Missing ⇒ transcripts without speaker identity.
+    speaker_model: PathBuf,
     lang: String,
     min_secs: f64,
     once: bool,
@@ -153,6 +155,7 @@ pub(crate) fn run_daemon(argv: &[String]) -> Result<()> {
         logs_dir: base.join("logs"),
         db_path: base.join("meetscribe.db"),
         model: model_override.unwrap_or_else(|| base.join("models/ggml-large-v3.bin")),
+        speaker_model: base.join(crate::SPEAKER_MODEL_REL),
         lang: lang_override.unwrap_or(file_cfg.daemon.lang),
         min_secs: min_secs_override.unwrap_or(file_cfg.daemon.min_secs),
         allowlist,
@@ -180,6 +183,14 @@ pub(crate) fn run_daemon(argv: &[String]) -> Result<()> {
             "model not found at {} — meetings will still be CAPTURED, but transcription will fail \
              until the model is provisioned (see `meetscribe install`).",
             cfg.model.display()
+        );
+    }
+    if !cfg.speaker_model.exists() {
+        log::warn!(
+            "speaker model not found at {} — meetings will be transcribed but far-end voices will \
+             not be identified until it is provisioned (`bash models/provision.sh`, then \
+             `meetscribe install`).",
+            cfg.speaker_model.display()
         );
     }
     log::info!(
@@ -359,6 +370,7 @@ fn record_and_process(cfg: &DaemonConfig, app: &str) -> Result<()> {
         db_path: cfg.db_path.clone(),
         export_dir: dir.clone(),
         no_store: false,
+        speaker_model: Some(cfg.speaker_model.clone()),
     };
     log::info!("transcribing {} …", dir.display());
     // Capture is done but this call blocks for minutes on a long meeting — publish the transition so

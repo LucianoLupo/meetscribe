@@ -3,10 +3,13 @@
 **Date:** 2026-09-17 · **Plan:** `2026-08-05-speaker-identity-and-vocabulary.md` §D
 **Branch:** `spike/speaker-embeddings` · **Probe:** `src/bin/spk_probe.rs`
 
-## Verdict — NO-GO on the current recordings, GO once the input device changes
+## Verdict — GO for Batch E on the existing recordings (revised by the listening tests below)
 
-The embedding pipeline is correct. The recorded audio is telephone-band, and that alone
-explains the miss. Fixing it costs nothing: stop using the Bluetooth headset's microphone.
+The first reading of the numbers was NO-GO: the window-level EER on the owner's own mic channel
+missed its target because the audio is telephone-band. The addendum at the end shows that this
+was the wrong proxy — on the **far-end** channel, which is what speaker identity is about, the
+owner's ears confirmed clean clusters and correct cross-meeting recall. Switching off the
+Bluetooth headset's microphone remains a free quality improvement, not a prerequisite.
 
 | Exit criterion | Target | Measured | Result |
 |---|---|---|---|

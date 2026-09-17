@@ -60,6 +60,33 @@ meeting, by `export <id>`, and by `rerender`. Three consequences worth knowing a
 The daemon applies whatever rules are enabled at the moment it finishes a meeting; it does not need
 a restart after `vocab add`, because the rules are read from the DB on each run.
 
+## Speaker identity — far-end voices, named once
+
+After transcribing, the daemon embeds every far-end (`system.wav`) speech window with the speaker
+model at `~/.meetscribe/models/speaker/…onnx`, clusters the windows into voices (`A`, `B`, … by
+speech time), and matches each cluster against the voiceprints of people you have named. The
+result lives in its own tables (`speakers`, `voice_clusters`, `segment_voices`, `voiceprints`);
+`transcript_segments` is never touched. Rendering resolves a segment's cluster to a name through
+`load_segments`, so the daemon's `transcript.md`, `export`, and `rerender` all agree.
+
+- **Missing speaker model** ⇒ the daemon logs one warning at startup and one per meeting, and
+  transcribes without speaker identity. Provision it with `bash models/provision.sh`, then re-run
+  `meetscribe install` (which copies/links it under `~/.meetscribe/models/speaker/`).
+- **Only manual labels enrol a voiceprint.** An automatic match never does, so one wrong match
+  cannot seed the next. A match needs cosine ≥ 0.55, a 0.05 margin over the runner-up, and at
+  least 5 embedded windows; anything less stays unnamed.
+- **The owner's loop for meetings stored before this feature:** `meetscribe speakers cluster --all`
+  (reads each session's `system.wav` once; skips meetings whose recording is gone, and meetings
+  already clustered) → `speakers list --pending` → `play` + `label` a few → `speakers match --all`
+  → `rerender --all` (preview) → `rerender --all --write`. `cluster --all` over ~130 meetings takes
+  roughly half an hour; run it with the daemon idle.
+- **Imported far-end-only sessions** (no `mic.wav`) contain your own voice on the far end: `skip`
+  it or label yourself.
+- **A clustered meeting's `transcript.json` gains `voice_cluster` per far-end segment** even before
+  any name exists (it is how `play` finds the audio). `rerender` previews that change like any other.
+- Short windows (< 1.5 s) are not embedded; they take the cluster of the nearest embedded window
+  within 30 s, or stay unassigned.
+
 ## Schema migrations
 
 The database carries a `PRAGMA user_version` and upgrades itself on first open by a newer binary.
@@ -72,9 +99,12 @@ meetscribe list                                                     # 3. migrate
 sqlite3 ~/.meetscribe/meetscribe.db 'PRAGMA user_version'           # 4. confirm the bump
 ```
 
-Then rebuild → re-sign → `meetscribe install` as usual. To revert, restore the backup and reinstall
-the old binary — migrations are additive (never a NOT NULL column, never a rename), so an older
-binary can still read a newer database.
+Then rebuild → re-sign → `meetscribe install` as usual. To revert, **reinstall the old binary** —
+migrations are additive (never a NOT NULL column, never a rename), so an older binary reads a newer
+database. Restore the backup only if a rung failed half-way, which the transactional ladder is built
+to prevent; restoring it otherwise discards every meeting captured since the copy.
+
+Rungs so far: v1 `vocab_corrections`; v2 the four speaker-identity tables (CREATE only, no ALTER).
 
 ⚠️ Migrating turns `list` and `export` into **writers** on their first run under a new binary. The
 database uses SQLite's default rollback journal (no WAL), so writers serialize — run the migration
@@ -118,7 +148,9 @@ the **manual capture** flow directly from it, which needs its own TCC grant.)
 3. copy the running binary → `~/.meetscribe/bin/meetscribe` (a **stable path** so future
    `cargo build`s can't zero the running daemon's signature/TCC grant) and **re-sign** it there;
 4. provision the model at `~/.meetscribe/models/ggml-large-v3.bin` — a **symlink** to the repo model
-   by default (no 2.9 GB copy), or `install --copy` for a repo-independent copy;
+   by default (no 2.9 GB copy), or `install --copy` for a repo-independent copy — and, the same way,
+   the speaker model under `~/.meetscribe/models/speaker/` (missing ⇒ warn, the daemon transcribes
+   without speaker identity; `--speaker-model <onnx>` overrides the source);
 5. write `~/Library/LaunchAgents/com.lucianolupo.meetscribe.plist` (absolute paths, pinned `HOME`,
    `RunAtLoad`, `KeepAlive` on crash);
 6. `launchctl bootstrap gui/$UID` it (starts now + at every login).

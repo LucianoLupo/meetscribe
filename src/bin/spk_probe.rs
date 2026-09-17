@@ -27,72 +27,26 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
-use ndarray::Array3;
-use ort::session::{builder::GraphOptimizationLevel, Session};
-use ort::value::TensorRef;
 
 #[allow(dead_code)]
 #[path = "../resample.rs"]
 mod resample;
 #[allow(dead_code)]
+#[path = "../spk.rs"]
+mod spk;
+#[allow(dead_code)]
 #[path = "../vad.rs"]
 mod vad;
 
+use spk::{cosine, Embedder};
+
 const RATE: usize = 16_000;
 /// Windows shorter than this are not embedded (E's floor).
-const MIN_WINDOW_MS: usize = 1500;
+const MIN_WINDOW_MS: usize = spk::MIN_WINDOW_MS;
 /// Sub-chunk length for the purity check.
 const CHUNK_SECS: usize = 3;
 /// Only `others` windows at least this long get the purity check (≥ 3 sub-chunks).
 const PURITY_MIN_SECS: usize = 9;
-
-// ---------------------------------------------------------------- embedder
-
-struct Embedder {
-    session: Session,
-    input_name: String,
-    dim: usize,
-}
-
-impl Embedder {
-    fn load(path: &Path) -> Result<Self> {
-        let session = Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .with_intra_threads(4)?
-            .commit_from_file(path)
-            .with_context(|| format!("load speaker model {}", path.display()))?;
-        let input_name = session
-            .inputs
-            .first()
-            .map(|i| i.name.clone())
-            .context("model has no inputs")?;
-        Ok(Self { session, input_name, dim: 0 })
-    }
-
-    /// L2-normalised embedding of a 16 kHz mono clip.
-    fn embed(&mut self, audio_16k: &[f32]) -> Result<Vec<f32>> {
-        // knf: 25 ms / 10 ms Kaldi fbank, 80 bins, dither 0, then per-utterance mean subtraction
-        // (== the model's `feature_normalize_type: global-mean`, `normalize_samples: 1`).
-        let feats = knf_rs::compute_fbank(audio_16k).map_err(|e| anyhow::anyhow!("fbank: {e}"))?;
-        let (t, bins) = feats.dim();
-        let x: Array3<f32> = feats
-            .into_shape_with_order((1, t, bins))
-            .context("reshape fbank to (1,T,80)")?;
-        let outputs = self.session.run(ort::inputs![
-            self.input_name.as_str() => TensorRef::from_array_view(x.view())?
-        ])?;
-        let (_, data) = outputs[0].try_extract_tensor::<f32>()?;
-        let mut v = data.to_vec();
-        let norm = v.iter().map(|a| a * a).sum::<f32>().sqrt().max(1e-9);
-        v.iter_mut().for_each(|a| *a /= norm);
-        self.dim = v.len();
-        Ok(v)
-    }
-}
-
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
-}
 
 // ---------------------------------------------------------------- audio helpers
 

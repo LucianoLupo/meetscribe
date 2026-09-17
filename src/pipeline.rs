@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::{asr, db, export, render, resample, transcript, vad};
+use crate::{asr, db, export, render, resample, spk, transcript, vad, voices};
 
 /// Inputs for one transcribe+store+export run. Designed against BOTH callers (CLI + daemon):
 /// the daemon supplies an ABSOLUTE `model` path (under launchd `cwd=/`, a repo-relative path
@@ -27,6 +27,9 @@ pub(crate) struct PipelineOpts {
     /// Where the Markdown+JSON land (defaults, at both call sites, to the capture/session dir).
     pub export_dir: PathBuf,
     pub no_store: bool,
+    /// Speaker-embedding ONNX model. `None` or a missing file ⇒ transcribe without speaker
+    /// identity (logged once), nothing else changes. MUST be absolute for the daemon.
+    pub speaker_model: Option<PathBuf>,
 }
 
 /// Result of the pipeline. `segments`/`meeting_secs`/`rtf`/`wall_secs` let the CLI wrapper print
@@ -73,13 +76,17 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
         .to_str()
         .with_context(|| format!("model path not valid UTF-8: {}", opts.model.display()))?;
     let mut asr = asr::Asr::load(model_str).with_context(|| format!("load model {model_str}"))?;
+    let mut embedder = load_embedder(opts.speaker_model.as_deref());
     // Inter-segment gaps the capture layer recorded on rate-roll boundaries (empty for the common
     // single-segment case). Both channels share the same manifest.
     let gaps = read_segment_gaps(dir)?;
 
     let t0 = Instant::now();
-    let mut segs: Vec<transcript::TranscriptSegment> = Vec::new();
+    // Each segment travels with its far-end speaker embedding (`None` for the mic channel, for
+    // windows under the embedding floor, and when there is no embedder).
+    let mut segs: Vec<(transcript::TranscriptSegment, Option<Vec<f32>>)> = Vec::new();
     let mut meeting_secs = 0.0f64;
+    let embed_floor = spk::MIN_WINDOW_MS * resample::TARGET_RATE as usize / 1000;
 
     for (files, speaker) in [
         (&mic_files, transcript::Speaker::You),
@@ -114,21 +121,42 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
                 if text.is_empty() {
                     continue;
                 }
-                segs.push(transcript::TranscriptSegment {
-                    speaker,
-                    text,
-                    t_start: offset + w.start_ms as f64 / 1000.0,
-                    t_end: offset + w.end_ms as f64 / 1000.0,
-                    confidence,
-                });
+                let embedding = match embedder.as_mut() {
+                    Some(e) if speaker == transcript::Speaker::Others && b - a >= embed_floor => {
+                        Some(e.embed(&audio16[a..b]).context("speaker embedding")?)
+                    }
+                    _ => None,
+                };
+                segs.push((
+                    transcript::TranscriptSegment {
+                        speaker,
+                        text,
+                        t_start: offset + w.start_ms as f64 / 1000.0,
+                        t_end: offset + w.end_ms as f64 / 1000.0,
+                        confidence,
+                    },
+                    embedding,
+                ));
             }
             offset += dur;
         }
         meeting_secs = meeting_secs.max(offset);
     }
 
-    let merged = transcript::merge(segs);
+    let (merged, embeddings): (Vec<transcript::TranscriptSegment>, Vec<Option<Vec<f32>>>) =
+        transcript::merge_keyed(segs).into_iter().unzip();
     let wall = t0.elapsed().as_secs_f64();
+
+    // Far-end voice clusters for this meeting (empty without an embedder). Keys are indices into
+    // `merged`, which is exactly what `insert_meeting_with_voices` expects.
+    let windows: Vec<voices::Window> = merged
+        .iter()
+        .zip(&embeddings)
+        .enumerate()
+        .filter(|(_, (s, _))| s.speaker == transcript::Speaker::Others)
+        .map(|(i, (s, e))| voices::Window { key: i as i64, t_start: s.t_start, t_end: s.t_end, embedding: e.clone() })
+        .collect();
+    let mut assembly = voices::assemble(&windows, spk::CLUSTER_CUT);
     let rtf = if meeting_secs > 0.0 { wall / meeting_secs } else { 0.0 };
 
     // started_at = the real meeting time (earliest capture-file birth time).
@@ -148,54 +176,72 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
     // Vocabulary is loaded INSIDE this block_on, before `close()` — these exports are the files
     // the daemon writes for every captured meeting, so rendering them without corrections would
     // mean the feature never reaches the surface people actually read.
-    let (row, stored_id, vocab_rows) = if opts.no_store {
+    // Stored: (row, id, vocab rows, the segments re-read from the DB, speakers) — the exports are
+    // then rendered from the SAME rows `export <id>` reads, so the daemon's transcript.md carries
+    // the same names and corrections. Unstored: no identity, no vocab, rendered from `merged`.
+    let stored = if opts.no_store {
         // No DB handle on this path: render raw, and say so rather than silently differing from
         // what `export <id>` would produce.
-        log::info!("--no-store: exporting without vocabulary corrections (no database opened)");
-        (synth_row(&meta, merged.len()), None, Vec::new())
+        log::info!(
+            "--no-store: exporting without vocabulary corrections and without speaker names \
+             (no database opened)"
+        );
+        None
     } else {
         let rt = crate::new_runtime()?;
-        let stored = rt.block_on(async {
+        let res = rt.block_on(async {
             let mut database = db::Db::open(&opts.db_path).await?;
-            let id = database.insert_meeting(&meta, &merged).await?;
+            let enrolled = voices::decode_enrolled(&database.load_enrolled().await?)?;
+            let matched = voices::apply_matches(&mut assembly, &enrolled);
+            let id = database
+                .insert_meeting_with_voices(&meta, &merged, &assembly.clusters, &assembly.voices)
+                .await?;
             let row = database
                 .get_meeting(id)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("meeting {id} vanished after insert"))?;
             let vocab = database.load_enabled_vocab().await?;
+            let segments = database.load_segments(id).await?;
+            let speakers = database.list_speakers().await?;
             database.close().await?;
-            anyhow::Ok((id, row, vocab))
+            anyhow::Ok((id, row, vocab, segments, speakers, matched))
         });
-        match stored {
-            Ok((id, row, vocab)) => {
+        match res {
+            Ok((id, row, vocab, segments, speakers, matched)) => {
                 log::info!("stored meeting id {id} → {}", opts.db_path.display());
-                (row, Some(id), vocab)
+                if !assembly.is_empty() {
+                    log::info!(
+                        "far-end voices: {} cluster(s), {matched} recognised — `meetscribe speakers list {id}`",
+                        assembly.clusters.len()
+                    );
+                }
+                Some((row, id, vocab, segments, speakers))
             }
             Err(e) => {
                 // Same rendering inputs as the --no-store branch, deliberately: if these two
                 // diverged, a store failure would produce an on-disk transcript that no later
                 // `export <id>` could reproduce.
                 log::warn!(
-                    "could not persist meeting ({e:#}); exporting without storage \
-                     and without vocabulary corrections"
+                    "could not persist meeting ({e:#}); exporting without storage, without \
+                     vocabulary corrections and without speaker names"
                 );
-                (synth_row(&meta, merged.len()), None, Vec::new())
+                None
             }
         }
     };
 
-    let vocab = if vocab_rows.is_empty() {
-        render::Vocab::empty()
-    } else {
-        let (v, warnings) = render::Vocab::compile(&vocab_rows);
-        for w in &warnings {
-            log::warn!("{w}");
+    let (row, stored_id, rendered) = match stored {
+        Some((row, id, vocab_rows, segments, speakers)) => {
+            let vocab = compile_vocab(&vocab_rows);
+            let ids = render::IdentityMap::from_db(&speakers);
+            (row, Some(id), render::render(&segments, &ids, &vocab))
         }
-        log::info!("applying {} vocabulary correction(s)", vocab_rows.len() - warnings.len());
-        v
+        None => (
+            synth_row(&meta, merged.len()),
+            None,
+            render::render_fresh(&merged, &render::IdentityMap::empty(), &render::Vocab::empty()),
+        ),
     };
-    // Identity is empty until the speaker-ID work lands; render already handles it.
-    let rendered = render::render_fresh(&merged, &render::IdentityMap::empty(), &vocab);
     let (md_path, json_path) =
         export::write_exports(&opts.export_dir, "transcript", &row, &rendered)?;
 
@@ -210,8 +256,40 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
     })
 }
 
+fn compile_vocab(rows: &[db::VocabRow]) -> render::Vocab {
+    if rows.is_empty() {
+        return render::Vocab::empty();
+    }
+    let (v, warnings) = render::Vocab::compile(rows);
+    for w in &warnings {
+        log::warn!("{w}");
+    }
+    log::info!("applying {} vocabulary correction(s)", rows.len() - warnings.len());
+    v
+}
+
+/// The speaker-embedding model, or `None` with ONE log line explaining why identity is off.
+fn load_embedder(path: Option<&Path>) -> Option<spk::Embedder> {
+    let path = path?;
+    if !path.exists() {
+        log::warn!(
+            "speaker model not found at {} — transcribing without speaker identity \
+             (run `bash models/provision.sh`, then `meetscribe install`)",
+            path.display()
+        );
+        return None;
+    }
+    match spk::Embedder::load(path) {
+        Ok(e) => Some(e),
+        Err(e) => {
+            log::warn!("speaker model failed to load ({e:#}) — transcribing without speaker identity");
+            None
+        }
+    }
+}
+
 /// Read a capture WAV of any sample rate → (mono f32 samples, rate).
-fn read_wav_any_rate(path: &Path) -> Result<(Vec<f32>, u32)> {
+pub(crate) fn read_wav_any_rate(path: &Path) -> Result<(Vec<f32>, u32)> {
     let reader = hound::WavReader::open(path).with_context(|| format!("open {}", path.display()))?;
     let spec = reader.spec();
     if spec.channels != 1
@@ -259,7 +337,7 @@ fn parse_segment_gaps(content: &str) -> HashMap<u32, f64> {
     gaps
 }
 
-fn read_segment_gaps(dir: &Path) -> Result<HashMap<u32, f64>> {
+pub(crate) fn read_segment_gaps(dir: &Path) -> Result<HashMap<u32, f64>> {
     let path = dir.join("segments.txt");
     if !path.exists() {
         return Ok(HashMap::new());
@@ -270,7 +348,7 @@ fn read_segment_gaps(dir: &Path) -> Result<HashMap<u32, f64>> {
 }
 
 /// Ordered segment files for a channel base ("mic"/"system"): base.wav, base.001.wav, …
-fn discover_channel(dir: &Path, base: &str) -> Vec<PathBuf> {
+pub(crate) fn discover_channel(dir: &Path, base: &str) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let seg0 = dir.join(format!("{base}.wav"));
     if seg0.exists() {

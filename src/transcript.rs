@@ -49,10 +49,12 @@ pub struct TranscriptSegment {
 }
 
 /// Merge segments from both channels into one time-ordered transcript (stable by t_start).
-pub fn merge(mut segs: Vec<TranscriptSegment>) -> Vec<TranscriptSegment> {
+/// Segments carry a companion value (the pipeline pairs each far-end segment with its speaker
+/// embedding, `()` when there is none). One comparator, one order.
+pub fn merge_keyed<T>(mut segs: Vec<(TranscriptSegment, T)>) -> Vec<(TranscriptSegment, T)> {
     segs.sort_by(|a, b| {
-        a.t_start
-            .partial_cmp(&b.t_start)
+        a.0.t_start
+            .partial_cmp(&b.0.t_start)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     segs
@@ -70,10 +72,10 @@ mod tests {
     fn merge_orders_both_channels_by_start() {
         let you = vec![seg(Speaker::You, 0.0), seg(Speaker::You, 5.0)];
         let others = vec![seg(Speaker::Others, 2.0), seg(Speaker::Others, 3.0)];
-        let merged = merge([you, others].concat());
-        let order: Vec<f64> = merged.iter().map(|s| s.t_start).collect();
+        let merged = merge_keyed([you, others].concat().into_iter().map(|s| (s, ())).collect());
+        let order: Vec<f64> = merged.iter().map(|(s, ())| s.t_start).collect();
         assert_eq!(order, vec![0.0, 2.0, 3.0, 5.0]);
-        assert_eq!(merged[1].speaker, Speaker::Others);
+        assert_eq!(merged[1].0.speaker, Speaker::Others);
     }
 
     #[test]

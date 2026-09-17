@@ -196,6 +196,7 @@ fn provision_model(src: &Path, dest: &Path, copy: bool) -> Result<()> {
 /// `meetscribe install [--model <ggml.bin>] [--copy]` — install + load the login LaunchAgent.
 pub(crate) fn run_install(argv: &[String]) -> Result<()> {
     let mut model_src = PathBuf::from("models/ggml-large-v3.bin");
+    let mut speaker_src = PathBuf::from(crate::SPEAKER_MODEL_REL);
     let mut copy_model = false;
     let mut identity: Option<String> = None;
     let mut it = argv.iter();
@@ -206,6 +207,11 @@ pub(crate) fn run_install(argv: &[String]) -> Result<()> {
                     model_src = PathBuf::from(v);
                 }
             }
+            "--speaker-model" => {
+                if let Some(v) = it.next() {
+                    speaker_src = PathBuf::from(v);
+                }
+            }
             "--identity" | "-i" => {
                 if let Some(v) = it.next() {
                     identity = Some(v.clone());
@@ -214,7 +220,8 @@ pub(crate) fn run_install(argv: &[String]) -> Result<()> {
             "--copy" => copy_model = true,
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: meetscribe install [--model <ggml.bin>] [--copy] [--identity <sha1>]\n\n\
+                    "usage: meetscribe install [--model <ggml.bin>] [--speaker-model <onnx>] [--copy] \
+                     [--identity <sha1>]\n\n\
                      --identity  codesigning identity to re-sign the daemon binary with.\n\
                      {SIGN_IDENTITY_ENV} is consulted next; otherwise the sole identity from\n\
                      `security find-identity -v -p codesigning` is used, and anything else errors."
@@ -239,10 +246,12 @@ pub(crate) fn run_install(argv: &[String]) -> Result<()> {
     let bin_dir = base.join("bin");
     let dest_bin = bin_dir.join("meetscribe");
     let models_dir = base.join("models");
+    let speaker_dest = base.join(crate::SPEAKER_MODEL_REL);
     let logs_dir = base.join("logs");
     let out_log = logs_dir.join("meetscribe.out.log");
     let err_log = logs_dir.join("meetscribe.err.log");
-    for d in [&bin_dir, &models_dir, &logs_dir, &base.join("sessions")] {
+    let speaker_dir = speaker_dest.parent().expect("speaker model path has a parent").to_path_buf();
+    for d in [&bin_dir, &models_dir, &speaker_dir, &logs_dir, &base.join("sessions")] {
         std::fs::create_dir_all(d).with_context(|| format!("create {}", d.display()))?;
     }
 
@@ -277,6 +286,18 @@ pub(crate) fn run_install(argv: &[String]) -> Result<()> {
              at {} (re-run install with --model <path>)",
             model_src.display(),
             models_dir.join("ggml-large-v3.bin").display()
+        ),
+    }
+
+    // 3b. Same for the speaker-embedding model — warn, never fail: the daemon transcribes without
+    //     speaker identity until it is provisioned.
+    match std::fs::canonicalize(&speaker_src) {
+        Ok(abs) => provision_model(&abs, &speaker_dest, copy_model)?,
+        Err(_) => log::warn!(
+            "speaker model {} not found — daemon will transcribe but NOT identify far-end voices \
+             until it is placed at {} (run `bash models/provision.sh`, then re-run install)",
+            speaker_src.display(),
+            speaker_dest.display()
         ),
     }
 

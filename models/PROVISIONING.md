@@ -93,4 +93,26 @@ The compile cache is keyed to the model + machine; it survives across runs and r
 **doc-only** step by choice (Phase 5) — there is no `prewarm` subcommand, because the shipped daemon
 never uses CoreML, so pre-warm only matters when you deliberately opt a manual run into it.
 
-**Provisioned:** 2026-07-19.
+## Speaker-embedding model — 3D-Speaker CAM++ (speaker identity)
+
+Provisioned by the same script into `models/speaker/` (gitignored: `/models/speaker/`), from the
+sherpa-onnx maintainers' bare-ONNX export, sha256 read from the HF git-lfs pointer at fetch time:
+
+| Artifact | On disk | Size | sha256 |
+|---|---|---|---|
+| `3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx` (repo `csukuangfj/speaker-embedding-models`) | `models/speaker/…onnx` | 28.3 MB | `aa3cfc16…` (full value printed by `provision.sh` on verification) |
+
+- **Input** is an 80-bin Kaldi fbank `(1, T, 80)` — 25/10 ms, dither 0, per-utterance mean
+  subtraction, samples in [-1, 1] — computed by `knf-rs` (kaldi-native-fbank). Output is a 192-d
+  embedding, L2-normalised in `src/spk.rs`. The mel high cutoff is the Kaldi default (Nyquist);
+  sherpa-onnx's `nyquist − 400` is an ASR convention 3D-Speaker did not train with — do not "fix"
+  the Rust path to match it (Batch D verified bit-parity against `kaldi_native_fbank` at 0.9996).
+- **Why this model:** it handles the telephone-band audio a Bluetooth headset (HFP) produces well
+  enough by ear — six of seven far-end groups clean, six of six cross-meeting pairs right — and it
+  shares `ort` with the VAD, so there is one ONNX runtime in the binary.
+- **Cost:** embedding runs at ~0.006× real time; clustering a 59-minute meeting from its recording
+  takes ~14 s wall clock, dominated by decoding the WAV.
+- **Provisioned:** 2026-09-17. Calibration and listening results:
+  `plans/2026-09-17-batch-d-speaker-embedding-results.md`.
+
+**Provisioned (ASR):** 2026-07-19.

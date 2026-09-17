@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::db::{StoredSegment, VocabRow};
+use crate::db::{SpeakerRow, StoredSegment, VocabRow};
 use crate::transcript::{Speaker, TranscriptSegment};
 
 /// A segment ready for display. Serializes byte-identically to `TranscriptSegment` while the
@@ -44,8 +44,8 @@ impl RenderedSegment {
     }
 }
 
-/// Resolved speaker names. Empty until the speaker-ID work lands, at which point `names` maps a
-/// `speakers.id` to a person and `your_name` renames the mic channel.
+/// Resolved speaker names: `names` maps a `speakers.id` to "First Last". `your_name` would rename
+/// the mic channel; it is not configurable yet (v1.1), so the mic channel always renders "You".
 #[derive(Debug, Clone, Default)]
 pub struct IdentityMap {
     your_name: Option<String>,
@@ -55,6 +55,15 @@ pub struct IdentityMap {
 impl IdentityMap {
     pub fn empty() -> Self {
         Self::default()
+    }
+
+    /// Names for every person in the database. A far-end segment whose cluster is unnamed (or
+    /// skipped) has no `speaker_id` and falls back to the channel label.
+    pub fn from_db(speakers: &[SpeakerRow]) -> Self {
+        Self {
+            your_name: None,
+            names: speakers.iter().map(|s| (s.id, s.full_name())).collect(),
+        }
     }
 
     fn resolve(&self, speaker: Speaker, speaker_id: Option<i64>) -> Option<String> {
@@ -362,6 +371,34 @@ mod tests {
             stored[0].seg.text, "the NCP gateway",
             "the raw segment must not be mutated"
         );
+    }
+
+    #[test]
+    fn named_clusters_render_the_full_name_and_unnamed_ones_the_channel() {
+        let people = vec![SpeakerRow {
+            id: 7,
+            first_name: "Ada".into(),
+            last_name: "Lovelace".into(),
+            created_at: 0,
+            voiceprints: 1,
+        }];
+        let ids = IdentityMap::from_db(&people);
+        let mut named = StoredSegment::unstored(seg("hola"));
+        named.speaker_id = Some(7);
+        named.voice_cluster = Some("A".into());
+        let mut unnamed = StoredSegment::unstored(seg("chau"));
+        unnamed.voice_cluster = Some("B".into());
+        let mut you = StoredSegment::unstored(seg("yo"));
+        you.seg.speaker = Speaker::You;
+
+        let out = render(&[named, unnamed, you], &ids, &Vocab::empty());
+        assert_eq!(out[0].display_label(), "Ada Lovelace");
+        assert_eq!(out[0].speaker_name.as_deref(), Some("Ada Lovelace"));
+        assert_eq!(out[0].voice_cluster.as_deref(), Some("A"));
+        assert_eq!(out[1].display_label(), "Others", "an unnamed cluster keeps the channel label");
+        assert!(out[1].speaker_name.is_none());
+        assert_eq!(out[1].voice_cluster.as_deref(), Some("B"), "…but the cluster still shows in JSON");
+        assert_eq!(out[2].display_label(), "You", "the mic channel is never renamed in v1");
     }
 
     #[test]

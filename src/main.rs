@@ -5,6 +5,7 @@
 //!   - `transcribe <dir>`      = batch resample → VAD → whisper → merge → store + export;
 //!   - `list` / `export <id>`  = read back stored meetings;
 //!   - `vocab …`               = correction rules applied at RENDER time (never to stored text);
+//!   - `speakers …`            = name the far-end voices (cluster → play → label; recalled later);
 //!   - `rerender [--all]`      = re-render stored meetings into their session dirs, preview by
 //!     default — how a new correction reaches past transcripts;
 //!   - `detect [--watch]`      = which allowlisted app (if any) holds the mic (Phase-4 detector).
@@ -20,6 +21,9 @@ mod asr;
 mod transcript;
 mod db;
 mod render;
+mod spk;
+mod voices;
+mod speakers;
 mod export;
 mod detect;
 mod session;
@@ -82,6 +86,7 @@ fn parse_args() -> Args {
 fn run_transcribe(argv: &[String]) -> Result<()> {
     let mut dir: Option<PathBuf> = None;
     let mut model = String::from("models/ggml-large-v3.bin");
+    let mut speaker_model = PathBuf::from(SPEAKER_MODEL_REL);
     let mut lang = String::from("es");
     let mut title: Option<String> = None;
     let mut db_path: Option<PathBuf> = None;
@@ -93,6 +98,11 @@ fn run_transcribe(argv: &[String]) -> Result<()> {
             "--model" | "-m" => {
                 if let Some(v) = it.next() {
                     model = v.clone();
+                }
+            }
+            "--speaker-model" => {
+                if let Some(v) = it.next() {
+                    speaker_model = PathBuf::from(v);
                 }
             }
             "--lang" | "-l" => {
@@ -119,7 +129,8 @@ fn run_transcribe(argv: &[String]) -> Result<()> {
             "-h" | "--help" => {
                 eprintln!(
                     "usage: meetscribe transcribe <dir> [--title <t>] [--model <ggml.bin>] \
-                     [--lang <code>] [--db <path>] [--export-dir <dir>] [--no-store]"
+                     [--speaker-model <onnx>] [--lang <code>] [--db <path>] [--export-dir <dir>] \
+                     [--no-store]"
                 );
                 return Ok(());
             }
@@ -135,6 +146,7 @@ fn run_transcribe(argv: &[String]) -> Result<()> {
         db_path: db_path.unwrap_or_else(default_db_path),
         export_dir: export_dir.unwrap_or_else(|| dir.clone()),
         no_store,
+        speaker_model: Some(speaker_model),
     };
     let out = pipeline::transcribe_and_store(&dir, &opts)?;
 
@@ -167,6 +179,11 @@ pub(crate) fn base_dir() -> Option<PathBuf> {
 }
 
 /// `~/.meetscribe/meetscribe.db` (falls back to a repo-local path if `$HOME` is unset).
+/// The speaker-embedding model, relative to the repo (CLI) or to `~/.meetscribe` (daemon).
+/// Provisioned by `models/provision.sh`; copied under `~/.meetscribe/models/` by `install`.
+pub(crate) const SPEAKER_MODEL_REL: &str =
+    "models/speaker/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx";
+
 pub(crate) fn default_db_path() -> PathBuf {
     base_dir()
         .map(|b| b.join("meetscribe.db"))
@@ -252,31 +269,35 @@ fn run_list(argv: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Load a meeting's row plus its segments rendered with the current vocabulary (and, later,
-/// speaker names). `raw` skips rendering entirely — the escape hatch for diffing what changed.
+/// Load a meeting's row plus its segments rendered with the current vocabulary and speaker
+/// names. `raw` skips rendering entirely — the escape hatch for diffing what changed.
 fn load_rendered(
     db_path: &Path,
     id: i64,
     raw: bool,
 ) -> Result<(db::MeetingRow, Vec<render::RenderedSegment>)> {
     let rt = new_runtime()?;
-    let (row, segs, vocab_rows) = rt.block_on(async {
+    let (row, segs, vocab_rows, speakers) = rt.block_on(async {
         let mut database = db::Db::open(db_path).await?;
         let row = database
             .get_meeting(id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("no meeting with id {id} in {}", db_path.display()))?;
         let segs = database.load_segments(id).await?;
-        let vocab = if raw { Vec::new() } else { database.load_enabled_vocab().await? };
+        let (vocab, speakers) = if raw {
+            (Vec::new(), Vec::new())
+        } else {
+            (database.load_enabled_vocab().await?, database.list_speakers().await?)
+        };
         database.close().await?;
-        anyhow::Ok((row, segs, vocab))
+        anyhow::Ok((row, segs, vocab, speakers))
     })?;
 
     let (vocab, warnings) = render::Vocab::compile(&vocab_rows);
     for w in &warnings {
         log::warn!("{w}");
     }
-    let rendered = render::render(&segs, &render::IdentityMap::empty(), &vocab);
+    let rendered = render::render(&segs, &render::IdentityMap::from_db(&speakers), &vocab);
     Ok((row, rendered))
 }
 
@@ -357,7 +378,7 @@ fn run_rerender(argv: &[String]) -> Result<()> {
                     "usage: meetscribe rerender [--all | <id>…] [--db <path>] [--write]\n\
                      \n\
                      Re-renders stored meetings into their session directories using the current\n\
-                     vocabulary. Previews by default; pass --write to overwrite the files."
+                     vocabulary and speaker names. Previews by default; pass --write to overwrite."
                 );
                 return Ok(());
             }
@@ -377,10 +398,11 @@ fn run_rerender(argv: &[String]) -> Result<()> {
         anyhow::bail!("db {} does not exist", db_path.display());
     }
 
-    // ONE connection and ONE compiled vocabulary for the whole run — `--all` over a few dozen
-    // meetings would otherwise reopen the database and recompile every rule once per meeting.
+    // ONE connection, ONE compiled vocabulary and ONE identity map for the whole run — `--all`
+    // over a hundred meetings would otherwise reopen the database and recompile every rule once
+    // per meeting.
     let rt = new_runtime()?;
-    let (meetings, vocab_rows) = rt.block_on(async {
+    let (meetings, vocab_rows, speakers) = rt.block_on(async {
         let mut database = db::Db::open(&db_path).await?;
         let wanted: Vec<i64> = if all {
             database.list_meetings().await?.iter().map(|m| m.id).collect()
@@ -396,19 +418,21 @@ fn run_rerender(argv: &[String]) -> Result<()> {
             out.push((row, segs));
         }
         let vocab = database.load_enabled_vocab().await?;
+        let speakers = database.list_speakers().await?;
         database.close().await?;
-        anyhow::Ok((out, vocab))
+        anyhow::Ok((out, vocab, speakers))
     })?;
 
     let (vocab, warnings) = render::Vocab::compile(&vocab_rows);
     for w in &warnings {
         log::warn!("{w}");
     }
+    let ids = render::IdentityMap::from_db(&speakers);
 
     let (mut changed, mut unchanged, mut skipped) = (0usize, 0usize, 0usize);
     for (row, segs) in &meetings {
         let id = row.id;
-        let rendered = render::render(segs, &render::IdentityMap::empty(), &vocab);
+        let rendered = render::render(segs, &ids, &vocab);
 
         // source_dir is untrusted historical data: early rows hold a relative path long since
         // overwritten. Skip with a log rather than failing the whole run.
@@ -758,6 +782,7 @@ fn main() -> Result<()> {
         Some("export") => return run_export(&argv[2..]),
         Some("rerender") => return run_rerender(&argv[2..]),
         Some("vocab") => return run_vocab(&argv[2..]),
+        Some("speakers") => return speakers::run_speakers(&argv[2..]),
         Some("detect") => return run_detect(&argv[2..]),
         Some("daemon") => return daemon::run_daemon(&argv[2..]),
         Some("tray") => return tray::run_tray(&argv[2..]),
