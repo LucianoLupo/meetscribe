@@ -162,6 +162,8 @@ struct Channel {
     rate: u32,
     /// Whole-window embeddings (subsampled, ≥ MIN_WINDOW_MS).
     windows: Vec<Vec<f32>>,
+    /// (start_ms, end_ms) of each embedded window, same order as `windows`.
+    window_times: Vec<(usize, usize)>,
     /// Per long window: its 3 s sub-chunk embeddings (purity check).
     chunked: Vec<Vec<Vec<f32>>>,
 }
@@ -209,9 +211,11 @@ fn extract_channel(
         }
     };
     let mut windows = Vec::new();
+    let mut window_times = Vec::new();
     let t = Instant::now();
     for i in pick(usable.len(), per_channel) {
         let (a, b) = usable[i].sample_range(audio.len());
+        window_times.push((usable[i].start_ms, usable[i].end_ms));
         if let Some(p) = dump_clip.take() {
             write_wav_16k(&p, &audio[a..b])?;
             eprintln!("dumped first window ({:.2}s) → {}", (b - a) as f64 / RATE as f64, p.display());
@@ -241,7 +245,7 @@ fn extract_channel(
     }
     timing.embed += t.elapsed().as_secs_f64();
     timing.windows += windows.len();
-    Ok(Channel { rate, windows, chunked })
+    Ok(Channel { rate, windows, window_times, chunked })
 }
 
 // ---------------------------------------------------------------- statistics
@@ -403,7 +407,7 @@ fn main() -> Result<()> {
             .iter()
             .map(|m| {
                 let ch = |c: &Option<Channel>| {
-                    c.as_ref().map(|c| serde_json::json!({"rate": c.rate, "windows": c.windows, "chunked": c.chunked}))
+                    c.as_ref().map(|c| serde_json::json!({"rate": c.rate, "windows": c.windows, "window_times": c.window_times, "chunked": c.chunked}))
                 };
                 serde_json::json!({"stamp": m.stamp, "you": ch(&m.you), "others": ch(&m.others)})
             })

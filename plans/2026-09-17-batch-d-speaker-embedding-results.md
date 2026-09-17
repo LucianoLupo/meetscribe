@@ -85,3 +85,24 @@ workable after enrollment; "which of three far-end voices said this segment" is 
    never one frozen centroid; low-confidence windows stay unassigned.
 4. Old narrowband meetings can still be labelled retroactively at the *meeting* level (one far-end
    voice per 1:1 call) once names exist — the 5 % enrolled-vs-meeting number is what applies.
+
+## Addendum — listening tests (2026-09-17, the owner's ears)
+
+The you-channel EER above turned out to be the wrong proxy for the feature. Two listening tests
+on the **far-end** channel, which is what speaker identity is about:
+
+**Within one meeting** (59-min Teams call, far-end windows clustered by average-linkage on
+cosine, cut 0.45; 3 clips per group): 6 of 7 judged groups were one person each; one small
+group (4 windows, 1.5 min) was a mix of two people. Two skipped. Independently, pyannote
+segmentation-3.0 + the same embeddings (sherpa-onnx, fully local) agreed with these groups at
+94–100 % time overlap per speaker.
+
+**Across meetings** (far-end meeting centroids, 6 pairs: three the model scored 0.93–0.94, one
+at 0.62, two at 0.30): all six judged correctly — the three high pairs and the 0.62 pair were
+the same person, the two low pairs were different people. So the cross-meeting recall threshold
+sits **below 0.62**, and a 0.55 working point is the starting guess for Batch E.
+
+**Revised verdict: GO for Batch E on the existing narrowband recordings**, with two rules baked
+in from the failure that was observed: small or low-confidence clusters stay unnamed until
+confirmed, and merge/split must be a one-command operation at labelling time. The
+built-in-mic recommendation stands as a quality improvement, not a prerequisite.
