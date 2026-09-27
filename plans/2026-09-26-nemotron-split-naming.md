@@ -285,7 +285,15 @@ reference must never compile the code under test). Runs after `assemble` + `appl
 | Retro recluster/split re-assign short pieces by nearest neighbour | accepted, documented in Out |
 | New licences in a public repo | OpenMDW + Apache-2.0/ggml notices, Scope 5 |
 
-## Verification buckets (fill at the end)
-- **Verified:**
-- **Proxy:**
-- **Not run:**
+## Verification buckets (2026-09-27, through Step 7)
+- **Verified:** `transcribe` on the 3 evaluation meetings with the real diarizer (live) and with
+  replayed turns (long-piece parity 99.5 / 99.8 / 99.5 %); DTW text identity on 30 far-end chunks +
+  12 mic windows with the real model (byte-identical); diarizer under a Background LaunchAgent 3/3
+  byte-identical RTTMs; `build-diarizer.sh` output reproduces a frozen RTTM; timing +17 % (N = 2);
+  reviewer's DTW-model repro (ggml-tiny, split on) now transcribes with split off; the two-voice
+  `say` test with the real diarizer.
+- **Proxy:** 107 unit tests (split/rule C/finalize/stats, diar subprocess incl. timeout + drop-kill,
+  install 3c on a temp dir, config); clippy clean.
+- **Not run:** live blind listening round (built: `~/.meetscribe/eval/nemotron-split/liveclips/`,
+  owner deferred); Step 8 install into the live daemon + a real captured meeting; multi-roll
+  sessions through the split path; the 92 live name→Others cases beyond the 4 in the round.
