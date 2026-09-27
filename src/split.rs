@@ -180,11 +180,11 @@ pub fn finalize(
     let mut out_voices = Vec::new();
     let mut windows: Vec<Vec<db::WindowRow>> = vec![Vec::new(); kept.len()];
     for (i, (seg, voice)) in rows.into_iter().enumerate() {
-        if let Some((c, inherited, embedding)) = voice {
-            if let Some(&nc) = remap.get(&c) {
-                windows[nc].push(db::WindowRow { segment_id: i as i64, t_start: seg.t_start, t_end: seg.t_end, inherited, embedding: embedding.clone() });
-                out_voices.push(db::SegmentVoice { segment: i as i64, cluster: nc, inherited, embedding });
-            }
+        if let Some((c, inherited, embedding)) = voice
+            && let Some(&nc) = remap.get(&c)
+        {
+            windows[nc].push(db::WindowRow { segment_id: i as i64, t_start: seg.t_start, t_end: seg.t_end, inherited, embedding: embedding.clone() });
+            out_voices.push(db::SegmentVoice { segment: i as i64, cluster: nc, inherited, embedding });
         }
         segments.push(seg);
     }

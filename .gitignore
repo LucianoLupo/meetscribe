@@ -26,3 +26,6 @@
 
 # Far-end diarizer (model + NeMo-Speech.cpp build) — models/provision.sh + models/build-diarizer.sh
 /models/diarizer/
+
+# Python bytecode from eval/ scripts
+__pycache__/

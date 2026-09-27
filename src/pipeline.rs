@@ -101,7 +101,8 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
     // windows under the embedding floor, and when there is no embedder) and, when splitting, its
     // pieces with their own embeddings (path B).
     type Pieces = Vec<(split::Piece, Option<Vec<f32>>)>;
-    let mut segs: Vec<(transcript::TranscriptSegment, (Option<Vec<f32>>, Pieces))> = Vec::new();
+    type Keyed = (Option<Vec<f32>>, Pieces);
+    let mut segs: Vec<(transcript::TranscriptSegment, Keyed)> = Vec::new();
     let mut meeting_secs = 0.0f64;
     let embed_floor = spk::MIN_WINDOW_MS * resample::TARGET_RATE as usize / 1000;
 
@@ -197,7 +198,7 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
         meeting_secs = meeting_secs.max(offset);
     }
 
-    let (merged, keyed): (Vec<transcript::TranscriptSegment>, Vec<(Option<Vec<f32>>, Pieces)>) =
+    let (merged, keyed): (Vec<transcript::TranscriptSegment>, Vec<Keyed>) =
         transcript::merge_keyed(segs).into_iter().unzip();
     let mut embeddings: Vec<Option<Vec<f32>>> = Vec::with_capacity(keyed.len());
     let (mut pieces, mut piece_embs): (Vec<split::Piece>, Vec<Option<Vec<f32>>>) = (Vec::new(), Vec::new());
