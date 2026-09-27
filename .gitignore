@@ -23,3 +23,6 @@
 
 # Speaker-embedding model — provisioned via models/provision.sh (never committed)
 /models/speaker/
+
+# Far-end diarizer (model + NeMo-Speech.cpp build) — models/provision.sh + models/build-diarizer.sh
+/models/diarizer/

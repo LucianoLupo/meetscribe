@@ -193,10 +193,52 @@ fn provision_model(src: &Path, dest: &Path, copy: bool) -> Result<()> {
     Ok(())
 }
 
+/// Install step 3c — the far-end diarizer. The model is provisioned like the others (symlink, or
+/// copy with `--copy`); the runtime's directory is always COPIED, never symlinked, because the
+/// executable finds its dylibs through `@executable_path`. Missing sources warn and install
+/// nothing: the daemon then transcribes without splitting (fail-open).
+fn install_diarizer(model_src: &Path, bin_src: &Path, base: &Path, copy_model: bool) -> Result<()> {
+    let model_dest = base.join(crate::DIARIZER_MODEL_REL);
+    let bin_dest = base.join(crate::DIARIZER_BIN_REL);
+    let (Ok(model_abs), Ok(bin_abs)) = (std::fs::canonicalize(model_src), std::fs::canonicalize(bin_src)) else {
+        log::warn!(
+            "diarizer {} / {} not found — daemon will transcribe but NOT split far-end voices until \
+             both are installed (run `bash models/provision.sh` and `bash models/build-diarizer.sh`, \
+             then re-run install)",
+            model_src.display(),
+            bin_src.display()
+        );
+        return Ok(());
+    };
+    let model_dir = model_dest.parent().expect("diarizer model path has a parent");
+    std::fs::create_dir_all(model_dir).with_context(|| format!("create {}", model_dir.display()))?;
+    provision_model(&model_abs, &model_dest, copy_model)?;
+
+    let src_dir = bin_abs.parent().context("diarizer binary has no parent dir")?;
+    let dest_dir = bin_dest.parent().expect("diarizer bin path has a parent");
+    // Replace the whole directory so no stale dylib from an older build survives.
+    if std::fs::symlink_metadata(dest_dir).is_ok() {
+        std::fs::remove_dir_all(dest_dir).with_context(|| format!("remove stale {}", dest_dir.display()))?;
+    }
+    std::fs::create_dir_all(dest_dir).with_context(|| format!("create {}", dest_dir.display()))?;
+    for entry in std::fs::read_dir(src_dir).with_context(|| format!("read {}", src_dir.display()))? {
+        let path = entry?.path();
+        if path.is_file() {
+            let to = dest_dir.join(path.file_name().expect("file has a name"));
+            std::fs::copy(&path, &to).with_context(|| format!("copy {} → {}", path.display(), to.display()))?;
+        }
+    }
+    anyhow::ensure!(bin_dest.is_file(), "diarizer binary missing after copy: {}", bin_dest.display());
+    log::info!("diarizer installed → {} (+ model {})", dest_dir.display(), model_dest.display());
+    Ok(())
+}
+
 /// `meetscribe install [--model <ggml.bin>] [--copy]` — install + load the login LaunchAgent.
 pub(crate) fn run_install(argv: &[String]) -> Result<()> {
     let mut model_src = PathBuf::from("models/ggml-large-v3.bin");
     let mut speaker_src = PathBuf::from(crate::SPEAKER_MODEL_REL);
+    let mut diarizer_model_src = PathBuf::from(crate::DIARIZER_MODEL_REL);
+    let mut diarizer_bin_src = PathBuf::from(crate::DIARIZER_BIN_REL);
     let mut copy_model = false;
     let mut identity: Option<String> = None;
     let mut it = argv.iter();
@@ -212,6 +254,16 @@ pub(crate) fn run_install(argv: &[String]) -> Result<()> {
                     speaker_src = PathBuf::from(v);
                 }
             }
+            "--diarizer-model" => {
+                if let Some(v) = it.next() {
+                    diarizer_model_src = PathBuf::from(v);
+                }
+            }
+            "--diarizer-bin" => {
+                if let Some(v) = it.next() {
+                    diarizer_bin_src = PathBuf::from(v);
+                }
+            }
             "--identity" | "-i" => {
                 if let Some(v) = it.next() {
                     identity = Some(v.clone());
@@ -220,8 +272,10 @@ pub(crate) fn run_install(argv: &[String]) -> Result<()> {
             "--copy" => copy_model = true,
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: meetscribe install [--model <ggml.bin>] [--speaker-model <onnx>] [--copy] \
+                    "usage: meetscribe install [--model <ggml.bin>] [--speaker-model <onnx>] \
+                     [--diarizer-model <gguf>] [--diarizer-bin <nemo-speech-diar>] [--copy] \
                      [--identity <sha1>]\n\n\
+                     --diarizer-bin  the diarizer executable; its whole directory (dylibs) is copied.\n\
                      --identity  codesigning identity to re-sign the daemon binary with.\n\
                      {SIGN_IDENTITY_ENV} is consulted next; otherwise the sole identity from\n\
                      `security find-identity -v -p codesigning` is used, and anything else errors."
@@ -301,6 +355,12 @@ pub(crate) fn run_install(argv: &[String]) -> Result<()> {
         ),
     }
 
+    // 3c. The far-end diarizer (split-then-name) — warn, never fail: without it the daemon
+    //     transcribes exactly as before, just without splitting far-end chunks.
+    if let Err(e) = install_diarizer(&diarizer_model_src, &diarizer_bin_src, &base, copy_model) {
+        log::warn!("diarizer not installed ({e:#}) — daemon will transcribe without splitting");
+    }
+
     // 4. Write the plist (absolute paths + pinned HOME).
     let plist = plist_contents(&dest_bin, &home, &out_log, &err_log);
     let pp = plist_path(&home);
@@ -359,6 +419,45 @@ mod tests {
     const ONE: &str = "  1) 1111222233334444555566667777888899990000 \"Apple Development: someone@example.com (TEAMID1234)\"\n     1 valid identities found\n";
 
     const TWO: &str = "  1) 1111222233334444555566667777888899990000 \"Apple Development: someone@example.com (TEAMID1234)\"\n  2) AAAA1111BBBB2222CCCC3333DDDD4444EEEE5555 \"Apple Distribution: Someone (TEAMID1234)\"\n     2 valid identities found\n";
+
+    /// Step 3c on a temp base dir: model provisioned, the runtime dir COPIED (a real directory,
+    /// dylibs alongside, executable bit kept), re-install replaces stale files, and missing sources
+    /// install nothing without failing. Never touches launchd or the real ~/.meetscribe.
+    #[test]
+    fn install_diarizer_copies_the_runtime_dir_and_warns_on_missing_sources() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = std::env::temp_dir().join(format!("meetscribe-diar-install-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let src = tmp.join("src");
+        let base = tmp.join("base");
+        std::fs::create_dir_all(src.join("bin")).unwrap();
+        let model = src.join("model.gguf");
+        let exe = src.join("bin/nemo-speech-diar");
+        std::fs::write(&model, b"gguf").unwrap();
+        std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(src.join("bin/libggml.0.dylib"), b"dylib").unwrap();
+
+        install_diarizer(&model, &exe, &base, false).unwrap();
+        let bin_dest = base.join(crate::DIARIZER_BIN_REL);
+        let dir_dest = bin_dest.parent().unwrap();
+        assert!(std::fs::symlink_metadata(dir_dest).unwrap().is_dir(), "bin dir must be a real dir");
+        assert!(dir_dest.join("libggml.0.dylib").is_file());
+        assert_eq!(std::fs::metadata(&bin_dest).unwrap().permissions().mode() & 0o111, 0o111);
+        assert!(base.join(crate::DIARIZER_MODEL_REL).exists());
+
+        // Re-install: a dylib that is no longer in the source must not survive.
+        std::fs::write(dir_dest.join("stale.dylib"), b"old").unwrap();
+        install_diarizer(&model, &exe, &base, true).unwrap();
+        assert!(!dir_dest.join("stale.dylib").exists());
+        assert!(!std::fs::symlink_metadata(base.join(crate::DIARIZER_MODEL_REL)).unwrap().file_type().is_symlink());
+
+        // Missing sources: Ok, nothing new installed.
+        let empty = tmp.join("empty");
+        install_diarizer(&src.join("nope.gguf"), &src.join("nope"), &empty, false).unwrap();
+        assert!(!empty.exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     #[test]
     fn parses_a_single_identity() {

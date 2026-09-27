@@ -22,6 +22,7 @@ mod transcript;
 mod db;
 mod render;
 mod spk;
+mod diar;
 mod voices;
 mod speakers;
 mod export;
@@ -183,6 +184,12 @@ pub(crate) fn base_dir() -> Option<PathBuf> {
 /// Provisioned by `models/provision.sh`; copied under `~/.meetscribe/models/` by `install`.
 pub(crate) const SPEAKER_MODEL_REL: &str =
     "models/speaker/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx";
+
+/// The far-end diarizer (split-then-name): the model from `models/provision.sh` and the runtime
+/// from `models/build-diarizer.sh`, relative to the repo (CLI) or to `~/.meetscribe` (daemon).
+/// `install` copies both under `~/.meetscribe/models/diarizer/`.
+pub(crate) const DIARIZER_MODEL_REL: &str = "models/diarizer/Nemotron-3-Diarization.q8_0.gguf";
+pub(crate) const DIARIZER_BIN_REL: &str = "models/diarizer/bin/nemo-speech-diar";
 
 pub(crate) fn default_db_path() -> PathBuf {
     base_dir()

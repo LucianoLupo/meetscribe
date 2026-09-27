@@ -22,6 +22,13 @@ WHISPER_REPO="ggerganov/whisper.cpp"
 # output = 192-d embedding. 28 MB.
 SPEAKER_REPO="csukuangfj/speaker-embedding-models"
 SPEAKER_MODEL="3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx"
+# Far-end diarizer model (split-then-name): NVIDIA Nemotron 3 Diarization, q8_0 GGUF for the
+# NeMo-Speech.cpp runtime built by build-diarizer.sh. 107 MB, OpenMDW v1.1.
+# sha256 is PINNED here, not read from the LFS pointer: these are the exact bytes the blind
+# evaluation used, and a pointer read at fetch time would accept an upstream re-upload.
+DIAR_REPO="nvidia/Nemotron-3-Diarization"
+DIAR_MODEL="Nemotron-3-Diarization.q8_0.gguf"
+DIAR_SHA="08456d9e22cd9a323c0364d98375f3746d6e68507ebb705cd46438c534c7a3a1"
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 BIN="$DIR/ggml-${MODEL}.bin"
@@ -40,9 +47,10 @@ expected_sha() {
 sha_of() { shasum -a 256 "$1" | awk '{print $1}'; }
 
 download_verified() {
-  # $1 = HF repo (owner/name), $2 = remote filename, $3 = local path
-  local repo="$1" name="$2" out="$3" want have
-  want="$(expected_sha "$repo" "$name")"
+  # $1 = HF repo (owner/name), $2 = remote filename, $3 = local path, $4 = pinned sha256 (optional;
+  # without it the expected sha is read from the git-lfs pointer)
+  local repo="$1" name="$2" out="$3" want="${4:-}" have
+  [ -n "$want" ] || want="$(expected_sha "$repo" "$name")"
   [ -n "$want" ] || { log "ERROR: could not read expected sha256 for $name"; exit 1; }
   if [ -f "$out" ]; then
     have="$(sha_of "$out")"
@@ -77,7 +85,12 @@ fi
 mkdir -p "$DIR/speaker"
 download_verified "$SPEAKER_REPO" "$SPEAKER_MODEL" "$DIR/speaker/$SPEAKER_MODEL"
 
+# --- far-end diarizer model (split-then-name; the runtime comes from build-diarizer.sh) ---
+mkdir -p "$DIR/diarizer"
+download_verified "$DIAR_REPO" "$DIAR_MODEL" "$DIR/diarizer/$DIAR_MODEL" "$DIAR_SHA"
+
 log "done."
+log "diarizer model: $DIR/diarizer/$DIAR_MODEL ($(du -h "$DIR/diarizer/$DIAR_MODEL" | awk '{print $1}')) — build the runtime with: bash models/build-diarizer.sh"
 log "speaker: $DIR/speaker/$SPEAKER_MODEL ($(du -h "$DIR/speaker/$SPEAKER_MODEL" | awk '{print $1}'))"
 log "model:   $BIN ($(du -h "$BIN" | awk '{print $1}'))"
 log "encoder: $ENC_DIR ($(du -sh "$ENC_DIR" | awk '{print $1}'))"
