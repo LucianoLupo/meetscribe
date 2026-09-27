@@ -34,8 +34,8 @@ pub(crate) struct PipelineOpts {
     pub split: bool,
     /// Diarizer runtime + model. `None`/missing ⇒ no split (logged once), nothing else changes.
     /// MUST be absolute for the daemon.
-    pub diarizer_bin: Option<PathBuf>,
-    pub diarizer_model: Option<PathBuf>,
+    pub diarizer_bin: PathBuf,
+    pub diarizer_model: PathBuf,
     /// Evaluation only: replay this RTTM's turns instead of running the diarizer (single roll).
     pub diarizer_rttm: Option<PathBuf>,
 }
@@ -86,11 +86,26 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
     // The diarizer loads FIRST: DTW word timestamps are a load-time Whisper setting, enabled only
     // when there is something to split with — otherwise the context is exactly the pre-split one.
     let mut diarizer = load_diarizer(opts);
-    let split_on = diarizer.is_some();
-    // Rolls the diarizer covered / far-end rolls seen, and why any roll fell back (§6 log line).
+    // Rolls the diarizer covered / far-end rolls seen, and why any roll fell back (per-meeting
+    // provenance log line).
     let (mut rolls_split, mut rolls_far, mut fallbacks) = (0usize, 0usize, Vec::<String>::new());
-    let mut asr = asr::Asr::load(model_str, diarizer.is_some())
-        .with_context(|| format!("load model {model_str}"))?;
+    // DTW uses large-v3's alignment heads; another Whisper model (turbo, small, …) can fail to
+    // build its state with them. A split problem must never cost the transcript, so on any DTW
+    // load failure: log, turn splitting off for this run, load exactly the pre-split context.
+    let mut asr = match diarizer.as_ref().map(|_| asr::Asr::load(model_str, true)) {
+        Some(Ok(a)) => a,
+        Some(Err(e)) => {
+            log::warn!(
+                "far-end split: off — Whisper model {model_str} does not load with large-v3 DTW \
+                 word timings ({e:#}); transcribing without splitting"
+            );
+            fallbacks.push(format!("DTW load failed: {e:#}"));
+            diarizer = None;
+            asr::Asr::load(model_str, false).with_context(|| format!("load model {model_str}"))?
+        }
+        None => asr::Asr::load(model_str, false).with_context(|| format!("load model {model_str}"))?,
+    };
+    let split_on = diarizer.is_some();
     let mut embedder = load_embedder(opts.speaker_model.as_deref());
     // Inter-segment gaps the capture layer recorded on rate-roll boundaries (empty for the common
     // single-segment case). Both channels share the same manifest.
@@ -133,7 +148,7 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
             let far = speaker == transcript::Speaker::Others;
             // One diarizer run per far-end roll, started in the BACKGROUND so Whisper transcribes
             // the same roll meanwhile; its turns are collected after the windows. A failed roll
-            // keeps its chunks whole (§6).
+            // keeps its chunks whole (fail-open).
             let pending = match diarizer.as_mut() {
                 Some(d) if far => {
                     rolls_far += 1;
@@ -155,7 +170,7 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
                 if b <= a {
                     continue;
                 }
-                // Far-end windows are decoded ONCE, with word timings when splitting (§3).
+                // Far-end windows are decoded ONCE, with word timings when splitting.
                 let (text, confidence, words) = if far && split_on {
                     asr.transcribe_words(&audio16[a..b], &opts.lang)?
                 } else {
@@ -252,7 +267,7 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
     let split_reason = if !opts.split {
         "off".to_string()
     } else if !split_on {
-        "off (diarizer not loaded)".to_string()
+        if fallbacks.is_empty() { "off (diarizer not loaded)".to_string() } else { format!("off ({})", fallbacks.join("; ")) }
     } else if fallbacks.is_empty() {
         "on".to_string()
     } else {
@@ -294,7 +309,7 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
             let mut database = db::Db::open(&opts.db_path).await?;
             let enrolled = voices::decode_enrolled(&database.load_enrolled().await?)?;
             let mut matched = voices::apply_matches(&mut assembly, &enrolled);
-            // Split-then-name (§2.4): match path B, apply rule C against path A, then turn the
+            // Split-then-name: match path B, apply rule C against path A, then turn the
             // named pieces back into stored segments. Without a diarizer: today's insert.
             let finalized = match assembly_b.as_mut() {
                 Some(b) => {
@@ -408,11 +423,7 @@ fn load_diarizer(opts: &PipelineOpts) -> Option<diar::Diarizer> {
             }
         };
     }
-    let (Some(bin), Some(model)) = (opts.diarizer_bin.as_deref(), opts.diarizer_model.as_deref()) else {
-        log::warn!("far-end split: off (no diarizer configured)");
-        return None;
-    };
-    match diar::Diarizer::load(bin, model) {
+    match diar::Diarizer::load(&opts.diarizer_bin, &opts.diarizer_model) {
         Ok(d) => {
             log::info!("far-end split: on ({})", d.provenance());
             Some(d)
@@ -574,7 +585,7 @@ fn synth_row(meta: &db::MeetingMeta, segment_count: usize) -> db::MeetingRow {
 mod tests {
     use super::*;
 
-    fn opts(split: bool, bin: Option<&Path>, model: Option<&Path>) -> PipelineOpts {
+    fn opts(split: bool, bin: &Path, model: &Path) -> PipelineOpts {
         PipelineOpts {
             model: PathBuf::from("unused.bin"),
             lang: "es".into(),
@@ -584,8 +595,8 @@ mod tests {
             no_store: true,
             speaker_model: None,
             split,
-            diarizer_bin: bin.map(Path::to_path_buf),
-            diarizer_model: model.map(Path::to_path_buf),
+            diarizer_bin: bin.to_path_buf(),
+            diarizer_model: model.to_path_buf(),
             diarizer_rttm: None,
         }
     }
@@ -600,11 +611,10 @@ mod tests {
         let model = tmp.join("m.gguf");
         std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
         std::fs::write(&model, b"gguf").unwrap();
-        assert!(load_diarizer(&opts(false, Some(&bin), Some(&model))).is_none(), "split = false");
-        assert!(load_diarizer(&opts(true, None, None)).is_none(), "unconfigured");
-        assert!(load_diarizer(&opts(true, Some(&tmp.join("nope")), Some(&model))).is_none(), "no bin");
-        assert!(load_diarizer(&opts(true, Some(&bin), Some(&tmp.join("nope")))).is_none(), "no model");
-        assert!(load_diarizer(&opts(true, Some(&bin), Some(&model))).is_some(), "both present");
+        assert!(load_diarizer(&opts(false, &bin, &model)).is_none(), "split = false");
+        assert!(load_diarizer(&opts(true, &tmp.join("nope"), &model)).is_none(), "no bin");
+        assert!(load_diarizer(&opts(true, &bin, &tmp.join("nope"))).is_none(), "no model");
+        assert!(load_diarizer(&opts(true, &bin, &model)).is_some(), "both present");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

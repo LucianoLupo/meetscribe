@@ -98,7 +98,7 @@ impl Diarizer {
         if let Some((_, turns)) = &self.fixed {
             anyhow::ensure!(self.seq == 0, "--diarizer-rttm replays ONE roll; this session has several");
             self.seq += 1;
-            return Ok(Pending { run: None, fixed: Some(turns.clone()) });
+            return Ok(Pending::Fixed(turns.clone()));
         }
         self.seq += 1;
         let stem = format!(".diar-{}-{}", std::process::id(), self.seq);
@@ -125,20 +125,17 @@ impl Diarizer {
             .stderr(err_file)
             .spawn()
             .with_context(|| format!("spawn {}", self.bin.display()))?;
-        Ok(Pending {
-            run: Some(Running { child, rttm, err, started: Instant::now(), timeout, secs, _cleanup: cleanup }),
-            fixed: None,
-        })
+        Ok(Pending::Running(Running { child, rttm, err, started: Instant::now(), timeout, secs, _cleanup: cleanup }))
     }
 }
 
-/// A diarizer run in flight (or replayed turns).
-pub struct Pending {
-    run: Option<Running>,
-    fixed: Option<Vec<Turn>>,
+/// A diarizer run in flight, or replayed turns (`--diarizer-rttm`).
+pub enum Pending {
+    Fixed(Vec<Turn>),
+    Running(Running),
 }
 
-struct Running {
+pub struct Running {
     child: std::process::Child,
     rttm: PathBuf,
     err: PathBuf,
@@ -151,11 +148,11 @@ struct Running {
 
 impl Pending {
     /// Block until the diarizer finishes (or the timeout kills it) and parse its turns.
-    pub fn wait(mut self) -> Result<Vec<Turn>> {
-        if let Some(t) = self.fixed.take() {
-            return Ok(t);
-        }
-        let mut r = self.run.take().expect("a Pending is either fixed or running");
+    pub fn wait(self) -> Result<Vec<Turn>> {
+        let mut r = match self {
+            Pending::Fixed(t) => return Ok(t),
+            Pending::Running(r) => r,
+        };
         let status = loop {
             if let Some(s) = r.child.try_wait().context("wait for diarizer")? {
                 break s;

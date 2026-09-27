@@ -403,8 +403,8 @@ fn record_and_process(cfg: &DaemonConfig, app: &str) -> Result<()> {
         no_store: false,
         speaker_model: Some(cfg.speaker_model.clone()),
         split: cfg.split,
-        diarizer_bin: Some(cfg.diarizer_bin.clone()),
-        diarizer_model: Some(cfg.diarizer_model.clone()),
+        diarizer_bin: cfg.diarizer_bin.clone(),
+        diarizer_model: cfg.diarizer_model.clone(),
         diarizer_rttm: None,
     };
     log::info!("transcribing {} …", dir.display());

@@ -172,8 +172,8 @@ fn run_transcribe(argv: &[String]) -> Result<()> {
         no_store,
         speaker_model: Some(speaker_model),
         split,
-        diarizer_bin: Some(diarizer_bin),
-        diarizer_model: Some(diarizer_model),
+        diarizer_bin,
+        diarizer_model,
         diarizer_rttm,
     };
     let out = pipeline::transcribe_and_store(&dir, &opts)?;
