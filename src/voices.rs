@@ -36,6 +36,79 @@ impl Assembly {
     pub fn is_empty(&self) -> bool {
         self.clusters.is_empty()
     }
+
+    /// Rebuild from parts (split-then-name `finalize`); `centroids[c]` belongs to `clusters[c]`.
+    pub fn from_parts(clusters: Vec<db::NewCluster>, voices: Vec<db::SegmentVoice>, centroids: Vec<Vec<f32>>) -> Self {
+        Self { clusters, voices, centroids }
+    }
+}
+
+/// Centroid + counts recomputed from a cluster's stored embeddings (inherited rows ignored).
+/// Shared by `speakers merge/split` and split-then-name `finalize`, so both compute identical
+/// stats for identical rows.
+pub fn stats_from(windows: &[db::WindowRow]) -> Result<(Vec<f32>, i64, f64)> {
+    let mut embs = Vec::new();
+    let mut secs = 0.0;
+    for w in windows.iter().filter(|w| !w.inherited) {
+        if let Some(b) = &w.embedding {
+            embs.push(spk::from_blob(b)?);
+            secs += w.t_end - w.t_start;
+        }
+    }
+    Ok((spk::centroid(&embs), embs.len() as i64, secs))
+}
+
+/// Rule C (split-then-name §5), after `apply_matches` on both paths. A SHORT piece (not embedded)
+/// takes the speaker its whole chunk got on path A: when path A matched the parent chunk to
+/// speaker S and some path-B cluster is matched to S, the piece moves to that cluster
+/// (inherited, no embedding). If several path-B clusters match S: the one holding an embedded
+/// piece of the same chunk, else the highest match score, else the lowest index. Every other
+/// short piece keeps the membership `assemble` gave it. With nothing enrolled this is the identity.
+///
+/// `parent[p]` = path-A key of piece p's chunk; `embedded[p]` = piece p was embedded.
+pub fn rule_c(a: &Assembly, b: &mut Assembly, parent: &[i64], embedded: &[bool]) {
+    let a_speaker = |key: i64| {
+        a.voices
+            .iter()
+            .find(|v| v.segment == key)
+            .and_then(|v| a.clusters[v.cluster].speaker_id)
+    };
+    let b_cluster = |b: &Assembly, p: usize| b.voices.iter().find(|v| v.segment == p as i64).map(|v| v.cluster);
+    for p in 0..parent.len() {
+        if embedded[p] {
+            continue;
+        }
+        let Some(s) = a_speaker(parent[p]) else { continue };
+        let candidates: Vec<usize> = (0..b.clusters.len()).filter(|&c| b.clusters[c].speaker_id == Some(s)).collect();
+        if candidates.is_empty() {
+            continue;
+        }
+        let same_chunk_long = |c: usize| {
+            (0..parent.len()).any(|q| parent[q] == parent[p] && embedded[q] && b_cluster(b, q) == Some(c))
+        };
+        let pick = *candidates
+            .iter()
+            .max_by(|&&x, &&y| {
+                same_chunk_long(x)
+                    .cmp(&same_chunk_long(y))
+                    .then(
+                        b.clusters[x]
+                            .match_score
+                            .unwrap_or(f64::MIN)
+                            .total_cmp(&b.clusters[y].match_score.unwrap_or(f64::MIN)),
+                    )
+                    .then(y.cmp(&x))
+            })
+            .expect("non-empty");
+        match b.voices.iter_mut().find(|v| v.segment == p as i64) {
+            Some(v) => {
+                v.cluster = pick;
+                v.inherited = true;
+                v.embedding = None;
+            }
+            None => b.voices.push(db::SegmentVoice { segment: p as i64, cluster: pick, inherited: true, embedding: None }),
+        }
+    }
 }
 
 /// Cluster the embedded windows at `cut`, letter the clusters by speech time, and let short

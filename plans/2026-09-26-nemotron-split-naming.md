@@ -200,8 +200,8 @@ reference must never compile the code under test). Runs after `assemble` + `appl
    frozen A.out/B.out JSONs are the oracle. README note: Step 4 re-transcribes from
    `~/.meetscribe/sessions/<id>`, whose WAVs are not in the frozen set (`retention.sessions_days = 0`
    keeps them for now).
-0. **Runtime check** (~30 min; the audit did most of it): §1 numbers recorded; run 20260925-175645
-   once through the same launchd-context job → 3/3.
+0. **Runtime check** — ✅ 2026-09-27: 20260925-175645 through the launchd-context job, byte-identical
+   RTTM (723 s, contended by a concurrent build) → 3/3.
 1. **Provisioning + install** (Scope 5 + 6). Verify: fresh provision on a clean models dir passes the
    checksum, a second run is a no-op, `build-diarizer.sh` output reproduces one frozen RTTM; install
    step 3c unit-tested over a temp base dir. **NEVER run `meetscribe install` before Step 8** — its
@@ -227,6 +227,14 @@ reference must never compile the code under test). Runs after `assemble` + `appl
      unique `source_dir` → duplicates);
    - compare exported far-end names by time with `rulec_ref.py` — **gate ≥ 99 %**; report dropped
      word-less time and auto-matched clusters whose recomputed `n_windows` < `MIN_WINDOWS`.
+   - **Amended 2026-09-27 (measured):** the diarizer is deterministic but chaotic in its input —
+     2 584 of 43 M samples differing by 1 LSB (our PCM16 rounding vs ffmpeg's) moved its turns to
+     88 % frame agreement, and live-diarizer parity landed at 92.4 / 94.9 / 91.7 % (today's labels:
+     82.6 / 90.0 / 85.8 %). A label gate against one frozen run therefore measures diarizer noise, not
+     our code. The ≥ 99 % gate now runs with `--diarizer-rttm <frozen rttm>` (evaluation-only replay
+     of the evaluated turns), which tests pieces, words, rule C and finalize exactly. Real-world
+     quality is instead checked by a **blind listening round on live-diarizer output** (new vs today,
+     15 clips where they disagree) before Step 8.
 5. **Render.** Spot-read of 20260922-190155 + segment-count diff; no render change.
 6. **Performance**, like-for-like: same binary context for baseline and split, quiet machine, N = 2,
    load average recorded. **Gate ≤ +30 %** (owner call, 2026-09-27: +20 % = 130 s, and the diarizer
@@ -251,7 +259,8 @@ reference must never compile the code under test). Runs after `assemble` + `appl
 ## Risks
 | Risk | Mitigation |
 |---|---|
-| Rule-C approximation (§5) drifts from what was tested | Step 4 parity ≥ 99 % or redesign |
+| Rule-C approximation (§5) drifts from what was tested | Step 4 parity ≥ 99 % (replayed turns) or redesign |
+| Diarizer output chaotic in its input (1-LSB changes move ~12 % of frames) | parity replays frozen turns; live quality judged by a blind listening round |
 | Whisper word timestamps misplace boundary words | DTW (§3, measured better); midpoint + overlap tie-break; Step 3 check |
 | Choppier transcripts (2× segments) | §4 storage re-join (64 % of growth is same-name) |
 | Diarizer failure loses a meeting | Fail-open §6 + Step 2 test (a) + Step 4 identity test |

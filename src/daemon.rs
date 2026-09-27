@@ -85,6 +85,10 @@ struct DaemonConfig {
     model: PathBuf,
     /// Speaker-embedding model (absolute). Missing ⇒ transcripts without speaker identity.
     speaker_model: PathBuf,
+    /// Far-end split ([speakers] split) + the installed diarizer (absolute). Missing ⇒ no split.
+    split: bool,
+    diarizer_bin: PathBuf,
+    diarizer_model: PathBuf,
     lang: String,
     min_secs: f64,
     once: bool,
@@ -156,6 +160,9 @@ pub(crate) fn run_daemon(argv: &[String]) -> Result<()> {
         db_path: base.join("meetscribe.db"),
         model: model_override.unwrap_or_else(|| base.join("models/ggml-large-v3.bin")),
         speaker_model: base.join(crate::SPEAKER_MODEL_REL),
+        split: file_cfg.speakers.split,
+        diarizer_bin: base.join(crate::DIARIZER_BIN_REL),
+        diarizer_model: base.join(crate::DIARIZER_MODEL_REL),
         lang: lang_override.unwrap_or(file_cfg.daemon.lang),
         min_secs: min_secs_override.unwrap_or(file_cfg.daemon.min_secs),
         allowlist,
@@ -192,6 +199,30 @@ pub(crate) fn run_daemon(argv: &[String]) -> Result<()> {
              `meetscribe install`).",
             cfg.speaker_model.display()
         );
+    }
+    if cfg.split {
+        let missing: Vec<String> = [&cfg.diarizer_bin, &cfg.diarizer_model]
+            .into_iter()
+            .filter(|p| !p.exists())
+            .map(|p| p.display().to_string())
+            .collect();
+        if missing.is_empty() {
+            log::info!(
+                "far-end split: on — diarizer {} + {} ({})",
+                cfg.diarizer_bin.display(),
+                cfg.diarizer_model.display(),
+                crate::diar::provenance(&cfg.diarizer_bin, &cfg.diarizer_model)
+            );
+        } else {
+            log::warn!(
+                "far-end split is on but the diarizer is missing ({}) — meetings will be transcribed \
+                 WITHOUT splitting until it is installed (`bash models/provision.sh`, \
+                 `bash models/build-diarizer.sh`, then `meetscribe install`).",
+                missing.join(", ")
+            );
+        }
+    } else {
+        log::info!("far-end split: off ([speakers] split = false in {})", config::config_path(&base).display());
     }
     log::info!(
         "meetscribe daemon up — watching for {} meeting apps (poll {}s, end-debounce {}s, \
@@ -371,6 +402,10 @@ fn record_and_process(cfg: &DaemonConfig, app: &str) -> Result<()> {
         export_dir: dir.clone(),
         no_store: false,
         speaker_model: Some(cfg.speaker_model.clone()),
+        split: cfg.split,
+        diarizer_bin: Some(cfg.diarizer_bin.clone()),
+        diarizer_model: Some(cfg.diarizer_model.clone()),
+        diarizer_rttm: None,
     };
     log::info!("transcribing {} …", dir.display());
     // Capture is done but this call blocks for minutes on a long meeting — publish the transition so

@@ -401,18 +401,6 @@ fn rename(rt: &tokio::runtime::Runtime, db_path: &Path, sid: i64, first: &str, l
 
 // ---------------------------------------------------------------- merge / split
 
-/// Centroid + counts recomputed from a cluster's stored embeddings.
-fn stats_from(windows: &[db::WindowRow]) -> Result<(Vec<f32>, i64, f64)> {
-    let mut embs = Vec::new();
-    let mut secs = 0.0;
-    for w in windows.iter().filter(|w| !w.inherited) {
-        if let Some(b) = &w.embedding {
-            embs.push(spk::from_blob(b)?);
-            secs += w.t_end - w.t_start;
-        }
-    }
-    Ok((spk::centroid(&embs), embs.len() as i64, secs))
-}
 
 fn merge_clusters(rt: &tokio::runtime::Runtime, db_path: &Path, mid: i64, keep: &str, others: &[&str]) -> Result<()> {
     let (moved, n, secs) = rt.block_on(async {
@@ -437,7 +425,7 @@ fn merge_clusters(rt: &tokio::runtime::Runtime, db_path: &Path, mid: i64, keep: 
             db.delete_cluster(b.id).await?;
         }
         let windows = db.cluster_windows(a.id).await?;
-        let (centroid, n, secs) = stats_from(&windows)?;
+        let (centroid, n, secs) = voices::stats_from(&windows)?;
         db.update_cluster_stats(a.id, &spk::to_blob(&centroid), centroid.len() as i64, n, secs).await?;
         // A manual label's voiceprint IS the centroid; refresh it to the merged one.
         if let (Some("manual"), Some(sid)) = (a.assigned_by.as_deref(), a.speaker_id) {

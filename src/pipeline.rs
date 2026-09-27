@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::{asr, db, export, render, resample, spk, transcript, vad, voices};
+use crate::{asr, db, diar, export, render, resample, split, spk, transcript, vad, voices};
 
 /// Inputs for one transcribe+store+export run. Designed against BOTH callers (CLI + daemon):
 /// the daemon supplies an ABSOLUTE `model` path (under launchd `cwd=/`, a repo-relative path
@@ -30,6 +30,14 @@ pub(crate) struct PipelineOpts {
     /// Speaker-embedding ONNX model. `None` or a missing file ⇒ transcribe without speaker
     /// identity (logged once), nothing else changes. MUST be absolute for the daemon.
     pub speaker_model: Option<PathBuf>,
+    /// Split far-end chunks at diarizer voice changes before naming (rollback: false).
+    pub split: bool,
+    /// Diarizer runtime + model. `None`/missing ⇒ no split (logged once), nothing else changes.
+    /// MUST be absolute for the daemon.
+    pub diarizer_bin: Option<PathBuf>,
+    pub diarizer_model: Option<PathBuf>,
+    /// Evaluation only: replay this RTTM's turns instead of running the diarizer (single roll).
+    pub diarizer_rttm: Option<PathBuf>,
 }
 
 /// Result of the pipeline. `segments`/`meeting_secs`/`rtf`/`wall_secs` let the CLI wrapper print
@@ -75,7 +83,14 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
         .model
         .to_str()
         .with_context(|| format!("model path not valid UTF-8: {}", opts.model.display()))?;
-    let mut asr = asr::Asr::load(model_str).with_context(|| format!("load model {model_str}"))?;
+    // The diarizer loads FIRST: DTW word timestamps are a load-time Whisper setting, enabled only
+    // when there is something to split with — otherwise the context is exactly the pre-split one.
+    let mut diarizer = load_diarizer(opts);
+    let split_on = diarizer.is_some();
+    // Rolls the diarizer covered / far-end rolls seen, and why any roll fell back (§6 log line).
+    let (mut rolls_split, mut rolls_far, mut fallbacks) = (0usize, 0usize, Vec::<String>::new());
+    let mut asr = asr::Asr::load(model_str, diarizer.is_some())
+        .with_context(|| format!("load model {model_str}"))?;
     let mut embedder = load_embedder(opts.speaker_model.as_deref());
     // Inter-segment gaps the capture layer recorded on rate-roll boundaries (empty for the common
     // single-segment case). Both channels share the same manifest.
@@ -83,8 +98,10 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
 
     let t0 = Instant::now();
     // Each segment travels with its far-end speaker embedding (`None` for the mic channel, for
-    // windows under the embedding floor, and when there is no embedder).
-    let mut segs: Vec<(transcript::TranscriptSegment, Option<Vec<f32>>)> = Vec::new();
+    // windows under the embedding floor, and when there is no embedder) and, when splitting, its
+    // pieces with their own embeddings (path B).
+    type Pieces = Vec<(split::Piece, Option<Vec<f32>>)>;
+    let mut segs: Vec<(transcript::TranscriptSegment, (Option<Vec<f32>>, Pieces))> = Vec::new();
     let mut meeting_secs = 0.0f64;
     let embed_floor = spk::MIN_WINDOW_MS * resample::TARGET_RATE as usize / 1000;
 
@@ -112,12 +129,37 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
                 dur,
                 windows.len()
             );
+            let far = speaker == transcript::Speaker::Others;
+            // One diarizer run per far-end roll; a failed roll keeps its chunks whole (§6).
+            let turns: Option<Vec<diar::Turn>> = match diarizer.as_mut() {
+                Some(d) if far => {
+                    rolls_far += 1;
+                    match d.turns(&audio16, dir) {
+                        Ok(t) => {
+                            rolls_split += 1;
+                            Some(t)
+                        }
+                        Err(e) => {
+                            log::warn!("far-end split: roll {i} falls back to whole chunks ({e:#})");
+                            fallbacks.push(format!("roll {i}: {e:#}"));
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
             for w in windows {
                 let (a, b) = w.sample_range(audio16.len());
                 if b <= a {
                     continue;
                 }
-                let (text, confidence) = asr.transcribe(&audio16[a..b], &opts.lang)?;
+                // Far-end windows are decoded ONCE, with word timings when splitting (§3).
+                let (text, confidence, words) = if far && split_on {
+                    asr.transcribe_words(&audio16[a..b], &opts.lang)?
+                } else {
+                    let (t, c) = asr.transcribe(&audio16[a..b], &opts.lang)?;
+                    (t, c, Vec::new())
+                };
                 if text.is_empty() {
                     continue;
                 }
@@ -127,15 +169,27 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
                     }
                     _ => None,
                 };
+                let (t_start, t_end) = (offset + w.start_ms as f64 / 1000.0, offset + w.end_ms as f64 / 1000.0);
+                let mut pieces: Pieces = Vec::new();
+                if far && split_on {
+                    // `chunk` is fixed up to the merged index after `merge_keyed`.
+                    let mut ps = split::pieces_for_chunk(0, t_start, t_end, offset, turns.as_deref().unwrap_or(&[]));
+                    split::assign_words(&mut ps, t_start, &words);
+                    for p in ps {
+                        let pa = (((p.t_start - offset) * resample::TARGET_RATE as f64).round() as usize).min(audio16.len());
+                        let pb = (((p.t_end - offset) * resample::TARGET_RATE as f64).round() as usize).min(audio16.len());
+                        let emb = match embedder.as_mut() {
+                            Some(e) if pb > pa && pb - pa >= embed_floor => {
+                                Some(e.embed(&audio16[pa..pb]).context("piece embedding")?)
+                            }
+                            _ => None,
+                        };
+                        pieces.push((p, emb));
+                    }
+                }
                 segs.push((
-                    transcript::TranscriptSegment {
-                        speaker,
-                        text,
-                        t_start: offset + w.start_ms as f64 / 1000.0,
-                        t_end: offset + w.end_ms as f64 / 1000.0,
-                        confidence,
-                    },
-                    embedding,
+                    transcript::TranscriptSegment { speaker, text, t_start, t_end, confidence },
+                    (embedding, pieces),
                 ));
             }
             offset += dur;
@@ -143,8 +197,18 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
         meeting_secs = meeting_secs.max(offset);
     }
 
-    let (merged, embeddings): (Vec<transcript::TranscriptSegment>, Vec<Option<Vec<f32>>>) =
+    let (merged, keyed): (Vec<transcript::TranscriptSegment>, Vec<(Option<Vec<f32>>, Pieces)>) =
         transcript::merge_keyed(segs).into_iter().unzip();
+    let mut embeddings: Vec<Option<Vec<f32>>> = Vec::with_capacity(keyed.len());
+    let (mut pieces, mut piece_embs): (Vec<split::Piece>, Vec<Option<Vec<f32>>>) = (Vec::new(), Vec::new());
+    for (ci, (emb, ps)) in keyed.into_iter().enumerate() {
+        embeddings.push(emb);
+        for (mut p, e) in ps {
+            p.chunk = ci;
+            pieces.push(p);
+            piece_embs.push(e);
+        }
+    }
     let wall = t0.elapsed().as_secs_f64();
 
     // Far-end voice clusters for this meeting (empty without an embedder). Keys are indices into
@@ -157,6 +221,25 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
         .map(|(i, (s, e))| voices::Window { key: i as i64, t_start: s.t_start, t_end: s.t_end, embedding: e.clone() })
         .collect();
     let mut assembly = voices::assemble(&windows, spk::CLUSTER_CUT);
+    // Path B: the same identity pipeline over the pieces (keys = piece index).
+    let mut assembly_b = split_on.then(|| {
+        let w: Vec<voices::Window> = pieces
+            .iter()
+            .zip(&piece_embs)
+            .enumerate()
+            .map(|(i, (p, e))| voices::Window { key: i as i64, t_start: p.t_start, t_end: p.t_end, embedding: e.clone() })
+            .collect();
+        voices::assemble(&w, spk::CLUSTER_CUT)
+    });
+    let split_reason = if !opts.split {
+        "off".to_string()
+    } else if !split_on {
+        "off (diarizer not loaded)".to_string()
+    } else if fallbacks.is_empty() {
+        "on".to_string()
+    } else {
+        format!("on, {} roll(s) whole: {}", fallbacks.len(), fallbacks.join("; "))
+    };
     let rtf = if meeting_secs > 0.0 { wall / meeting_secs } else { 0.0 };
 
     // started_at = the real meeting time (earliest capture-file birth time).
@@ -192,10 +275,27 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
         let res = rt.block_on(async {
             let mut database = db::Db::open(&opts.db_path).await?;
             let enrolled = voices::decode_enrolled(&database.load_enrolled().await?)?;
-            let matched = voices::apply_matches(&mut assembly, &enrolled);
+            let mut matched = voices::apply_matches(&mut assembly, &enrolled);
+            // Split-then-name (§2.4): match path B, apply rule C against path A, then turn the
+            // named pieces back into stored segments. Without a diarizer: today's insert.
+            let finalized = match assembly_b.as_mut() {
+                Some(b) => {
+                    matched = voices::apply_matches(b, &enrolled);
+                    let parent: Vec<i64> = pieces.iter().map(|p| p.chunk as i64).collect();
+                    let embedded: Vec<bool> = piece_embs.iter().map(Option::is_some).collect();
+                    voices::rule_c(&assembly, b, &parent, &embedded);
+                    Some(split::finalize(&merged, &embeddings, &pieces, b)?)
+                }
+                None => None,
+            };
+            let (final_segs, final_asm): (&[transcript::TranscriptSegment], &voices::Assembly) = match &finalized {
+                Some((segs, asm)) => (segs, asm),
+                None => (&merged, &assembly),
+            };
             let id = database
-                .insert_meeting_with_voices(&meta, &merged, &assembly.clusters, &assembly.voices)
+                .insert_meeting_with_voices(&meta, final_segs, &final_asm.clusters, &final_asm.voices)
                 .await?;
+            let n_clusters = final_asm.clusters.len();
             let row = database
                 .get_meeting(id)
                 .await?
@@ -204,17 +304,21 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
             let segments = database.load_segments(id).await?;
             let speakers = database.list_speakers().await?;
             database.close().await?;
-            anyhow::Ok((id, row, vocab, segments, speakers, matched))
+            anyhow::Ok((id, row, vocab, segments, speakers, matched, n_clusters))
         });
         match res {
-            Ok((id, row, vocab, segments, speakers, matched)) => {
+            Ok((id, row, vocab, segments, speakers, matched, n_clusters)) => {
                 log::info!("stored meeting id {id} → {}", opts.db_path.display());
-                if !assembly.is_empty() {
+                if n_clusters > 0 {
                     log::info!(
-                        "far-end voices: {} cluster(s), {matched} recognised — `meetscribe speakers list {id}`",
-                        assembly.clusters.len()
+                        "far-end voices: {n_clusters} cluster(s), {matched} recognised — `meetscribe speakers list {id}`"
                     );
                 }
+                log::info!(
+                    "far-end split: {split_reason} — {} meeting {id}, rolls split {rolls_split}/{rolls_far}{}",
+                    dir.display(),
+                    diarizer.as_ref().map(|d| format!(", {}", d.provenance())).unwrap_or_default()
+                );
                 Some((row, id, vocab, segments, speakers))
             }
             Err(e) => {
@@ -266,6 +370,43 @@ fn compile_vocab(rows: &[db::VocabRow]) -> render::Vocab {
     }
     log::info!("applying {} vocabulary correction(s)", rows.len() - warnings.len());
     v
+}
+
+/// The far-end diarizer, or `None` with ONE log line explaining why splitting is off.
+fn load_diarizer(opts: &PipelineOpts) -> Option<diar::Diarizer> {
+    if !opts.split {
+        log::info!("far-end split: off (split = false)");
+        return None;
+    }
+    if let Some(rttm) = opts.diarizer_rttm.as_deref() {
+        return match diar::Diarizer::from_rttm(rttm) {
+            Ok(d) => {
+                log::info!("far-end split: on ({})", d.provenance());
+                Some(d)
+            }
+            Err(e) => {
+                log::warn!("far-end split: off (cannot replay {}: {e:#})", rttm.display());
+                None
+            }
+        };
+    }
+    let (Some(bin), Some(model)) = (opts.diarizer_bin.as_deref(), opts.diarizer_model.as_deref()) else {
+        log::warn!("far-end split: off (no diarizer configured)");
+        return None;
+    };
+    match diar::Diarizer::load(bin, model) {
+        Ok(d) => {
+            log::info!("far-end split: on ({})", d.provenance());
+            Some(d)
+        }
+        Err(e) => {
+            log::warn!(
+                "far-end split: off ({e:#}) — run `bash models/provision.sh` + \
+                 `bash models/build-diarizer.sh`, then `meetscribe install`"
+            );
+            None
+        }
+    }
 }
 
 /// The speaker-embedding model, or `None` with ONE log line explaining why identity is off.
@@ -414,6 +555,40 @@ fn synth_row(meta: &db::MeetingMeta, segment_count: usize) -> db::MeetingRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn opts(split: bool, bin: Option<&Path>, model: Option<&Path>) -> PipelineOpts {
+        PipelineOpts {
+            model: PathBuf::from("unused.bin"),
+            lang: "es".into(),
+            title: None,
+            db_path: PathBuf::from("unused.db"),
+            export_dir: PathBuf::from("."),
+            no_store: true,
+            speaker_model: None,
+            split,
+            diarizer_bin: bin.map(Path::to_path_buf),
+            diarizer_model: model.map(Path::to_path_buf),
+            diarizer_rttm: None,
+        }
+    }
+
+    /// No diarizer ⇒ `Asr::load(dtw = false)` ⇒ the Whisper context is exactly the pre-split one,
+    /// and nothing can ever call the diarizer. Covers split off, unconfigured, and missing files.
+    #[test]
+    fn diarizer_stays_unloaded_when_split_is_off_or_it_is_missing() {
+        let tmp = std::env::temp_dir().join(format!("meetscribe-loaddiar-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let bin = tmp.join("nemo-speech-diar");
+        let model = tmp.join("m.gguf");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        std::fs::write(&model, b"gguf").unwrap();
+        assert!(load_diarizer(&opts(false, Some(&bin), Some(&model))).is_none(), "split = false");
+        assert!(load_diarizer(&opts(true, None, None)).is_none(), "unconfigured");
+        assert!(load_diarizer(&opts(true, Some(&tmp.join("nope")), Some(&model))).is_none(), "no bin");
+        assert!(load_diarizer(&opts(true, Some(&bin), Some(&tmp.join("nope")))).is_none(), "no model");
+        assert!(load_diarizer(&opts(true, Some(&bin), Some(&model))).is_some(), "both present");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     #[test]
     fn segment_gaps_parse_from_manifest_lines() {

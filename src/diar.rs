@@ -28,6 +28,11 @@ pub struct Turn {
 pub struct Diarizer {
     bin: PathBuf,
     model: PathBuf,
+    /// Evaluation only: fixed turns read from an RTTM instead of running the diarizer. The runtime
+    /// is deterministic but very sensitive to its input — a 1-LSB rounding difference on 0.006 %
+    /// of samples moved ~12 % of speech frames — so parity against a frozen run must replay that
+    /// run's turns to test meetscribe's own logic.
+    fixed: Option<(PathBuf, Vec<Turn>)>,
     /// Overrides the default timeout (= the audio's duration). Tests only.
     timeout: Option<Duration>,
     seq: u32,
@@ -35,6 +40,8 @@ pub struct Diarizer {
 
 /// Poll interval while waiting for the subprocess.
 const POLL: Duration = Duration::from_millis(100);
+/// Timeout floor: process start + model load + Metal init must fit even for a very short roll.
+const MIN_TIMEOUT: Duration = Duration::from_secs(60);
 
 impl Diarizer {
     /// Check both artifacts exist; nothing is spawned until [`Diarizer::turns`].
@@ -45,7 +52,29 @@ impl Diarizer {
         if !model.is_file() {
             bail!("diarizer model not found at {}", model.display());
         }
-        Ok(Self { bin: bin.to_path_buf(), model: model.to_path_buf(), timeout: None, seq: 0 })
+        Ok(Self { bin: bin.to_path_buf(), model: model.to_path_buf(), fixed: None, timeout: None, seq: 0 })
+    }
+
+    /// Evaluation only (`transcribe --diarizer-rttm`): replay the turns of a frozen RTTM for a
+    /// single-roll session instead of running the diarizer.
+    pub fn from_rttm(rttm: &Path) -> Result<Self> {
+        let turns = parse_rttm(&std::fs::read_to_string(rttm).with_context(|| format!("read {}", rttm.display()))?)?;
+        Ok(Self {
+            bin: PathBuf::new(),
+            model: PathBuf::new(),
+            fixed: Some((rttm.to_path_buf(), turns)),
+            timeout: None,
+            seq: 0,
+        })
+    }
+
+    /// `commit=<sha> model=<bytes>B` for the one-line provenance logs (the model's sha256 is
+    /// pinned at provisioning; its size identifies the q8_0 file at runtime).
+    pub fn provenance(&self) -> String {
+        match &self.fixed {
+            Some((path, _)) => format!("replaying {}", path.display()),
+            None => provenance(&self.bin, &self.model),
+        }
     }
 
     #[cfg(test)]
@@ -55,8 +84,14 @@ impl Diarizer {
     }
 
     /// Diarize 16 kHz mono audio. `work_dir` holds the temporary WAV + RTTM (deleted on return).
-    /// Timeout = the audio's duration — ≥ 9× the slowest measured run — then the process is killed.
+    /// Timeout = the audio's duration (≥ 9× the slowest measured run), at least [`MIN_TIMEOUT`];
+    /// then the process is killed.
     pub fn turns(&mut self, audio16: &[f32], work_dir: &Path) -> Result<Vec<Turn>> {
+        if let Some((_, turns)) = &self.fixed {
+            anyhow::ensure!(self.seq == 0, "--diarizer-rttm replays ONE roll; this session has several");
+            self.seq += 1;
+            return Ok(turns.clone());
+        }
         self.seq += 1;
         let stem = format!(".diar-{}-{}", std::process::id(), self.seq);
         let wav = work_dir.join(format!("{stem}.wav"));
@@ -65,7 +100,7 @@ impl Diarizer {
 
         write_pcm16(&wav, audio16)?;
         let secs = audio16.len() as f64 / resample::TARGET_RATE as f64;
-        let timeout = self.timeout.unwrap_or_else(|| Duration::from_secs_f64(secs.max(1.0)));
+        let timeout = self.timeout.unwrap_or_else(|| Duration::from_secs_f64(secs).max(MIN_TIMEOUT));
 
         let mut child = Command::new(&self.bin)
             .arg("diarize")
@@ -105,6 +140,17 @@ impl Diarizer {
     }
 }
 
+/// See [`Diarizer::provenance`]; also usable before loading (daemon startup line).
+pub fn provenance(bin: &Path, model: &Path) -> String {
+    let commit = bin
+        .parent()
+        .and_then(|d| std::fs::read_to_string(d.join("COMMIT")).ok())
+        .map(|c| c.trim().to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let size = std::fs::metadata(model).map(|m| m.len().to_string()).unwrap_or_else(|_| "?".into());
+    format!("commit={commit} model={size}B")
+}
+
 /// Removes the temporary files however `turns` returns.
 struct Cleanup(Vec<PathBuf>);
 
@@ -124,11 +170,17 @@ fn write_pcm16(path: &Path, audio16: &[f32]) -> Result<()> {
         sample_format: hound::SampleFormat::Int,
     };
     let mut w = hound::WavWriter::create(path, spec).with_context(|| format!("create {}", path.display()))?;
+    // Exactly ffmpeg's f32 → s16 (× 32768, round, clip): the diarizer's evaluation inputs were
+    // ffmpeg-converted, and a 1-LSB difference is enough to move its speaker turns.
     for &s in audio16 {
-        w.write_sample((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)?;
+        w.write_sample(pcm16(s))?;
     }
     w.finalize().with_context(|| format!("finalize {}", path.display()))?;
     Ok(())
+}
+
+fn pcm16(s: f32) -> i16 {
+    (s * 32768.0).round().clamp(-32768.0, 32767.0) as i16
 }
 
 /// `SPEAKER <file> 1 <start> <dur> <NA> <NA> speaker_<n> <NA> <NA>` → turns sorted by start.
@@ -201,6 +253,15 @@ mod tests {
         assert_eq!(t[0], Turn { t_start: 0.5, t_end: 2.5, speaker: 1 });
         assert_eq!(t[1].speaker, 0);
         assert!(parse_rttm("garbage line\n").is_err());
+    }
+
+    #[test]
+    fn pcm16_matches_ffmpeg_scaling() {
+        assert_eq!(pcm16(0.0), 0);
+        assert_eq!(pcm16(1.0), 32767); // clipped, like ffmpeg
+        assert_eq!(pcm16(-1.0), -32768);
+        assert_eq!(pcm16(0.5), 16384);
+        assert_eq!(pcm16(-0.000_02), -1); // -0.655 rounds to -1; truncation would give 0
     }
 
     #[test]

@@ -23,6 +23,7 @@ mod db;
 mod render;
 mod spk;
 mod diar;
+mod split;
 mod voices;
 mod speakers;
 mod export;
@@ -88,6 +89,10 @@ fn run_transcribe(argv: &[String]) -> Result<()> {
     let mut dir: Option<PathBuf> = None;
     let mut model = String::from("models/ggml-large-v3.bin");
     let mut speaker_model = PathBuf::from(SPEAKER_MODEL_REL);
+    let mut diarizer_model = PathBuf::from(DIARIZER_MODEL_REL);
+    let mut diarizer_bin = PathBuf::from(DIARIZER_BIN_REL);
+    let mut split = true;
+    let mut diarizer_rttm: Option<PathBuf> = None;
     let mut lang = String::from("es");
     let mut title: Option<String> = None;
     let mut db_path: Option<PathBuf> = None;
@@ -104,6 +109,22 @@ fn run_transcribe(argv: &[String]) -> Result<()> {
             "--speaker-model" => {
                 if let Some(v) = it.next() {
                     speaker_model = PathBuf::from(v);
+                }
+            }
+            "--diarizer-model" => {
+                if let Some(v) = it.next() {
+                    diarizer_model = PathBuf::from(v);
+                }
+            }
+            "--diarizer-bin" => {
+                if let Some(v) = it.next() {
+                    diarizer_bin = PathBuf::from(v);
+                }
+            }
+            "--no-split" => split = false,
+            "--diarizer-rttm" => {
+                if let Some(v) = it.next() {
+                    diarizer_rttm = Some(PathBuf::from(v));
                 }
             }
             "--lang" | "-l" => {
@@ -130,8 +151,10 @@ fn run_transcribe(argv: &[String]) -> Result<()> {
             "-h" | "--help" => {
                 eprintln!(
                     "usage: meetscribe transcribe <dir> [--title <t>] [--model <ggml.bin>] \
-                     [--speaker-model <onnx>] [--lang <code>] [--db <path>] [--export-dir <dir>] \
-                     [--no-store]"
+                     [--speaker-model <onnx>] [--diarizer-model <gguf>] [--diarizer-bin <exe>] \
+                     [--no-split] [--lang <code>] [--db <path>] [--export-dir <dir>] [--no-store]\n\n\
+                     --no-split  do not cut far-end chunks at voice changes (the pre-split pipeline)\n\
+                     --diarizer-rttm <file>  evaluation: replay these diarizer turns (single-roll session)"
                 );
                 return Ok(());
             }
@@ -148,6 +171,10 @@ fn run_transcribe(argv: &[String]) -> Result<()> {
         export_dir: export_dir.unwrap_or_else(|| dir.clone()),
         no_store,
         speaker_model: Some(speaker_model),
+        split,
+        diarizer_bin: Some(diarizer_bin),
+        diarizer_model: Some(diarizer_model),
+        diarizer_rttm,
     };
     let out = pipeline::transcribe_and_store(&dir, &opts)?;
 

@@ -123,6 +123,7 @@ done
 if DYLD_PRINT_LIBRARIES=1 "$EXE" --version 2>&1 | grep -q -e '/opt/homebrew/' -e "$SRC/"; then
   die "staged binary still loads a library from Homebrew or the build dir"
 fi
+echo "$COMMIT" > "$BIN/COMMIT"   # travels with the bin dir through `install`
 echo "$COMMIT" > "$OUT/COMMIT"
 log "done: $EXE ($(du -sh "$BIN" | awk '{print $1}')) at $COMMIT"
 log "GGUF is provisioned by provision.sh into $OUT/"
