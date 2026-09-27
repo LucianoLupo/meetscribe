@@ -25,7 +25,8 @@ You:     works for me
 ```bash
 git clone https://github.com/LucianoLupo/meetscribe && cd meetscribe
 
-./models/provision.sh    # downloads the speech model (~4 GB, once)
+./models/provision.sh        # downloads the speech models (~4 GB, once)
+./models/build-diarizer.sh   # builds the voice splitter (optional; needs cmake + ninja)
 cargo build
 ./target/debug/meetscribe install
 ```
@@ -84,6 +85,14 @@ mixes two people can be `split`, two groups that are one person can be `merge`d,
 is only ever assigned automatically when the match is clear — an unsure voice stays "Others"
 rather than getting the wrong name. `meetscribe speakers --help` lists everything.
 
+When people talk in quick succession, one stretch of transcript often holds two or three
+voices. meetscribe cuts those stretches where the voice changes — using NVIDIA's Nemotron 3
+Diarization, run on your Mac — before naming them, so a quick "sí, sí" from someone else no
+longer gets the previous speaker's name. The words themselves are unchanged; only who said them
+is sharper. Processing takes about 15–20 % longer (roughly two extra minutes for a 45-minute meeting). Turn it off with
+`[speakers] split = false` in `~/.meetscribe/config.toml` (or `transcribe --no-split`); without
+the splitter built, meetscribe simply keeps each stretch whole, as before.
+
 ## Before you start, you need
 
 | | |
@@ -94,6 +103,7 @@ rather than getting the wrong name. `meetscribe speakers --help` lists everythin
 | **Xcode command line tools** | `xcode-select --install` |
 | **A free Apple developer certificate** | see below — this one surprises people |
 | **~4 GB of disk** | for the speech model |
+| **cmake + ninja** *(optional)* | `brew install cmake ninja` — only to build the voice splitter |
 
 ### The certificate thing
 
@@ -185,7 +195,7 @@ Stated plainly, so nothing surprises you later.
 ```
 ~/.meetscribe/
 ├── sessions/   your recordings
-├── models/     the speech model (and, under speaker/, the voice model)
+├── models/     the speech model (under speaker/ the voice model, under diarizer/ the voice splitter)
 ├── logs/       what the daemon is doing
 └── config.toml settings
 ```

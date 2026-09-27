@@ -235,12 +235,23 @@ reference must never compile the code under test). Runs after `assemble` + `appl
      of the evaluated turns), which tests pieces, words, rule C and finalize exactly. Real-world
      quality is instead checked by a **blind listening round on live-diarizer output** (new vs today,
      15 clips where they disagree) before Step 8.
+   - **Result 2026-09-27 (replayed turns):** long pieces 99.5 / 99.8 / 99.5 % — the code reproduces
+     the tested rule. Short pieces deviate on 94 s of 6 484 s far-end (1.5 %: 54 s today-Others →
+     named, 26 s named → Others, 14 s different name) — the audited §5 approximation, which keeps the
+     later-labelling loop. **Owner decision 2026-09-27:** keep the audited rule; gate = long-piece
+     parity ≥ 99 % (met); short-piece disagreements go into the live blind listening round.
 5. **Render.** Spot-read of 20260922-190155 + segment-count diff; no render change.
 6. **Performance**, like-for-like: same binary context for baseline and split, quiet machine, N = 2,
    load average recorded. **Gate ≤ +30 %** (owner call, 2026-09-27: +20 % = 130 s, and the diarizer
    alone takes 114 s; note 650 s is a CLI figure — today's daemon run of this meeting took 1326 s).
    One Background-context run for information. Over budget → first overlap the diarizer subprocess
    with the roll's Whisper pass; still over → plain timestamps.
+   - **Result 2026-09-27 (45-min meeting, `--no-store`, N = 2, alternating):** serial diarizer
+     590 → 787 s (**+33 %, over**). Lever 1 applied — the diarizer now starts in the background and
+     Whisper runs the same roll meanwhile (`Diarizer::start` / `Pending::wait`): 605 → 711 s
+     (**+17 %, pass**; quiet-machine pair 595 → 684 s, +15 %). Replay output byte-identical to the
+     serial build. Background-QoS run not repeated (daemon context was measured for the diarizer
+     alone in Step 0).
 7. **Review.** `/review-branch spike/speaker-embeddings`; fix verified findings; `cargo clippy`, `cargo test`.
 8. **Real path.** Install with `--diarizer-model` + `--diarizer-bin` + reinstall the daemon **(ask
    first — it is the live recorder)**; confirm from the §6 log line that the split path ran (not the

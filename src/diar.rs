@@ -86,23 +86,34 @@ impl Diarizer {
     /// Diarize 16 kHz mono audio. `work_dir` holds the temporary WAV + RTTM (deleted on return).
     /// Timeout = the audio's duration (≥ 9× the slowest measured run), at least [`MIN_TIMEOUT`];
     /// then the process is killed.
+    #[cfg(test)]
     pub fn turns(&mut self, audio16: &[f32], work_dir: &Path) -> Result<Vec<Turn>> {
+        self.start(audio16, work_dir)?.wait()
+    }
+
+    /// Start diarizing in the background and return at once, so the caller can run Whisper on
+    /// the same roll meanwhile; [`Pending::wait`] collects the turns. Dropping the `Pending`
+    /// kills the process and deletes its files.
+    pub fn start(&mut self, audio16: &[f32], work_dir: &Path) -> Result<Pending> {
         if let Some((_, turns)) = &self.fixed {
             anyhow::ensure!(self.seq == 0, "--diarizer-rttm replays ONE roll; this session has several");
             self.seq += 1;
-            return Ok(turns.clone());
+            return Ok(Pending { run: None, fixed: Some(turns.clone()) });
         }
         self.seq += 1;
         let stem = format!(".diar-{}-{}", std::process::id(), self.seq);
         let wav = work_dir.join(format!("{stem}.wav"));
         let rttm = work_dir.join(format!("{stem}.rttm"));
-        let _cleanup = Cleanup(vec![wav.clone(), rttm.clone()]);
+        let err = work_dir.join(format!("{stem}.err"));
+        let cleanup = Cleanup(vec![wav.clone(), rttm.clone(), err.clone()]);
 
         write_pcm16(&wav, audio16)?;
         let secs = audio16.len() as f64 / resample::TARGET_RATE as f64;
         let timeout = self.timeout.unwrap_or_else(|| Duration::from_secs_f64(secs).max(MIN_TIMEOUT));
-
-        let mut child = Command::new(&self.bin)
+        // stderr goes to a file, not a pipe: nobody reads it while the process runs, and a full
+        // pipe would stall the diarizer until the timeout.
+        let err_file = std::fs::File::create(&err).with_context(|| format!("create {}", err.display()))?;
+        let child = Command::new(&self.bin)
             .arg("diarize")
             .arg(&wav)
             .arg("-m")
@@ -111,32 +122,66 @@ impl Diarizer {
             .arg(&rttm)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(err_file)
             .spawn()
             .with_context(|| format!("spawn {}", self.bin.display()))?;
+        Ok(Pending {
+            run: Some(Running { child, rttm, err, started: Instant::now(), timeout, secs, _cleanup: cleanup }),
+            fixed: None,
+        })
+    }
+}
 
-        let started = Instant::now();
+/// A diarizer run in flight (or replayed turns).
+pub struct Pending {
+    run: Option<Running>,
+    fixed: Option<Vec<Turn>>,
+}
+
+struct Running {
+    child: std::process::Child,
+    rttm: PathBuf,
+    err: PathBuf,
+    started: Instant,
+    timeout: Duration,
+    secs: f64,
+    // Declared last so the files are removed after the child is reaped.
+    _cleanup: Cleanup,
+}
+
+impl Pending {
+    /// Block until the diarizer finishes (or the timeout kills it) and parse its turns.
+    pub fn wait(mut self) -> Result<Vec<Turn>> {
+        if let Some(t) = self.fixed.take() {
+            return Ok(t);
+        }
+        let mut r = self.run.take().expect("a Pending is either fixed or running");
         let status = loop {
-            if let Some(s) = child.try_wait().context("wait for diarizer")? {
+            if let Some(s) = r.child.try_wait().context("wait for diarizer")? {
                 break s;
             }
-            if started.elapsed() >= timeout {
-                let _ = child.kill();
-                let _ = child.wait();
-                bail!("diarizer timed out after {:.0}s on {secs:.0}s of audio", timeout.as_secs_f64());
+            if r.started.elapsed() >= r.timeout {
+                let _ = r.child.kill();
+                let _ = r.child.wait();
+                bail!("diarizer timed out after {:.0}s on {:.0}s of audio", r.timeout.as_secs_f64(), r.secs);
             }
             std::thread::sleep(POLL);
         };
         if !status.success() {
-            let mut err = String::new();
-            if let Some(mut e) = child.stderr.take() {
-                use std::io::Read;
-                let _ = e.read_to_string(&mut err);
-            }
+            let err = std::fs::read_to_string(&r.err).unwrap_or_default();
             bail!("diarizer exited with {status}: {}", err.trim());
         }
-        let text = std::fs::read_to_string(&rttm).with_context(|| format!("read {}", rttm.display()))?;
+        let text = std::fs::read_to_string(&r.rttm).with_context(|| format!("read {}", r.rttm.display()))?;
         parse_rttm(&text)
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
     }
 }
 
@@ -302,6 +347,18 @@ mod tests {
         assert!(format!("{err:#}").contains("timed out"), "{err:#}");
         assert!(t0.elapsed() < Duration::from_secs(5));
         assert!(only_stub_files(&d));
+    }
+
+    #[test]
+    fn dropping_a_pending_run_kills_it_and_cleans_up() {
+        let d = tmp("drop");
+        let marker = d.join("still-alive");
+        let (bin, model) = stub(&d, &format!("sleep 2; touch '{}'", marker.display()));
+        let pending = Diarizer::load(&bin, &model).unwrap().start(&vec![0.0; 16_000], &d).unwrap();
+        drop(pending);
+        std::thread::sleep(Duration::from_millis(2500));
+        assert!(!marker.exists(), "the diarizer must be killed when its Pending is dropped");
+        assert!(only_stub_files(&d), "temporary WAV/RTTM/err must be deleted");
     }
 
     /// Real runtime on two macOS `say` voices (needs `bash models/provision.sh` +

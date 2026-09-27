@@ -131,15 +131,14 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
                 windows.len()
             );
             let far = speaker == transcript::Speaker::Others;
-            // One diarizer run per far-end roll; a failed roll keeps its chunks whole (§6).
-            let turns: Option<Vec<diar::Turn>> = match diarizer.as_mut() {
+            // One diarizer run per far-end roll, started in the BACKGROUND so Whisper transcribes
+            // the same roll meanwhile; its turns are collected after the windows. A failed roll
+            // keeps its chunks whole (§6).
+            let pending = match diarizer.as_mut() {
                 Some(d) if far => {
                     rolls_far += 1;
-                    match d.turns(&audio16, dir) {
-                        Ok(t) => {
-                            rolls_split += 1;
-                            Some(t)
-                        }
+                    match d.start(&audio16, dir) {
+                        Ok(p) => Some(p),
                         Err(e) => {
                             log::warn!("far-end split: roll {i} falls back to whole chunks ({e:#})");
                             fallbacks.push(format!("roll {i}: {e:#}"));
@@ -149,6 +148,8 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
                 }
                 _ => None,
             };
+            // Far-end chunks of this roll waiting for the turns: (index in `segs`, words).
+            let mut awaiting: Vec<(usize, Vec<asr::Word>)> = Vec::new();
             for w in windows {
                 let (a, b) = w.sample_range(audio16.len());
                 if b <= a {
@@ -171,8 +172,28 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
                     _ => None,
                 };
                 let (t_start, t_end) = (offset + w.start_ms as f64 / 1000.0, offset + w.end_ms as f64 / 1000.0);
-                let mut pieces: Pieces = Vec::new();
                 if far && split_on {
+                    awaiting.push((segs.len(), words));
+                }
+                segs.push((
+                    transcript::TranscriptSegment { speaker, text, t_start, t_end, confidence },
+                    (embedding, Vec::new()),
+                ));
+            }
+            if far && split_on {
+                let turns = pending.and_then(|p| match p.wait() {
+                    Ok(t) => {
+                        rolls_split += 1;
+                        Some(t)
+                    }
+                    Err(e) => {
+                        log::warn!("far-end split: roll {i} falls back to whole chunks ({e:#})");
+                        fallbacks.push(format!("roll {i}: {e:#}"));
+                        None
+                    }
+                });
+                for (k, words) in awaiting {
+                    let (t_start, t_end) = (segs[k].0.t_start, segs[k].0.t_end);
                     // `chunk` is fixed up to the merged index after `merge_keyed`.
                     let mut ps = split::pieces_for_chunk(0, t_start, t_end, offset, turns.as_deref().unwrap_or(&[]));
                     split::assign_words(&mut ps, t_start, &words);
@@ -185,13 +206,9 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
                             }
                             _ => None,
                         };
-                        pieces.push((p, emb));
+                        segs[k].1.1.push((p, emb));
                     }
                 }
-                segs.push((
-                    transcript::TranscriptSegment { speaker, text, t_start, t_end, confidence },
-                    (embedding, pieces),
-                ));
             }
             offset += dur;
         }
