@@ -116,9 +116,8 @@ pub fn from_blob(b: &[u8]) -> Result<Vec<f32>> {
     if !b.len().is_multiple_of(4) {
         anyhow::bail!("embedding blob has {} bytes, not a multiple of 4", b.len());
     }
-    Ok(b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect())
+    let (words, _) = b.as_chunks::<4>();
+    Ok(words.iter().map(|w| f32::from_le_bytes(*w)).collect())
 }
 
 // ---------------------------------------------------------------- clustering
