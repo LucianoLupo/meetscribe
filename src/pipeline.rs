@@ -83,28 +83,11 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
         .model
         .to_str()
         .with_context(|| format!("model path not valid UTF-8: {}", opts.model.display()))?;
-    // The diarizer loads FIRST: DTW word timestamps are a load-time Whisper setting, enabled only
-    // when there is something to split with — otherwise the context is exactly the pre-split one.
     let mut diarizer = load_diarizer(opts);
     // Rolls the diarizer covered / far-end rolls seen, and why any roll fell back (per-meeting
     // provenance log line).
     let (mut rolls_split, mut rolls_far, mut fallbacks) = (0usize, 0usize, Vec::<String>::new());
-    // DTW uses large-v3's alignment heads; another Whisper model (turbo, small, …) can fail to
-    // build its state with them. A split problem must never cost the transcript, so on any DTW
-    // load failure: log, turn splitting off for this run, load exactly the pre-split context.
-    let mut asr = match diarizer.as_ref().map(|_| asr::Asr::load(model_str, true)) {
-        Some(Ok(a)) => a,
-        Some(Err(e)) => {
-            log::warn!(
-                "far-end split: off — Whisper model {model_str} does not load with large-v3 DTW \
-                 word timings ({e:#}); transcribing without splitting"
-            );
-            fallbacks.push(format!("DTW load failed: {e:#}"));
-            diarizer = None;
-            asr::Asr::load(model_str, false).with_context(|| format!("load model {model_str}"))?
-        }
-        None => asr::Asr::load(model_str, false).with_context(|| format!("load model {model_str}"))?,
-    };
+    let mut asr = asr::Asr::load(model_str).with_context(|| format!("load model {model_str}"))?;
     let split_on = diarizer.is_some();
     let mut embedder = load_embedder(opts.speaker_model.as_deref());
     // Inter-segment gaps the capture layer recorded on rate-roll boundaries (empty for the common
@@ -601,8 +584,8 @@ mod tests {
         }
     }
 
-    /// No diarizer ⇒ `Asr::load(dtw = false)` ⇒ the Whisper context is exactly the pre-split one,
-    /// and nothing can ever call the diarizer. Covers split off, unconfigured, and missing files.
+    /// No diarizer ⇒ no split, and nothing can ever call the diarizer. Covers split off and
+    /// missing files.
     #[test]
     fn diarizer_stays_unloaded_when_split_is_off_or_it_is_missing() {
         let tmp = std::env::temp_dir().join(format!("meetscribe-loaddiar-{}", std::process::id()));
