@@ -12,15 +12,15 @@ come from). Runtime: the tested NeMo-Speech.cpp diarizer (commit `97a15af`) call
 creating the branch: stacked. Step 7 reviews against `spike/speaker-embeddings`; retarget to
 `master` **before** merging.
 
-**Why:** blind listening, held-out round (Brain #1312): rule C right on 14/15 clips where it
+**Why:** blind listening, held-out round: rule C right on 14/15 clips where it
 disagrees with today's labels, today 0/15, 1 unclear. Expected effect: 10–16 % of far-end speech
 time relabelled in multi-person meetings; named share unchanged. Diarizer cost measured on the 45-min
 meeting: 114 s interactive (≈ +2.5 min per meeting-hour) and 214 s under the daemon's Background QoS
 (≈ +4.8 min). DTW and extra-embedding costs are measured in Step 3.
 
-**Evidence trail (Brain, project `meetscribe`):** #1304 #1305 (diarizer: 5/5 on mixed chunks, fails
-on identity with 7 speakers) · #1310 (ASR bake-off: Whisper stays) · #1311 (long pieces win 6/7,
-short pieces lose 1/8 → rule C) · #1312 (rule C held-out 14/15).
+**Evidence trail (private notes):** (diarizer: 5/5 on mixed chunks, fails
+on identity with 7 speakers) · (ASR bake-off: Whisper stays) · (long pieces win 6/7,
+short pieces lose 1/8 → rule C) · (rule C held-out 14/15).
 **Audits:** `/audit-plan` 2026-09-27 ×2 — revise-major, then revise-minor; both folded in below (raw
 syntheses in the regression set: `planDelta.md`, `planDelta2.md`).
 
@@ -49,7 +49,7 @@ blind keys + verdicts, a frozen DB copy, probes. See its README.
      `nemo-speech-diar` + its 6 dylibs in `models/diarizer/bin/` with `rpath=@executable_path`. Pin
      the **commit**, not a binary sha (builds are not byte-reproducible). Verify by behaviour:
      `otool -L` shows only `@rpath` + system libs, `doctor` runs, and locally the build reproduces
-     `out/20260925-164927.rttm` byte-for-byte.
+     meeting B's frozen RTTM byte-for-byte.
    - `.gitignore`: add `/models/diarizer/` (repo is public).
    - `THIRD-PARTY-NOTICES.md`: NeMo-Speech.cpp (Apache-2.0) + the bundled ggml dylibs' licence
      (confirm at 97a15af).
@@ -83,18 +83,18 @@ blind keys + verdicts, a frozen DB copy, probes. See its README.
   "onnxruntime"` means two versions cannot coexist. Revisit only if the subprocess causes packaging
   pain, or once ort moves to ≥ rc.13.
 - Live/streaming diarization; the pipeline stays batch-at-finalize.
-- Replacing Whisper (#1310).
+- Replacing Whisper (the ASR bake-off kept Whisper).
 - Fixing the name→Others loss (~300 s over 3 meetings from clusters under `MIN_WINDOWS`) — measured,
   accepted, revisit after a week of real meetings.
 
 ## Design
 
 ### 1. Diarizer runtime — decided: B as a subprocess
-The exact binary behind #1304–#1312. The prebuilt v0.1.0 release is **not** an option: it rejects the
+The exact binary behind the evaluation. The prebuilt v0.1.0 release is **not** an option: it rejects the
 model (`pre_ln transformer variant is not supported`); no newer release exists.
 Audit evidence 2026-09-27 — a LaunchAgent in the daemon's context (`ProcessType=Background`, HOME-only
 env, `cwd=/`, minimal PATH) ran on Metal device 0, exited 0, byte-identical RTTMs:
-20260922-190155 (52 min) 338 s at load average 15–28; 20260925-164927 (45 min) 214 s (the same file
+meeting A (52 min) 338 s at load average 15–28; meeting B (45 min) 214 s (the same file
 interactively: 114 s, 23.6× realtime). B vendored is rejected: not the tested binary, and it would put
 a second ggml beside whisper-rs-sys's ggml in one binary (likely symbol clashes; unverified).
 
@@ -200,7 +200,7 @@ reference must never compile the code under test). Runs after `assemble` + `appl
    frozen A.out/B.out JSONs are the oracle. README note: Step 4 re-transcribes from
    `~/.meetscribe/sessions/<id>`, whose WAVs are not in the frozen set (`retention.sessions_days = 0`
    keeps them for now).
-0. **Runtime check** — ✅ 2026-09-27: 20260925-175645 through the launchd-context job, byte-identical
+0. **Runtime check** — ✅ 2026-09-27: meeting C through the launchd-context job, byte-identical
    RTTM (723 s, contended by a concurrent build) → 3/3.
 1. **Provisioning + install** (Scope 5 + 6). Verify: fresh provision on a clean models dir passes the
    checksum, a second run is a no-op, `build-diarizer.sh` output reproduces one frozen RTTM; install
@@ -240,7 +240,7 @@ reference must never compile the code under test). Runs after `assemble` + `appl
      named, 26 s named → Others, 14 s different name) — the audited §5 approximation, which keeps the
      later-labelling loop. **Owner decision 2026-09-27:** keep the audited rule; gate = long-piece
      parity ≥ 99 % (met); short-piece disagreements go into the live blind listening round.
-5. **Render.** Spot-read of 20260922-190155 + segment-count diff; no render change.
+5. **Render.** Spot-read of meeting A + segment-count diff; no render change.
 6. **Performance**, like-for-like: same binary context for baseline and split, quiet machine, N = 2,
    load average recorded. **Gate ≤ +30 %** (owner call, 2026-09-27: +20 % = 130 s, and the diarizer
    alone takes 114 s; note 650 s is a CLI figure — today's daemon run of this meeting took 1326 s).

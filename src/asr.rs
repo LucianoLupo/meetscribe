@@ -172,7 +172,14 @@ mod tests {
         let sessions = home.join(".meetscribe/sessions");
         let mut far: Vec<Vec<f32>> = Vec::new();
         let mut mic: Vec<Vec<f32>> = Vec::new();
-        for m in ["20260922-190155", "20260925-175645", "20260925-164927"] {
+        // Meeting ids come from the private regression set, never from the (public) source.
+        let mut meetings: Vec<String> = std::fs::read_dir(&eval)
+            .expect("regression set missing (~/.meetscribe/eval/nemotron-split/ts)")
+            .filter_map(|e| e.ok()?.file_name().to_str()?.strip_suffix(".chunks.json").map(String::from))
+            .collect();
+        meetings.sort();
+        for m in &meetings {
+            let m = m.as_str();
             let load = |ch: &str| {
                 let (s, r) = pipeline::read_wav_any_rate(&sessions.join(m).join(format!("{ch}.wav"))).unwrap();
                 resample::to_16k_mono(&s, r).unwrap()

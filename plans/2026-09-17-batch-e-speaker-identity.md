@@ -254,7 +254,7 @@ Unit (fixtures only, fictional names, no model files):
 - `cargo clippy --all-targets -- -D warnings` clean.
 
 Real path (on a **copy** of the live DB, never the live one):
-1. `speakers cluster <id of 20260916-140022>` → the six clean groups of the listening test
+1. `speakers cluster <id of the listening-test meeting>` → the six clean groups of the listening test
    reappear as the largest clusters; `speakers play` on each; owner names them.
 2. `speakers cluster` on two later meetings with the same people, then `speakers match` →
    `speakers list <id>` shows the names auto-assigned with scores ≥ 0.55. That cross-meeting
