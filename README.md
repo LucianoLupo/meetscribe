@@ -25,7 +25,8 @@ You:     works for me
 ```bash
 git clone https://github.com/LucianoLupo/meetscribe && cd meetscribe
 
-./models/provision.sh    # downloads the speech model (~4 GB, once)
+./models/provision.sh        # downloads the speech models (~4 GB, once)
+./models/build-diarizer.sh   # builds the voice splitter (optional; needs cmake + ninja)
 cargo build
 ./target/debug/meetscribe install
 ```
@@ -62,6 +63,36 @@ Matching is on whole words, so `NCP` will not rewrite `NCPX`. Pass `--regex` if 
 real pattern. Both `vocab test` and `rerender` preview by default and change nothing until
 you add `--write`.
 
+## Putting names to the voices
+
+The far end of a call is one mixed track, so meetscribe groups it into voices per meeting,
+lets you hear each one, and asks for a name once. From then on that voice is recognised in
+every later meeting where it turns up:
+
+```bash
+meetscribe speakers list 42                      # the voices in meeting 42: A, B, C…
+meetscribe speakers play 42 B                    # hear a few seconds of voice B
+meetscribe speakers label 42 B "Ada" "Lovelace"  # name it (first + last name)
+meetscribe speakers skip 42 C                    # a voice you'd rather leave unknown
+meetscribe speakers list --pending               # every voice still waiting for a name
+```
+
+Names are applied at render time, like corrections, so a name given today reaches every past
+transcript on the next `rerender --all --write`. Meetings recorded before this feature get
+their voices found with `meetscribe speakers cluster --all` (it reads the recordings once and
+keeps what it learned in the database; the WAVs are not needed after that). A voice that
+mixes two people can be `split`, two groups that are one person can be `merge`d, and a name
+is only ever assigned automatically when the match is clear — an unsure voice stays "Others"
+rather than getting the wrong name. `meetscribe speakers --help` lists everything.
+
+When people talk in quick succession, one stretch of transcript often holds two or three
+voices. meetscribe cuts those stretches where the voice changes — using NVIDIA's Nemotron 3
+Diarization, run on your Mac — before naming them, so a quick "sí, sí" from someone else no
+longer gets the previous speaker's name. The words themselves are unchanged; only who said them
+is sharper. Processing takes about 15–20 % longer (roughly two extra minutes for a 45-minute meeting). Turn it off with
+`[speakers] split = false` in `~/.meetscribe/config.toml` (or `transcribe --no-split`); without
+the splitter built, meetscribe simply keeps each stretch whole, as before.
+
 ## Before you start, you need
 
 | | |
@@ -72,6 +103,7 @@ you add `--write`.
 | **Xcode command line tools** | `xcode-select --install` |
 | **A free Apple developer certificate** | see below — this one surprises people |
 | **~4 GB of disk** | for the speech model |
+| **cmake + ninja** *(optional)* | `brew install cmake ninja` — only to build the voice splitter |
 
 ### The certificate thing
 
@@ -148,8 +180,9 @@ Stated plainly, so nothing surprises you later.
   moving parts and risks dropping audio, which is a bad trade for a recorder.
 - **Transcripts are stored unencrypted** on your disk (readable only by your user account).
   Encryption is planned. If your meetings are sensitive, know this now.
-- **"Others" is one label, not names.** You get *You* vs *Others* — if three people are on
-  the far end, they share a label.
+- **Names come from you, once per voice.** The far end is one mixed track; meetscribe groups
+  it into voices and recognises the ones you have named. Anyone you have not named (or chose
+  to skip) shows as *Others*. Your own side is always *You*.
 - **Headphones work better than speakers.** On speakers, the other people leak into your
   microphone. It still works, your track is just messier.
 - **It uses the largest, most accurate speech model**, which is also the slowest. You can
@@ -162,6 +195,7 @@ Stated plainly, so nothing surprises you later.
 ```
 ~/.meetscribe/
 ├── sessions/   your recordings
+├── models/     the speech model (under speaker/ the voice model, under diarizer/ the voice splitter)
 ├── logs/       what the daemon is doing
 └── config.toml settings
 ```

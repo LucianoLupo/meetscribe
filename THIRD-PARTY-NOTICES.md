@@ -139,6 +139,21 @@ SOFTWARE.
 
 ---
 
+## Fetched at provisioning time (not redistributed)
+
+These are downloaded or built on your machine by the provisioning scripts into gitignored paths.
+The repository does not contain or redistribute them; their own licenses apply.
+
+| Artifact | Fetched by | Upstream | License |
+|---|---|---|---|
+| Whisper `ggml-large-v3.bin` + CoreML encoder | `models/provision.sh` | [ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp) (OpenAI Whisper weights) | MIT |
+| 3D-Speaker CAM++ speaker-embedding ONNX | `models/provision.sh` | [csukuangfj/speaker-embedding-models](https://huggingface.co/csukuangfj/speaker-embedding-models), exported from [modelscope/3D-Speaker](https://github.com/modelscope/3D-Speaker) | Apache-2.0 (upstream 3D-Speaker; the HF export repo declares none) |
+| `Nemotron-3-Diarization.q8_0.gguf` | `models/provision.sh` | [nvidia/Nemotron-3-Diarization](https://huggingface.co/nvidia/Nemotron-3-Diarization) | OpenMDW License Agreement v1.1 |
+| `nemo-speech-diar` diarizer runtime (built from source at commit `97a15af`) | `models/build-diarizer.sh` | [NVIDIA/NeMo-Speech.cpp](https://github.com/NVIDIA/NeMo-Speech.cpp) | Apache-2.0 |
+| ggml dylibs bundled with that runtime | `models/build-diarizer.sh` | [ggml-org/ggml](https://github.com/ggml-org/ggml) (NeMo-Speech.cpp submodule) | MIT |
+
+---
+
 ## Dependencies
 
 Dependency licenses are declared in `Cargo.toml` / `Cargo.lock` and are not vendored here.

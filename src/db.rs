@@ -63,11 +63,11 @@ const MEETING_COLS: &str =
     "id, title, source_dir, model, lang, started_at, duration_secs, segment_count, created_at";
 
 /// Schema version this binary knows how to produce. Bump with each new ladder rung.
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 /// A stored segment: the raw ASR contract plus the row identity and the (nullable) speaker
-/// identity. `speaker_id`/`voice_cluster` are always `None` until the speaker-ID work populates
-/// them; they are carried now so widening this does not churn every read and export signature.
+/// identity, resolved through `segment_voices` → `voice_clusters`. Both are `None` for the mic
+/// channel and for any far-end segment whose meeting has not been clustered.
 #[derive(Debug, Clone)]
 pub struct StoredSegment {
     pub id: i64,
@@ -95,6 +95,95 @@ pub struct VocabRow {
     pub is_regex: bool,
     pub enabled: bool,
     pub created_at: i64,
+}
+
+/// A named person. Display form is "First Last"; the two fields are stored separately.
+#[derive(Debug, Clone)]
+pub struct SpeakerRow {
+    pub id: i64,
+    pub first_name: String,
+    pub last_name: String,
+    pub created_at: i64,
+    /// How many confirmed voiceprints this person has (0 = named but nothing enrolled).
+    pub voiceprints: i64,
+}
+
+impl SpeakerRow {
+    pub fn full_name(&self) -> String {
+        format!("{} {}", self.first_name, self.last_name)
+    }
+}
+
+/// One far-end voice cluster inside one meeting.
+#[derive(Debug, Clone)]
+pub struct ClusterRow {
+    pub id: i64,
+    pub meeting_id: i64,
+    /// `A`, `B`, … — by descending speech time at cluster time; merge/split leave gaps.
+    pub cluster: String,
+    pub speaker_id: Option<i64>,
+    /// `"auto"` (matched against enrolled voiceprints) or `"manual"` (the owner named it).
+    pub assigned_by: Option<String>,
+    pub match_score: Option<f64>,
+    /// The owner marked this voice as unknown-by-choice; it is not pending.
+    pub skipped: bool,
+    /// f32 little-endian, L2-normalised (decode with `spk::from_blob`).
+    pub centroid: Vec<u8>,
+    pub dim: i64,
+    /// Embedded windows only (inherited short windows do not count).
+    pub n_windows: i64,
+    pub speech_secs: f64,
+}
+
+/// A cluster to write (no id yet). Written through `insert_meeting_with_voices`,
+/// `replace_meeting_clusters` or `replace_cluster`.
+#[derive(Debug, Clone)]
+pub struct NewCluster {
+    pub cluster: String,
+    pub speaker_id: Option<i64>,
+    pub assigned_by: Option<String>,
+    pub match_score: Option<f64>,
+    pub centroid: Vec<u8>,
+    pub dim: i64,
+    pub n_windows: i64,
+    pub speech_secs: f64,
+}
+
+/// Membership of one segment in one cluster. `cluster` indexes the `NewCluster` slice written in
+/// the same call; `segment` is either an index into the segments being inserted
+/// (`insert_meeting_with_voices`) or an existing `transcript_segments.id` (the replace calls).
+#[derive(Debug, Clone)]
+pub struct SegmentVoice {
+    pub segment: i64,
+    pub cluster: usize,
+    pub inherited: bool,
+    /// f32 little-endian; `None` for inherited (short) windows.
+    pub embedding: Option<Vec<u8>>,
+}
+
+/// One far-end window as stored: its segment, its times, and its embedding (if it was embedded).
+#[derive(Debug, Clone)]
+pub struct WindowRow {
+    pub segment_id: i64,
+    pub t_start: f64,
+    pub t_end: f64,
+    pub inherited: bool,
+    pub embedding: Option<Vec<u8>>,
+}
+
+/// An enrolled person: every confirmed voiceprint, as raw blobs.
+#[derive(Debug, Clone)]
+pub struct EnrolledRow {
+    pub speaker_id: i64,
+    pub voiceprints: Vec<Vec<u8>>,
+}
+
+/// A pending cluster with the meeting it belongs to (for `speakers list --pending`).
+#[derive(Debug, Clone)]
+pub struct PendingCluster {
+    pub cluster: ClusterRow,
+    pub meeting_title: String,
+    pub started_at: i64,
 }
 
 pub struct Db {
@@ -172,12 +261,26 @@ impl Db {
             .collect()
     }
 
-    /// Insert a meeting and its segments in one transaction; returns the meeting id.
-    /// Zero segments is valid (a silent recording where VAD found no speech).
+    /// Insert a meeting and its segments with no voice clusters. Production goes through
+    /// `insert_meeting_with_voices` (an empty assembly is the no-identity case); this shorthand
+    /// keeps the storage tests readable.
+    #[cfg(test)]
     pub async fn insert_meeting(
         &mut self,
         meta: &MeetingMeta,
         segs: &[TranscriptSegment],
+    ) -> Result<i64> {
+        self.insert_meeting_with_voices(meta, segs, &[], &[]).await
+    }
+
+    /// Insert a meeting, its segments, and its far-end voice clusters in ONE transaction.
+    /// `voices[i].segment` indexes `segs`; `voices[i].cluster` indexes `clusters`.
+    pub async fn insert_meeting_with_voices(
+        &mut self,
+        meta: &MeetingMeta,
+        segs: &[TranscriptSegment],
+        clusters: &[NewCluster],
+        voices: &[SegmentVoice],
     ) -> Result<i64> {
         let mut tx = self.conn.begin().await.context("begin insert tx")?;
         let res = sqlx::query(
@@ -198,8 +301,9 @@ impl Db {
         .context("insert meeting")?;
         let meeting_id = res.last_insert_rowid();
 
+        let mut seg_ids = Vec::with_capacity(segs.len());
         for (i, s) in segs.iter().enumerate() {
-            sqlx::query(
+            let r = sqlx::query(
                 "INSERT INTO transcript_segments \
                  (meeting_id, seq, speaker, text, t_start, t_end, confidence) \
                  VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -214,7 +318,18 @@ impl Db {
             .execute(&mut *tx)
             .await
             .with_context(|| format!("insert segment {i}"))?;
+            seg_ids.push(r.last_insert_rowid());
         }
+
+        let by_id: Vec<SegmentVoice> = voices
+            .iter()
+            .map(|v| {
+                let idx = usize::try_from(v.segment).ok().filter(|i| *i < seg_ids.len());
+                idx.map(|i| SegmentVoice { segment: seg_ids[i], ..v.clone() })
+                    .ok_or_else(|| anyhow!("voice refers to segment index {} of {}", v.segment, seg_ids.len()))
+            })
+            .collect::<Result<_>>()?;
+        write_clusters(&mut tx, meeting_id, clusters, &by_id, meta.created_at).await?;
 
         tx.commit().await.context("commit insert tx")?;
         Ok(meeting_id)
@@ -249,8 +364,12 @@ impl Db {
     /// function of (raw, identity, vocab) applied by `render`.
     pub async fn load_segments(&mut self, meeting_id: i64) -> Result<Vec<StoredSegment>> {
         let rows = sqlx::query(
-            "SELECT id, speaker, text, t_start, t_end, confidence \
-             FROM transcript_segments WHERE meeting_id = ? ORDER BY seq",
+            "SELECT ts.id, ts.speaker, ts.text, ts.t_start, ts.t_end, ts.confidence, \
+                    vc.speaker_id AS speaker_id, vc.cluster AS voice_cluster \
+             FROM transcript_segments ts \
+             LEFT JOIN segment_voices sv ON sv.segment_id = ts.id \
+             LEFT JOIN voice_clusters vc ON vc.id = sv.cluster_id \
+             WHERE ts.meeting_id = ? ORDER BY ts.seq",
         )
         .bind(meeting_id)
         .fetch_all(&mut self.conn)
@@ -264,9 +383,8 @@ impl Db {
                 Speaker::from_sql(&sp).ok_or_else(|| anyhow!("unknown speaker token '{sp}'"))?;
             out.push(StoredSegment {
                 id: r.try_get("id")?,
-                // Populated by the speaker-ID work (ladder rung 2); always None today.
-                speaker_id: None,
-                voice_cluster: None,
+                speaker_id: r.try_get("speaker_id")?,
+                voice_cluster: r.try_get("voice_cluster")?,
                 seg: TranscriptSegment {
                     speaker,
                     text: r.try_get("text")?,
@@ -349,6 +467,340 @@ impl Db {
         Ok(res.rows_affected() > 0)
     }
 
+
+    // ------------------------------------------------------------------ speakers (Batch E)
+
+    /// Every named person, with voiceprint counts, ordered by last then first name.
+    pub async fn list_speakers(&mut self) -> Result<Vec<SpeakerRow>> {
+        let rows = sqlx::query(
+            "SELECT s.id, s.first_name, s.last_name, s.created_at, \
+                    (SELECT count(*) FROM voiceprints v WHERE v.speaker_id = s.id) AS voiceprints \
+             FROM speakers s ORDER BY s.last_name COLLATE NOCASE, s.first_name COLLATE NOCASE, s.id",
+        )
+        .fetch_all(&mut self.conn)
+        .await
+        .context("list speakers")?;
+        rows.iter().map(speaker_from_row).collect()
+    }
+
+    pub async fn get_speaker(&mut self, id: i64) -> Result<Option<SpeakerRow>> {
+        let row = sqlx::query(
+            "SELECT s.id, s.first_name, s.last_name, s.created_at, \
+                    (SELECT count(*) FROM voiceprints v WHERE v.speaker_id = s.id) AS voiceprints \
+             FROM speakers s WHERE s.id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&mut self.conn)
+        .await
+        .context("get speaker")?;
+        row.as_ref().map(speaker_from_row).transpose()
+    }
+
+    /// Case-insensitive exact match on first + last name, so labelling the same person twice
+    /// reuses one row.
+    pub async fn find_speaker(&mut self, first: &str, last: &str) -> Result<Option<i64>> {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM speakers WHERE lower(first_name) = lower(?) AND lower(last_name) = lower(?) \
+             ORDER BY id LIMIT 1",
+        )
+        .bind(first)
+        .bind(last)
+        .fetch_optional(&mut self.conn)
+        .await
+        .context("find speaker")
+    }
+
+    pub async fn add_speaker(&mut self, first: &str, last: &str, created_at: i64) -> Result<i64> {
+        let res = sqlx::query("INSERT INTO speakers (first_name, last_name, created_at) VALUES (?, ?, ?)")
+            .bind(first)
+            .bind(last)
+            .bind(created_at)
+            .execute(&mut self.conn)
+            .await
+            .context("insert speaker")?;
+        Ok(res.last_insert_rowid())
+    }
+
+    /// `false` = no speaker with that id.
+    pub async fn rename_speaker(&mut self, id: i64, first: &str, last: &str) -> Result<bool> {
+        let res = sqlx::query("UPDATE speakers SET first_name = ?, last_name = ? WHERE id = ?")
+            .bind(first)
+            .bind(last)
+            .bind(id)
+            .execute(&mut self.conn)
+            .await
+            .context("rename speaker")?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Every enrolled person with all their voiceprints — what auto-match runs against.
+    pub async fn load_enrolled(&mut self) -> Result<Vec<EnrolledRow>> {
+        let rows = sqlx::query("SELECT speaker_id, embedding FROM voiceprints ORDER BY speaker_id, id")
+            .fetch_all(&mut self.conn)
+            .await
+            .context("load voiceprints")?;
+        let mut out: Vec<EnrolledRow> = Vec::new();
+        for r in &rows {
+            let sid: i64 = r.try_get("speaker_id")?;
+            let emb: Vec<u8> = r.try_get("embedding")?;
+            match out.last_mut() {
+                Some(e) if e.speaker_id == sid => e.voiceprints.push(emb),
+                _ => out.push(EnrolledRow { speaker_id: sid, voiceprints: vec![emb] }),
+            }
+        }
+        Ok(out)
+    }
+
+    // ------------------------------------------------------------------ clusters (Batch E)
+
+    /// A meeting's clusters, most speech first.
+    pub async fn list_clusters(&mut self, meeting_id: i64) -> Result<Vec<ClusterRow>> {
+        let sql = format!("SELECT {CLUSTER_COLS} FROM voice_clusters WHERE meeting_id = ? \
+                           ORDER BY speech_secs DESC, cluster");
+        let rows = sqlx::query(&sql)
+            .bind(meeting_id)
+            .fetch_all(&mut self.conn)
+            .await
+            .context("list clusters")?;
+        rows.iter().map(cluster_from_row).collect()
+    }
+
+    pub async fn get_cluster(&mut self, meeting_id: i64, label: &str) -> Result<Option<ClusterRow>> {
+        let sql = format!("SELECT {CLUSTER_COLS} FROM voice_clusters WHERE meeting_id = ? AND cluster = ?");
+        let row = sqlx::query(&sql)
+            .bind(meeting_id)
+            .bind(label)
+            .fetch_optional(&mut self.conn)
+            .await
+            .context("get cluster")?;
+        row.as_ref().map(cluster_from_row).transpose()
+    }
+
+    /// Unnamed, unskipped clusters with at least `min_windows` embedded windows, across all
+    /// meetings, newest meeting first — what the owner still has to listen to.
+    pub async fn pending_clusters(&mut self, min_windows: i64) -> Result<Vec<PendingCluster>> {
+        let cols = CLUSTER_COLS
+            .split(',')
+            .map(|c| format!("vc.{}", c.trim()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {cols}, m.title AS meeting_title, m.started_at AS meeting_started_at \
+             FROM voice_clusters vc JOIN meetings m ON m.id = vc.meeting_id \
+             WHERE vc.speaker_id IS NULL AND vc.skipped = 0 AND vc.n_windows >= ? \
+             ORDER BY m.started_at DESC, vc.meeting_id DESC, vc.speech_secs DESC"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(min_windows)
+            .fetch_all(&mut self.conn)
+            .await
+            .context("pending clusters")?;
+        rows.iter()
+            .map(|r| {
+                Ok(PendingCluster {
+                    cluster: cluster_from_row(r)?,
+                    meeting_title: r.try_get("meeting_title")?,
+                    started_at: r.try_get("meeting_started_at")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Set (or clear, with `None`) the person behind a cluster. Clearing also clears the
+    /// provenance and score; setting clears `skipped`.
+    pub async fn set_cluster_speaker(
+        &mut self,
+        cluster_id: i64,
+        speaker_id: Option<i64>,
+        assigned_by: Option<&str>,
+        match_score: Option<f64>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE voice_clusters SET speaker_id = ?, assigned_by = ?, match_score = ?, \
+             skipped = CASE WHEN ? IS NULL THEN skipped ELSE 0 END WHERE id = ?",
+        )
+        .bind(speaker_id)
+        .bind(assigned_by)
+        .bind(match_score)
+        .bind(speaker_id)
+        .bind(cluster_id)
+        .execute(&mut self.conn)
+        .await
+        .context("set cluster speaker")?;
+        Ok(())
+    }
+
+    pub async fn set_cluster_skipped(&mut self, cluster_id: i64, skipped: bool) -> Result<()> {
+        sqlx::query("UPDATE voice_clusters SET skipped = ? WHERE id = ?")
+            .bind(i64::from(skipped))
+            .bind(cluster_id)
+            .execute(&mut self.conn)
+            .await
+            .context("set cluster skipped")?;
+        Ok(())
+    }
+
+    /// Recompute a cluster's centroid and counts (after `merge`).
+    pub async fn update_cluster_stats(
+        &mut self,
+        cluster_id: i64,
+        centroid: &[u8],
+        dim: i64,
+        n_windows: i64,
+        speech_secs: f64,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE voice_clusters SET centroid = ?, dim = ?, n_windows = ?, speech_secs = ? WHERE id = ?",
+        )
+        .bind(centroid)
+        .bind(dim)
+        .bind(n_windows)
+        .bind(speech_secs)
+        .bind(cluster_id)
+        .execute(&mut self.conn)
+        .await
+        .context("update cluster stats")?;
+        Ok(())
+    }
+
+    /// Move every window of `from` into `to` (the `merge` primitive).
+    pub async fn move_segments(&mut self, from_cluster: i64, to_cluster: i64) -> Result<u64> {
+        let res = sqlx::query("UPDATE segment_voices SET cluster_id = ? WHERE cluster_id = ?")
+            .bind(to_cluster)
+            .bind(from_cluster)
+            .execute(&mut self.conn)
+            .await
+            .context("move segments between clusters")?;
+        Ok(res.rows_affected())
+    }
+
+    /// Delete a cluster; its windows and its voiceprints go with it (cascade).
+    pub async fn delete_cluster(&mut self, cluster_id: i64) -> Result<()> {
+        sqlx::query("DELETE FROM voice_clusters WHERE id = ?")
+            .bind(cluster_id)
+            .execute(&mut self.conn)
+            .await
+            .context("delete cluster")?;
+        Ok(())
+    }
+
+    /// Replace ALL of a meeting's clusters (the retro `speakers cluster` path). One short
+    /// transaction; `voices[i].segment` are existing `transcript_segments.id`s.
+    pub async fn replace_meeting_clusters(
+        &mut self,
+        meeting_id: i64,
+        clusters: &[NewCluster],
+        voices: &[SegmentVoice],
+        created_at: i64,
+    ) -> Result<()> {
+        let mut tx = self.conn.begin().await.context("begin replace clusters tx")?;
+        sqlx::query("DELETE FROM voice_clusters WHERE meeting_id = ?")
+            .bind(meeting_id)
+            .execute(&mut *tx)
+            .await
+            .context("delete meeting clusters")?;
+        write_clusters(&mut tx, meeting_id, clusters, voices, created_at).await?;
+        tx.commit().await.context("commit replace clusters tx")?;
+        Ok(())
+    }
+
+    /// Replace ONE cluster with several (the `split` primitive), in one transaction.
+    pub async fn replace_cluster(
+        &mut self,
+        cluster_id: i64,
+        meeting_id: i64,
+        clusters: &[NewCluster],
+        voices: &[SegmentVoice],
+        created_at: i64,
+    ) -> Result<()> {
+        let mut tx = self.conn.begin().await.context("begin split tx")?;
+        sqlx::query("DELETE FROM voice_clusters WHERE id = ?")
+            .bind(cluster_id)
+            .execute(&mut *tx)
+            .await
+            .context("delete split cluster")?;
+        write_clusters(&mut tx, meeting_id, clusters, voices, created_at).await?;
+        tx.commit().await.context("commit split tx")?;
+        Ok(())
+    }
+
+    /// The windows of one cluster, in time order.
+    pub async fn cluster_windows(&mut self, cluster_id: i64) -> Result<Vec<WindowRow>> {
+        let rows = sqlx::query(
+            "SELECT sv.segment_id, sv.inherited, sv.embedding, ts.t_start, ts.t_end \
+             FROM segment_voices sv JOIN transcript_segments ts ON ts.id = sv.segment_id \
+             WHERE sv.cluster_id = ? ORDER BY ts.t_start",
+        )
+        .bind(cluster_id)
+        .fetch_all(&mut self.conn)
+        .await
+        .context("cluster windows")?;
+        rows.iter().map(window_from_row).collect()
+    }
+
+    /// Every clustered window of a meeting, in time order (for `--recluster`).
+    pub async fn meeting_windows(&mut self, meeting_id: i64) -> Result<Vec<WindowRow>> {
+        let rows = sqlx::query(
+            "SELECT sv.segment_id, sv.inherited, sv.embedding, ts.t_start, ts.t_end \
+             FROM segment_voices sv JOIN transcript_segments ts ON ts.id = sv.segment_id \
+             WHERE ts.meeting_id = ? ORDER BY ts.t_start",
+        )
+        .bind(meeting_id)
+        .fetch_all(&mut self.conn)
+        .await
+        .context("meeting windows")?;
+        rows.iter().map(window_from_row).collect()
+    }
+
+    /// The far-end segments of a meeting as `(segment_id, t_start, t_end)`, in time order — the
+    /// slices the retro path embeds.
+    pub async fn far_end_segments(&mut self, meeting_id: i64) -> Result<Vec<(i64, f64, f64)>> {
+        let rows = sqlx::query(
+            "SELECT id, t_start, t_end FROM transcript_segments \
+             WHERE meeting_id = ? AND speaker = ? ORDER BY t_start, seq",
+        )
+        .bind(meeting_id)
+        .bind(Speaker::Others.as_sql())
+        .fetch_all(&mut self.conn)
+        .await
+        .context("far-end segments")?;
+        rows.iter()
+            .map(|r| Ok((r.try_get("id")?, r.try_get("t_start")?, r.try_get("t_end")?)))
+            .collect()
+    }
+
+    // ------------------------------------------------------------------ voiceprints (Batch E)
+
+    /// Enrol a cluster's centroid as one voiceprint of `speaker_id`. A voiceprint IS a confirmed
+    /// cluster's centroid — that is why it takes the row rather than loose fields.
+    pub async fn add_voiceprint(&mut self, speaker_id: i64, cluster: &ClusterRow, created_at: i64) -> Result<i64> {
+        let res = sqlx::query(
+            "INSERT INTO voiceprints (speaker_id, meeting_id, cluster_id, embedding, dim, sample_secs, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(speaker_id)
+        .bind(cluster.meeting_id)
+        .bind(cluster.id)
+        .bind(cluster.centroid.as_slice())
+        .bind(cluster.dim)
+        .bind(cluster.speech_secs)
+        .bind(created_at)
+        .execute(&mut self.conn)
+        .await
+        .context("insert voiceprint")?;
+        Ok(res.last_insert_rowid())
+    }
+
+    /// Remove whatever this cluster contributed to the enrolment set (`unlabel`, `skip`, re-`label`).
+    pub async fn delete_voiceprints_for_cluster(&mut self, cluster_id: i64) -> Result<u64> {
+        let res = sqlx::query("DELETE FROM voiceprints WHERE cluster_id = ?")
+            .bind(cluster_id)
+            .execute(&mut self.conn)
+            .await
+            .context("delete cluster voiceprints")?;
+        Ok(res.rows_affected())
+    }
+
     pub async fn close(self) -> Result<()> {
         self.conn.close().await.context("close sqlite connection")?;
         Ok(())
@@ -367,6 +819,94 @@ fn meeting_from_row(r: &SqliteRow) -> Result<MeetingRow> {
         segment_count: r.try_get("segment_count")?,
         created_at: r.try_get("created_at")?,
     })
+}
+
+const CLUSTER_COLS: &str = "id, meeting_id, cluster, speaker_id, assigned_by, match_score, skipped, \
+                            centroid, dim, n_windows, speech_secs";
+
+fn speaker_from_row(r: &SqliteRow) -> Result<SpeakerRow> {
+    Ok(SpeakerRow {
+        id: r.try_get("id")?,
+        first_name: r.try_get("first_name")?,
+        last_name: r.try_get("last_name")?,
+        created_at: r.try_get("created_at")?,
+        voiceprints: r.try_get("voiceprints")?,
+    })
+}
+
+fn cluster_from_row(r: &SqliteRow) -> Result<ClusterRow> {
+    Ok(ClusterRow {
+        id: r.try_get("id")?,
+        meeting_id: r.try_get("meeting_id")?,
+        cluster: r.try_get("cluster")?,
+        speaker_id: r.try_get("speaker_id")?,
+        assigned_by: r.try_get("assigned_by")?,
+        match_score: r.try_get("match_score")?,
+        skipped: r.try_get::<i64, _>("skipped")? != 0,
+        centroid: r.try_get("centroid")?,
+        dim: r.try_get("dim")?,
+        n_windows: r.try_get("n_windows")?,
+        speech_secs: r.try_get("speech_secs")?,
+    })
+}
+
+fn window_from_row(r: &SqliteRow) -> Result<WindowRow> {
+    Ok(WindowRow {
+        segment_id: r.try_get("segment_id")?,
+        t_start: r.try_get("t_start")?,
+        t_end: r.try_get("t_end")?,
+        inherited: r.try_get::<i64, _>("inherited")? != 0,
+        embedding: r.try_get("embedding")?,
+    })
+}
+
+/// Write clusters + memberships inside a caller-owned transaction. `voices[i].segment` are
+/// `transcript_segments.id`s; `voices[i].cluster` indexes `clusters`.
+async fn write_clusters(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    meeting_id: i64,
+    clusters: &[NewCluster],
+    voices: &[SegmentVoice],
+    created_at: i64,
+) -> Result<()> {
+    let mut ids = Vec::with_capacity(clusters.len());
+    for c in clusters {
+        let r = sqlx::query(
+            "INSERT INTO voice_clusters \
+             (meeting_id, cluster, speaker_id, assigned_by, match_score, skipped, centroid, dim, \
+              n_windows, speech_secs, created_at) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)",
+        )
+        .bind(meeting_id)
+        .bind(c.cluster.as_str())
+        .bind(c.speaker_id)
+        .bind(c.assigned_by.as_deref())
+        .bind(c.match_score)
+        .bind(c.centroid.as_slice())
+        .bind(c.dim)
+        .bind(c.n_windows)
+        .bind(c.speech_secs)
+        .bind(created_at)
+        .execute(&mut **tx)
+        .await
+        .with_context(|| format!("insert cluster {}", c.cluster))?;
+        ids.push(r.last_insert_rowid());
+    }
+    for v in voices {
+        let cid = *ids
+            .get(v.cluster)
+            .ok_or_else(|| anyhow!("voice refers to cluster index {} of {}", v.cluster, ids.len()))?;
+        sqlx::query(
+            "INSERT INTO segment_voices (segment_id, cluster_id, inherited, embedding) VALUES (?, ?, ?, ?)",
+        )
+        .bind(v.segment)
+        .bind(cid)
+        .bind(i64::from(v.inherited))
+        .bind(v.embedding.as_deref())
+        .execute(&mut **tx)
+        .await
+        .with_context(|| format!("insert segment voice for segment {}", v.segment))?;
+    }
+    Ok(())
 }
 
 /// Bring a connection's schema to `SCHEMA_VERSION`: the frozen v0 baseline, then the ladder.
@@ -401,6 +941,7 @@ async fn apply_migrations(conn: &mut SqliteConnection) -> Result<()> {
         }
         match v {
             0 => run_migration(conn, 0, 1, MIGRATION_V1).await?,
+            1 => run_migration(conn, 1, 2, MIGRATION_V2).await?,
             other => anyhow::bail!("no migration registered from schema v{other}"),
         }
     }
@@ -424,6 +965,52 @@ const MIGRATION_V1: &[&str] = &[
         is_regex    INTEGER NOT NULL DEFAULT 0 CHECK (is_regex IN (0,1)), \
         enabled     INTEGER NOT NULL DEFAULT 1 CHECK (enabled  IN (0,1)), \
         created_at  INTEGER NOT NULL)",
+];
+
+/// v1 → v2: speaker identity (Batch E). Four new tables, NO change to `transcript_segments`.
+///
+/// Identity hangs off `transcript_segments.id` through `segment_voices`, so a transcript row is
+/// never rewritten when a voice is clustered, named, merged or split. Every `REFERENCES` names a
+/// table created earlier in this list (or in v0), and there is no ALTER at all.
+///
+/// `voiceprints.cluster_id` cascades: a voiceprint exists only while the cluster that produced it
+/// exists, so `merge`/`split`/`--recluster` can never leave a stale print feeding auto-match.
+const MIGRATION_V2: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS speakers (\
+        id         INTEGER PRIMARY KEY AUTOINCREMENT, \
+        first_name TEXT    NOT NULL, \
+        last_name  TEXT    NOT NULL, \
+        created_at INTEGER NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS voice_clusters (\
+        id          INTEGER PRIMARY KEY AUTOINCREMENT, \
+        meeting_id  INTEGER NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, \
+        cluster     TEXT    NOT NULL, \
+        speaker_id  INTEGER NULL REFERENCES speakers(id) ON DELETE SET NULL, \
+        assigned_by TEXT    NULL CHECK (assigned_by IN ('auto','manual')), \
+        match_score REAL    NULL, \
+        skipped     INTEGER NOT NULL DEFAULT 0 CHECK (skipped IN (0,1)), \
+        centroid    BLOB    NOT NULL, \
+        dim         INTEGER NOT NULL, \
+        n_windows   INTEGER NOT NULL, \
+        speech_secs REAL    NOT NULL, \
+        created_at  INTEGER NOT NULL, \
+        UNIQUE (meeting_id, cluster))",
+    "CREATE TABLE IF NOT EXISTS segment_voices (\
+        segment_id INTEGER PRIMARY KEY REFERENCES transcript_segments(id) ON DELETE CASCADE, \
+        cluster_id INTEGER NOT NULL REFERENCES voice_clusters(id) ON DELETE CASCADE, \
+        inherited  INTEGER NOT NULL DEFAULT 0 CHECK (inherited IN (0,1)), \
+        embedding  BLOB    NULL)",
+    "CREATE TABLE IF NOT EXISTS voiceprints (\
+        id          INTEGER PRIMARY KEY AUTOINCREMENT, \
+        speaker_id  INTEGER NOT NULL REFERENCES speakers(id) ON DELETE CASCADE, \
+        meeting_id  INTEGER NULL REFERENCES meetings(id) ON DELETE SET NULL, \
+        cluster_id  INTEGER NOT NULL REFERENCES voice_clusters(id) ON DELETE CASCADE, \
+        embedding   BLOB    NOT NULL, \
+        dim         INTEGER NOT NULL, \
+        sample_secs REAL    NOT NULL, \
+        created_at  INTEGER NOT NULL)",
+    "CREATE INDEX IF NOT EXISTS idx_segment_voices_cluster ON segment_voices(cluster_id)",
+    "CREATE INDEX IF NOT EXISTS idx_voice_clusters_meeting ON voice_clusters(meeting_id)",
 ];
 
 /// Run one ladder rung inside `BEGIN IMMEDIATE`, re-checking the version inside the transaction
@@ -600,6 +1187,67 @@ mod tests {
         Db::open(path).await
     }
 
+    /// Every table the ladder produces. A rung that adds a table must add it here, or the
+    /// fresh-vs-migrated check silently stops covering it.
+    const ALL_TABLES: [&str; 7] = [
+        "meetings",
+        "transcript_segments",
+        "vocab_corrections",
+        "speakers",
+        "voice_clusters",
+        "segment_voices",
+        "voiceprints",
+    ];
+
+    /// A 4-byte-per-value blob for a small fake embedding.
+    fn blob(v: &[f32]) -> Vec<u8> {
+        v.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    fn new_cluster(label: &str, n: i64, secs: f64) -> NewCluster {
+        NewCluster {
+            cluster: label.into(),
+            speaker_id: None,
+            assigned_by: None,
+            match_score: None,
+            centroid: blob(&[1.0, 0.0]),
+            dim: 2,
+            n_windows: n,
+            speech_secs: secs,
+        }
+    }
+
+    fn voice(segment: i64, cluster: usize, inherited: bool) -> SegmentVoice {
+        SegmentVoice {
+            segment,
+            cluster,
+            inherited,
+            embedding: if inherited { None } else { Some(blob(&[1.0, 0.0])) },
+        }
+    }
+
+    /// Insert a meeting with two far-end clusters and name one of them — touches every v2
+    /// table, which is the only way to prove their foreign keys resolve.
+    async fn insert_with_voices_and_label(db: &mut Db) -> (i64, i64, i64) {
+        let segs = vec![
+            seg(Speaker::You, 0.0, "hola"),
+            seg(Speaker::Others, 1.0, "buenas"),
+            seg(Speaker::Others, 2.0, "qué tal"),
+            seg(Speaker::Others, 3.0, "sí"), // short window: inherits
+        ];
+        let clusters = vec![new_cluster("A", 2, 2.0), new_cluster("B", 1, 1.0)];
+        let voices = vec![voice(1, 0, false), voice(2, 1, false), voice(3, 0, true)];
+        let mid = db
+            .insert_meeting_with_voices(&meta(), &segs, &clusters, &voices)
+            .await
+            .expect("insert with voices");
+        let a = db.get_cluster(mid, "A").await.unwrap().expect("cluster A");
+        let sid = db.add_speaker("Ada", "Lovelace", 5).await.unwrap();
+        db.set_cluster_speaker(a.id, Some(sid), Some("manual"), None).await.unwrap();
+        db.add_voiceprint(sid, &a, 6).await.unwrap();
+        (mid, a.id, sid)
+    }
+
     /// Build a v0 database: the frozen baseline schema, WITH ROWS, and no `user_version`.
     /// This is what every existing installation looks like.
     async fn seed_v0(path: &Path) {
@@ -658,8 +1306,182 @@ mod tests {
             .await
             .expect("a migrated database must still accept new meetings");
         assert_eq!(db.load_segments(id).await.unwrap().len(), 1);
+        // …and every v2 table must accept writes too. SQLite lets `REFERENCES <missing>` through at
+        // CREATE time and only fails at DML, so a read-only assertion would prove nothing here.
+        let (mid, _, sid) = insert_with_voices_and_label(&mut db).await;
+        assert_eq!(db.list_clusters(mid).await.unwrap().len(), 2);
+        assert_eq!(db.get_speaker(sid).await.unwrap().unwrap().voiceprints, 1);
         db.close().await.unwrap();
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Build a v1 database (what every installation running the vocab release looks like).
+    async fn seed_v1(path: &Path) {
+        seed_v0(path).await;
+        let opts = SqliteConnectOptions::new().filename(path).foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&opts).await.unwrap();
+        run_migration(&mut conn, 0, 1, MIGRATION_V1).await.unwrap();
+        sqlx::query("INSERT INTO vocab_corrections (pattern, replacement, is_regex, enabled, created_at) VALUES ('a','b',0,1,1)")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(read_user_version(&mut conn).await.unwrap(), 1);
+        conn.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ladder_upgrades_a_populated_v1_db_to_v2_and_is_idempotent() {
+        let tmp = tempdir();
+        let path = tmp.join("m.db");
+        seed_v1(&path).await;
+
+        let mut db = open_file(&path).await.unwrap();
+        assert_eq!(db.schema_version().await.unwrap(), 2);
+        assert_eq!(db.list_meetings().await.unwrap().len(), 1);
+        assert_eq!(db.list_vocab().await.unwrap().len(), 1, "v1 rows survive the v2 rung");
+        // Unclustered legacy segments read back with no identity at all.
+        let legacy = db.load_segments(1).await.unwrap();
+        assert!(legacy[0].speaker_id.is_none() && legacy[0].voice_cluster.is_none());
+        assert!(db.list_speakers().await.unwrap().is_empty());
+        assert!(db.pending_clusters(1).await.unwrap().is_empty());
+        db.close().await.unwrap();
+
+        let mut db = open_file(&path).await.unwrap();
+        assert_eq!(db.schema_version().await.unwrap(), 2);
+        db.close().await.unwrap();
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn voices_roundtrip_through_load_segments() {
+        let mut db = Db::open_in_memory().await.unwrap();
+        let (mid, a_id, sid) = insert_with_voices_and_label(&mut db).await;
+
+        let segs = db.load_segments(mid).await.unwrap();
+        assert_eq!(segs.len(), 4);
+        assert!(segs[0].voice_cluster.is_none(), "the mic channel is never clustered");
+        assert_eq!(segs[1].voice_cluster.as_deref(), Some("A"));
+        assert_eq!(segs[1].speaker_id, Some(sid), "labelled cluster resolves to the person");
+        assert_eq!(segs[2].voice_cluster.as_deref(), Some("B"));
+        assert!(segs[2].speaker_id.is_none(), "unlabelled cluster has no person");
+        assert_eq!(segs[3].voice_cluster.as_deref(), Some("A"), "short window inherited A");
+
+        let windows = db.cluster_windows(a_id).await.unwrap();
+        assert_eq!(windows.len(), 2);
+        assert!(!windows[0].inherited && windows[0].embedding.is_some());
+        assert!(windows[1].inherited && windows[1].embedding.is_none());
+        assert_eq!(db.meeting_windows(mid).await.unwrap().len(), 3);
+        assert_eq!(db.far_end_segments(mid).await.unwrap().len(), 3);
+
+        // A meeting inserted with no voices reads back exactly as before.
+        let plain = db.insert_meeting(&meta(), &[seg(Speaker::Others, 0.0, "x")]).await.unwrap();
+        let s = db.load_segments(plain).await.unwrap();
+        assert!(s[0].speaker_id.is_none() && s[0].voice_cluster.is_none());
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn enrolment_follows_labels_and_cluster_deletion() {
+        let mut db = Db::open_in_memory().await.unwrap();
+        let (mid, a_id, sid) = insert_with_voices_and_label(&mut db).await;
+
+        let enrolled = db.load_enrolled().await.unwrap();
+        assert_eq!(enrolled.len(), 1);
+        assert_eq!(enrolled[0].speaker_id, sid);
+        assert_eq!(enrolled[0].voiceprints.len(), 1);
+
+        // Only unnamed, unskipped, big-enough clusters are pending.
+        let pending = db.pending_clusters(1).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].cluster.cluster, "B");
+        assert_eq!(pending[0].meeting_title, "team sync");
+        assert!(db.pending_clusters(2).await.unwrap().is_empty(), "B has only 1 window");
+        let b = db.get_cluster(mid, "B").await.unwrap().unwrap();
+        db.set_cluster_skipped(b.id, true).await.unwrap();
+        assert!(db.pending_clusters(1).await.unwrap().is_empty(), "skipped is not pending");
+        // Naming a skipped cluster un-skips it.
+        db.set_cluster_speaker(b.id, Some(sid), Some("auto"), Some(0.7)).await.unwrap();
+        let b = db.get_cluster(mid, "B").await.unwrap().unwrap();
+        assert!(!b.skipped && b.assigned_by.as_deref() == Some("auto") && b.match_score == Some(0.7));
+        // Clearing the person clears provenance too but leaves skipped alone.
+        db.set_cluster_speaker(b.id, None, None, None).await.unwrap();
+        let b = db.get_cluster(mid, "B").await.unwrap().unwrap();
+        assert!(b.speaker_id.is_none() && b.assigned_by.is_none() && b.match_score.is_none());
+
+        // unlabel: the voiceprint this cluster contributed goes away, nothing else.
+        assert_eq!(db.delete_voiceprints_for_cluster(a_id).await.unwrap(), 1);
+        assert!(db.load_enrolled().await.unwrap().is_empty());
+        let a = db.get_cluster(mid, "A").await.unwrap().unwrap();
+        db.add_voiceprint(sid, &a, 7).await.unwrap();
+
+        // Deleting the cluster cascades to its windows AND its voiceprints (no stale prints).
+        db.delete_cluster(a_id).await.unwrap();
+        assert!(db.cluster_windows(a_id).await.unwrap().is_empty());
+        assert!(db.load_enrolled().await.unwrap().is_empty());
+        assert_eq!(db.get_speaker(sid).await.unwrap().unwrap().voiceprints, 0);
+        assert!(db.load_segments(mid).await.unwrap()[1].voice_cluster.is_none());
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn merge_split_and_replace_primitives() {
+        let mut db = Db::open_in_memory().await.unwrap();
+        let (mid, a_id, _) = insert_with_voices_and_label(&mut db).await;
+        let b = db.get_cluster(mid, "B").await.unwrap().unwrap();
+
+        // merge B into A
+        assert_eq!(db.move_segments(b.id, a_id).await.unwrap(), 1);
+        db.delete_cluster(b.id).await.unwrap();
+        db.update_cluster_stats(a_id, &blob(&[0.0, 1.0]), 2, 3, 3.0).await.unwrap();
+        assert_eq!(db.cluster_windows(a_id).await.unwrap().len(), 3);
+        let a = db.get_cluster(mid, "A").await.unwrap().unwrap();
+        assert_eq!((a.n_windows, a.speech_secs), (3, 3.0));
+        assert_eq!(a.centroid, blob(&[0.0, 1.0]));
+
+        // split A into C and D (existing segment ids are 2, 3, 4)
+        let ids: Vec<i64> = db.cluster_windows(a_id).await.unwrap().iter().map(|w| w.segment_id).collect();
+        db.replace_cluster(
+            a_id,
+            mid,
+            &[new_cluster("C", 1, 1.0), new_cluster("D", 1, 1.0)],
+            &[voice(ids[0], 0, false), voice(ids[1], 1, false), voice(ids[2], 1, true)],
+            9,
+        )
+        .await
+        .unwrap();
+        let labels: Vec<String> = db.list_clusters(mid).await.unwrap().into_iter().map(|c| c.cluster).collect();
+        assert_eq!(labels, vec!["C", "D"]);
+        assert_eq!(db.load_segments(mid).await.unwrap()[3].voice_cluster.as_deref(), Some("D"));
+
+        // replace everything (the retro path)
+        db.replace_meeting_clusters(mid, &[new_cluster("A", 3, 3.0)], &[voice(ids[0], 0, false)], 10)
+            .await
+            .unwrap();
+        let clusters = db.list_clusters(mid).await.unwrap();
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(db.meeting_windows(mid).await.unwrap().len(), 1);
+
+        // a bad cluster index rolls the whole write back
+        let err = db
+            .replace_meeting_clusters(mid, &[new_cluster("Z", 1, 1.0)], &[voice(ids[0], 5, false)], 11)
+            .await;
+        assert!(err.is_err());
+        assert_eq!(db.list_clusters(mid).await.unwrap()[0].cluster, "A", "rolled back");
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn speakers_are_found_case_insensitively_and_renamed() {
+        let mut db = Db::open_in_memory().await.unwrap();
+        let id = db.add_speaker("Grace", "Hopper", 1).await.unwrap();
+        assert_eq!(db.find_speaker("grace", "HOPPER").await.unwrap(), Some(id));
+        assert_eq!(db.find_speaker("Grace", "Hoppe").await.unwrap(), None);
+        assert!(db.rename_speaker(id, "Grace", "Brewster Hopper").await.unwrap());
+        assert!(!db.rename_speaker(999, "x", "y").await.unwrap());
+        let rows = db.list_speakers().await.unwrap();
+        assert_eq!(rows[0].full_name(), "Grace Brewster Hopper");
+        assert_eq!(rows[0].voiceprints, 0);
+        db.close().await.unwrap();
     }
 
     /// A fresh database and a migrated legacy one must be structurally identical, or the two
@@ -673,7 +1495,7 @@ mod tests {
 
         let mut a = open_file(&legacy).await.unwrap();
         let mut b = open_file(&fresh).await.unwrap();
-        for table in ["meetings", "transcript_segments", "vocab_corrections"] {
+        for table in ALL_TABLES {
             assert_eq!(
                 a.table_info(table).await.unwrap(),
                 b.table_info(table).await.unwrap(),

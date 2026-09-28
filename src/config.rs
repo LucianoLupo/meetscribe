@@ -57,6 +57,12 @@ min_secs = 20.0
 sessions_days = 0
 # Rotate the daemon log when it exceeds this many megabytes (keeps one .1 backup). 0 = never.
 log_max_mb = 10
+
+[speakers]
+# Cut far-end chunks where the voice changes (Nemotron diarizer) before naming the voices.
+# false = the pre-split pipeline. Needs the diarizer installed: `bash models/provision.sh`,
+# `bash models/build-diarizer.sh`, then `meetscribe install`. Missing diarizer = no split.
+split = true
 "#;
 
 /// Top-level config. `#[serde(default)]` fills any missing field from `Config::default()`.
@@ -67,6 +73,7 @@ pub struct Config {
     pub detector: DetectorConfig,
     pub daemon: DaemonSettings,
     pub retention: RetentionConfig,
+    pub speakers: SpeakerSettings,
     /// Unknown top-level keys — captured so we can WARN instead of silently ignoring them.
     #[serde(flatten)]
     pub extra: BTreeMap<String, toml::Value>,
@@ -79,6 +86,7 @@ impl Default for Config {
             detector: DetectorConfig::default(),
             daemon: DaemonSettings::default(),
             retention: RetentionConfig::default(),
+            speakers: SpeakerSettings::default(),
             extra: BTreeMap::new(),
         }
     }
@@ -149,6 +157,23 @@ impl Default for RetentionConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SpeakerSettings {
+    /// Split far-end chunks at diarizer voice changes before naming (split-then-name).
+    /// Rollback switch: false = the pre-split pipeline. Model paths are not configurable here —
+    /// the daemon uses the installed diarizer under `~/.meetscribe/models/diarizer/`.
+    pub split: bool,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, toml::Value>,
+}
+
+impl Default for SpeakerSettings {
+    fn default() -> Self {
+        Self { split: true, extra: BTreeMap::new() }
+    }
+}
+
 impl Config {
     /// The effective meeting-app allowlist: built-ins (unless disabled) ∪ user extras, de-duped,
     /// order-preserving (built-ins first).
@@ -188,6 +213,7 @@ impl Config {
         push_unknown(&mut w, "detector.", &self.detector.extra);
         push_unknown(&mut w, "daemon.", &self.daemon.extra);
         push_unknown(&mut w, "retention.", &self.retention.extra);
+        push_unknown(&mut w, "speakers.", &self.speakers.extra);
         w
     }
 
@@ -260,6 +286,16 @@ mod tests {
         let parsed: Config = toml::from_str(DEFAULT_CONFIG_TOML).expect("template parses");
         assert_eq!(parsed, Config::default());
         assert!(parsed.collect_warnings().is_empty());
+    }
+
+    #[test]
+    fn speakers_split_defaults_on_and_is_the_rollback_switch() {
+        // Existing config files have no [speakers] section → split is on.
+        let cfg: Config = toml::from_str("version = 1\n[daemon]\nlang = \"es\"\n").expect("parses");
+        assert!(cfg.speakers.split);
+        let cfg: Config = toml::from_str("[speakers]\nsplit = false\nspilt = true\n").expect("parses");
+        assert!(!cfg.speakers.split);
+        assert!(cfg.collect_warnings().iter().any(|w| w.contains("speakers.spilt")));
     }
 
     #[test]
