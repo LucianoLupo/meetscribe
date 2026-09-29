@@ -139,7 +139,8 @@ Rules:
   decode per window). It builds text and confidence exactly like `transcribe` (trim, space-join, mean
   token probability; asr.rs:59-82) and adds token timestamps. `transcribe` is unchanged for mic
   windows and when split is off.
-- **Decided: DTW** (`DtwModelPreset::LargeV3`), set at `Asr::load` only when the diarizer has loaded.
+- **Superseded 2026-09-28 — DTW removed:** whisper.cpp's DTW path asserts `filter_width < n_audio_tokens` and aborts the process when a decode pass covers ≤ ~150 ms; it took down the live daemon on a real meeting (reproduced: exit 134 on that meeting; the plain-timestamp build transcribes it). Word timings now use plain token timestamps. Speaker names are unaffected (pieces are named from audio, not words); only word placement at a boundary can shift. Original decision kept below for the record.
+- ~~**Decided: DTW**~~ (`DtwModelPreset::LargeV3`), set at `Asr::load` only when the diarizer has loaded.
   Audit probe (`ts_probe`, same whisper-rs + `FullParams` + token timestamps, 30 multi-speaker chunks,
   811 words): plain put 70 words (16 chunks) where the diarizer hears no speech vs 47 (5 chunks) for
   DTW; plain pulls first words back to the chunk start; 25 plain words have t0 == t1; 0/30 chunks
