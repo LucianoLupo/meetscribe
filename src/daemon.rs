@@ -1,9 +1,14 @@
-//! The background daemon: a single-threaded state machine that auto-records meetings.
+//! The background daemon: a capture state machine plus one transcription worker thread.
 //!
 //! IDLE — poll the detector every `POLL_INTERVAL`. When an allowlisted app takes the mic, start
 //! a capture session (the proven `session::run_capture` loop) whose stop predicate is "the app
 //! released the mic for `MEETING_END_DEBOUNCE`, OR we were signalled". On stop, finalize; if the
-//! session ran at least `min_secs`, transcribe+store+export via the Phase-3 pipeline; then IDLE.
+//! session ran at least `min_secs`, QUEUE it for transcribe+store+export; then IDLE at once.
+//!
+//! Transcription runs on a separate worker, one job at a time, in arrival order. It used to run
+//! inline, and a long meeting's transcription (often 10–50 min) blinded the detector: a call that
+//! started meanwhile went unrecorded until whisper finished. Capture stays on the main thread (Core
+//! Audio handles are `!Send`); the worker owns nothing but paths and the pipeline it runs.
 //!
 //! Absolute paths only: under a launchd LaunchAgent `cwd=/` and `~` is not expanded, so the model,
 //! DB, and session dirs are all resolved from an absolute `$HOME` (Batch 0 confirmed launchd sets
@@ -21,6 +26,8 @@ use std::fs::OpenOptions;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::config::{self, Config};
@@ -243,15 +250,10 @@ pub(crate) fn run_daemon(argv: &[String]) -> Result<()> {
     // Tray IPC: publish state changes to status.json; honor the pause flag file. Start in the
     // state the flag file dictates (so a daemon (re)started while paused stays paused).
     let mut was_paused = status::is_paused(&cfg.base);
-    publish_status(
-        &cfg,
-        if was_paused {
-            status::DaemonState::Paused
-        } else {
-            status::DaemonState::Idle
-        },
-        None,
-    );
+    let board = Arc::new(StatusBoard::new(cfg.base.clone()));
+    board.update(|a| a.paused = was_paused);
+    let (jobs, transcriber) = spawn_transcriber(Arc::clone(&board), run_transcribe_job)
+        .context("daemon: could not start the transcription worker")?;
 
     // Consecutive capture-start failures for the currently-detected app — throttles the error log
     // and backs off, so a persistently-denied grant doesn't spin+spam at the poll rate.
@@ -267,12 +269,14 @@ pub(crate) fn run_daemon(argv: &[String]) -> Result<()> {
         if paused_now != was_paused {
             was_paused = paused_now;
             if paused_now {
-                log::info!("paused (flag {} present) — not starting new recordings", status::pause_path(&cfg.base).display());
-                publish_status(&cfg, status::DaemonState::Paused, None);
+                log::info!(
+                    "paused (flag {} present) — not starting new recordings",
+                    status::pause_path(&cfg.base).display()
+                );
             } else {
                 log::info!("resumed (pause flag cleared)");
-                publish_status(&cfg, status::DaemonState::Idle, None);
             }
+            board.update(|a| a.paused = paused_now);
         }
         if paused_now {
             sleep_interruptible(POLL_INTERVAL);
@@ -281,15 +285,12 @@ pub(crate) fn run_daemon(argv: &[String]) -> Result<()> {
 
         match detector.active_app() {
             Ok(Some(app)) => {
-                publish_status(
-                    &cfg,
-                    status::DaemonState::Recording,
-                    Some(detect::app_label(&app).to_string()),
-                );
-                match record_and_process(&cfg, &app) {
+                board.update(|a| a.recording = Some(detect::app_label(&app).to_string()));
+                let recorded = record_and_queue(&cfg, &app, &jobs);
+                board.update(|a| a.recording = None);
+                match recorded {
                     Ok(()) => {
                         capture_fail_streak = 0;
-                        publish_status(&cfg, status::DaemonState::Idle, None);
                         if cfg.once {
                             log::info!("--once: processed one meeting, exiting");
                             break;
@@ -300,7 +301,6 @@ pub(crate) fn run_daemon(argv: &[String]) -> Result<()> {
                         if capture_fail_streak == 1 || capture_fail_streak.is_multiple_of(20) {
                             log::error!("{e:#} (attempt #{capture_fail_streak}; backing off)");
                         }
-                        publish_status(&cfg, status::DaemonState::Idle, None);
                         let backoff = (POLL_INTERVAL * capture_fail_streak.min(20))
                             .min(Duration::from_secs(30));
                         sleep_interruptible(backoff);
@@ -315,13 +315,77 @@ pub(crate) fn run_daemon(argv: &[String]) -> Result<()> {
         sleep_interruptible(POLL_INTERVAL);
     }
 
+    // Closing the queue lets the worker finish the job in hand (it skips queued ones on shutdown —
+    // their WAVs stay on disk) and exit. Joining keeps `--once` meaning "recorded AND transcribed".
+    drop(jobs);
+    if transcriber.join().is_err() {
+        log::error!("transcription worker panicked outside a job");
+    }
     log::info!("meetscribe daemon shutting down cleanly");
     Ok(())
 }
 
-/// Publish a state change to `status.json` for the tray (best-effort — a write failure is logged,
-/// never fatal). Called only on transitions, so it does not churn the file each poll.
-fn publish_status(cfg: &DaemonConfig, state: status::DaemonState, app: Option<String>) {
+/// What the daemon is doing right now. The capture loop owns `recording` and `paused`; the worker
+/// owns `transcribing`. Both can be live at once, and the tray shows one state, so it is derived.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Activity {
+    /// App label of the call being recorded.
+    recording: Option<String>,
+    /// App label of the meeting whisper is working on.
+    transcribing: Option<String>,
+    paused: bool,
+}
+
+impl Activity {
+    /// Recording wins (a live call is what the user must see), then Transcribing, then Paused. A
+    /// pause set mid-transcription keeps showing `transcribing` until it ends, as it always did.
+    fn shown(&self) -> Shown {
+        if let Some(app) = &self.recording {
+            (status::DaemonState::Recording, Some(app.clone()))
+        } else if let Some(app) = &self.transcribing {
+            (status::DaemonState::Transcribing, Some(app.clone()))
+        } else if self.paused {
+            (status::DaemonState::Paused, None)
+        } else {
+            (status::DaemonState::Idle, None)
+        }
+    }
+}
+
+/// A state as the tray renders it: what `status.json` carries.
+type Shown = (status::DaemonState, Option<String>);
+
+/// The [`Activity`] plus what was last written to `status.json`, shared by the capture loop and the
+/// worker. The file is rewritten only when the shown state changes, so `since_epoch` keeps meaning
+/// "since this state began" and the file does not churn each poll.
+struct StatusBoard {
+    base: PathBuf,
+    inner: Mutex<(Activity, Option<Shown>)>,
+}
+
+impl StatusBoard {
+    fn new(base: PathBuf) -> Self {
+        Self {
+            base,
+            inner: Mutex::new((Activity::default(), None)),
+        }
+    }
+
+    fn update(&self, change: impl FnOnce(&mut Activity)) {
+        // A poisoned lock only means another thread panicked mid-update; the data is still usable.
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let (activity, last) = &mut *guard;
+        change(activity);
+        let shown = activity.shown();
+        if last.as_ref() != Some(&shown) {
+            write_status(&self.base, shown.0, shown.1.clone());
+            *last = Some(shown);
+        }
+    }
+}
+
+/// Write `status.json` for the tray (best-effort — a write failure is logged, never fatal).
+fn write_status(base: &Path, state: status::DaemonState, app: Option<String>) {
     let now = crate::now_epoch();
     let s = status::Status {
         state,
@@ -330,20 +394,97 @@ fn publish_status(cfg: &DaemonConfig, state: status::DaemonState, app: Option<St
         updated_epoch: now,
         pid: std::process::id(),
     };
-    if let Err(e) = s.write(&cfg.base) {
+    if let Err(e) = s.write(base) {
         log::warn!("could not write status file: {e}");
     }
 }
 
-/// Record one meeting (`app` holds the mic), then gate + transcribe+store+export. Returns `Err`
-/// ONLY if capture failed to start/run — the caller throttles + backs off, so a persistently-denied
-/// grant (common on first run) doesn't spin+spam at the poll rate. A transcription failure is logged
-/// internally and returns `Ok` (the WAVs are kept); the daemon then returns to IDLE.
-fn record_and_process(cfg: &DaemonConfig, app: &str) -> Result<()> {
+/// One finished recording waiting for transcribe+store+export.
+struct TranscribeJob {
+    dir: PathBuf,
+    /// Friendly app label, shown by the tray while this job runs.
+    label: String,
+    opts: pipeline::PipelineOpts,
+}
+
+/// Start the worker that runs `run` on each queued job, one at a time, in arrival order. It marks
+/// the board `transcribing` while a job runs and clears it only once the queue is empty (so a
+/// backlog does not flicker the tray through `idle`). After [`SHUTDOWN`] it skips queued jobs.
+/// The worker exits when every `Sender` is dropped.
+fn spawn_transcriber(
+    board: Arc<StatusBoard>,
+    run: impl Fn(&TranscribeJob) + Send + 'static,
+) -> std::io::Result<(mpsc::Sender<TranscribeJob>, JoinHandle<()>)> {
+    let (tx, rx) = mpsc::channel::<TranscribeJob>();
+    let handle = std::thread::Builder::new()
+        .name("transcriber".to_string())
+        .spawn(move || {
+            let mut next = rx.recv().ok();
+            while let Some(job) = next {
+                if SHUTDOWN.load(Ordering::SeqCst) {
+                    log::info!(
+                        "shutdown requested — WAVs kept at {}, skipping transcription",
+                        job.dir.display()
+                    );
+                } else {
+                    board.update(|a| a.transcribing = Some(job.label.clone()));
+                    run(&job);
+                }
+                next = match rx.try_recv() {
+                    Ok(job) => Some(job),
+                    Err(_) => {
+                        board.update(|a| a.transcribing = None);
+                        rx.recv().ok()
+                    }
+                };
+            }
+        })?;
+    Ok((tx, handle))
+}
+
+/// Transcribe+store+export one session. Every failure, including a panic inside the pipeline, is
+/// logged and contained: the WAVs are kept and the worker moves on to the next meeting.
+fn run_transcribe_job(job: &TranscribeJob) {
+    log::info!("transcribing {} …", job.dir.display());
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pipeline::transcribe_and_store(&job.dir, &job.opts)
+    }));
+    match outcome {
+        Ok(Ok(out)) => log::info!(
+            "stored{} → {} ({} segments)",
+            out.stored_id
+                .map(|id| format!(" meeting id {id}"))
+                .unwrap_or_default(),
+            out.md_path.display(),
+            out.segments.len()
+        ),
+        Ok(Err(e)) => log::error!(
+            "transcription failed for {} — WAVs kept: {e}",
+            job.dir.display()
+        ),
+        Err(_) => log::error!(
+            "transcription panicked for {} — WAVs kept",
+            job.dir.display()
+        ),
+    }
+}
+
+/// Record one meeting (`app` holds the mic), then gate it and queue it for transcription. Returns
+/// as soon as capture ends, so the caller is back to watching for the next call while whisper
+/// works. Returns `Err` ONLY if capture failed to start/run — the caller throttles + backs off, so
+/// a persistently-denied grant (common on first run) doesn't spin+spam at the poll rate.
+fn record_and_queue(
+    cfg: &DaemonConfig,
+    app: &str,
+    jobs: &mpsc::Sender<TranscribeJob>,
+) -> Result<()> {
     let started = crate::now_epoch();
     let dir = cfg.sessions_dir.join(export::stamp_compact(started));
     let label = detect::app_label(app);
-    log::info!("meeting detected — {label} ({app}) took the mic → recording to {}", dir.display());
+    log::info!(
+        "meeting detected — {label} ({app}) took the mic → recording to {}",
+        dir.display()
+    );
 
     // Stop predicate: the app released the mic for MEETING_END_DEBOUNCE, or we were signalled.
     // The detector is polled at most every DETECT_POLL_DURING_CAPTURE (the capture loop ticks far
@@ -390,7 +531,10 @@ fn record_and_process(cfg: &DaemonConfig, app: &str) -> Result<()> {
     }
 
     if SHUTDOWN.load(Ordering::SeqCst) {
-        log::info!("shutdown requested — WAVs kept at {}, skipping transcription", dir.display());
+        log::info!(
+            "shutdown requested — WAVs kept at {}, skipping transcription",
+            dir.display()
+        );
         return Ok(());
     }
 
@@ -407,18 +551,17 @@ fn record_and_process(cfg: &DaemonConfig, app: &str) -> Result<()> {
         diarizer_model: cfg.diarizer_model.clone(),
         diarizer_rttm: None,
     };
-    log::info!("transcribing {} …", dir.display());
-    // Capture is done but this call blocks for minutes on a long meeting — publish the transition so
-    // the tray stops showing "recording" the moment the call actually ended.
-    publish_status(cfg, status::DaemonState::Transcribing, Some(label.to_string()));
-    match pipeline::transcribe_and_store(&dir, &opts) {
-        Ok(out) => log::info!(
-            "stored{} → {} ({} segments)",
-            out.stored_id.map(|id| format!(" meeting id {id}")).unwrap_or_default(),
-            out.md_path.display(),
-            out.segments.len()
-        ),
-        Err(e) => log::error!("transcription failed for {} — WAVs kept: {e}", dir.display()),
+    log::info!("queued {} for transcription", dir.display());
+    let job = TranscribeJob {
+        dir,
+        label: label.to_string(),
+        opts,
+    };
+    if let Err(mpsc::SendError(job)) = jobs.send(job) {
+        log::error!(
+            "transcription worker is gone — WAVs kept at {}",
+            job.dir.display()
+        );
     }
     Ok(())
 }
@@ -426,10 +569,17 @@ fn record_and_process(cfg: &DaemonConfig, app: &str) -> Result<()> {
 /// Disk/log hygiene: prune old session dirs + rotate the daemon logs (both config-driven, both
 /// best-effort — a failure is logged, never fatal). Runs at startup and once per day.
 fn run_maintenance(cfg: &DaemonConfig) {
-    match crate::maintenance::prune_sessions(&cfg.sessions_dir, cfg.sessions_days, crate::now_epoch())
-    {
+    match crate::maintenance::prune_sessions(
+        &cfg.sessions_dir,
+        cfg.sessions_days,
+        crate::now_epoch(),
+    ) {
         Ok(r) if r.removed > 0 => {
-            log::info!("retention: pruned {} old session(s) (kept {})", r.removed, r.kept);
+            log::info!(
+                "retention: pruned {} old session(s) (kept {})",
+                r.removed,
+                r.kept
+            );
         }
         Ok(_) => {}
         Err(e) => log::warn!("retention: session prune failed: {e}"),
@@ -451,5 +601,120 @@ fn sleep_interruptible(total: Duration) {
         let s = step.min(left);
         std::thread::sleep(s);
         left = left.saturating_sub(s);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use status::DaemonState;
+
+    fn temp_base(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("meetscribe-daemon-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn job(dir: &Path, label: &str) -> TranscribeJob {
+        TranscribeJob {
+            dir: dir.to_path_buf(),
+            label: label.to_string(),
+            opts: pipeline::PipelineOpts {
+                model: dir.join("ggml-large-v3.bin"),
+                lang: "es".to_string(),
+                title: None,
+                db_path: dir.join("meetscribe.db"),
+                export_dir: dir.to_path_buf(),
+                no_store: true,
+                speaker_model: None,
+                split: false,
+                diarizer_bin: dir.join("diarizer"),
+                diarizer_model: dir.join("diarizer.onnx"),
+                diarizer_rttm: None,
+            },
+        }
+    }
+
+    fn shown_on_disk(base: &Path) -> (DaemonState, Option<String>) {
+        let s = status::Status::read(base).expect("status.json written");
+        (s.state, s.app)
+    }
+
+    #[test]
+    fn a_live_recording_outranks_a_running_transcription() {
+        let mut a = Activity {
+            transcribing: Some("Chrome".into()),
+            paused: true,
+            ..Activity::default()
+        };
+        assert_eq!(
+            a.shown(),
+            (DaemonState::Transcribing, Some("Chrome".into()))
+        );
+        a.recording = Some("Zoom".into());
+        assert_eq!(a.shown(), (DaemonState::Recording, Some("Zoom".into())));
+        a.recording = None;
+        a.transcribing = None;
+        assert_eq!(a.shown(), (DaemonState::Paused, None));
+        a.paused = false;
+        assert_eq!(a.shown(), (DaemonState::Idle, None));
+    }
+
+    /// The bug this worker exists for: while a long transcription runs, the capture loop must be
+    /// free to record the next call. The job here blocks until the test releases it, standing in for
+    /// a 50-minute whisper run; a second recording starts and ends meanwhile.
+    #[test]
+    fn a_recording_can_start_and_queue_while_a_transcription_runs() {
+        let base = temp_base("overlap");
+        let board = Arc::new(StatusBoard::new(base.clone()));
+        let (started_tx, started_rx) = mpsc::channel::<String>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let (jobs, worker) = spawn_transcriber(Arc::clone(&board), move |job| {
+            started_tx.send(job.label.clone()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+        })
+        .unwrap();
+
+        jobs.send(job(&base, "Chrome")).unwrap();
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "Chrome"
+        );
+        assert_eq!(
+            shown_on_disk(&base),
+            (DaemonState::Transcribing, Some("Chrome".into()))
+        );
+
+        // The next call arrives mid-transcription: the loop can record it (nothing waits on whisper).
+        board.update(|a| a.recording = Some("Meet".into()));
+        assert_eq!(
+            shown_on_disk(&base),
+            (DaemonState::Recording, Some("Meet".into()))
+        );
+        board.update(|a| a.recording = None);
+        jobs.send(job(&base, "Meet")).unwrap();
+        assert_eq!(
+            shown_on_disk(&base),
+            (DaemonState::Transcribing, Some("Chrome".into()))
+        );
+
+        // Backlog runs in order, and the tray goes idle only once the queue is empty.
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "Meet"
+        );
+        assert_eq!(
+            shown_on_disk(&base),
+            (DaemonState::Transcribing, Some("Meet".into()))
+        );
+        release_tx.send(()).unwrap();
+        drop(jobs);
+        worker.join().unwrap();
+        assert_eq!(shown_on_disk(&base), (DaemonState::Idle, None));
+
+        std::fs::remove_dir_all(&base).ok();
     }
 }

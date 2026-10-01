@@ -4,8 +4,8 @@
 //! `paused`      — a flag file; while it exists the daemon skips STARTING new recordings (a
 //!                 recording already in progress finishes normally). The tray toggles it.
 //!
-//! File-based IPC is the whole point of the separate-process design: the daemon stays
-//! single-threaded with NO GUI run loop competing with its Core Audio listeners, and the tray is a
+//! File-based IPC is the whole point of the separate-process design: the daemon has
+//! NO GUI run loop competing with its Core Audio listeners, and the tray is a
 //! plain reader that never touches audio/capture. `cat status.json` / `touch paused` also make the
 //! daemon observable and pausable from a shell with no GUI at all.
 
@@ -20,9 +20,9 @@ pub const PAUSE_FILE: &str = "paused";
 pub enum DaemonState {
     Idle,
     Recording,
-    /// Capture has ended; whisper is still running. Distinct from `Recording` because transcription
-    /// of a long meeting blocks the daemon for many minutes — without this the tray would keep
-    /// showing "recording" long after the call ended.
+    /// Whisper is working on a finished meeting and no call is being recorded (a recording outranks
+    /// it — the daemon records the next call while the last one transcribes). `app` names the
+    /// meeting being transcribed.
     Transcribing,
     Paused,
 }

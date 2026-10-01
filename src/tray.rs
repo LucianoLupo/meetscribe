@@ -1,6 +1,6 @@
 //! `meetscribe tray` — a menu-bar status/control app for the background daemon.
 //!
-//! SEPARATE PROCESS by design: the daemon stays single-threaded with no GUI run loop competing with
+//! SEPARATE PROCESS by design: the daemon has no GUI run loop competing with
 //! its Core Audio listeners, and this process runs the AppKit event loop but never touches audio.
 //! The two talk only through `~/.meetscribe/{status.json, paused}` (see `crate::status`).
 //!
