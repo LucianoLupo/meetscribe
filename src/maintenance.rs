@@ -45,7 +45,12 @@ pub fn is_older_than(mtime_epoch: i64, now_epoch: i64, days: u64) -> bool {
     now_epoch - mtime_epoch > (days as i64) * SECS_PER_DAY
 }
 
+/// File the daemon drops in a session dir while its transcription is queued; removed after the
+/// attempt. Its presence means "recorded, transcript still owed" (see `daemon`).
+pub const PENDING_MARKER: &str = "pending";
+
 /// Delete session subdirs older than `days` (by mtime). `days == 0` is a no-op (keep forever).
+/// A dir carrying [`PENDING_MARKER`] is never deleted: its transcript is still owed.
 /// `now_epoch` is injected for testability. A per-dir error is logged, not fatal (best-effort).
 pub fn prune_sessions(sessions_dir: &Path, days: u64, now_epoch: i64) -> Result<PruneReport> {
     let mut report = PruneReport::default();
@@ -59,6 +64,10 @@ pub fn prune_sessions(sessions_dir: &Path, days: u64, now_epoch: i64) -> Result<
         let path = entry.path();
         if !path.is_dir() {
             continue; // only prune session directories, never stray files
+        }
+        if path.join(PENDING_MARKER).exists() {
+            report.kept += 1; // queued, never transcribed — the daemon still owes it a transcript
+            continue;
         }
         if is_older_than(mtime_epoch(&path), now_epoch, days) {
             match fs::remove_dir_all(&path) {
@@ -157,6 +166,23 @@ mod tests {
         assert_eq!(r, PruneReport { removed: 3, kept: 0 });
         assert!(!sessions.join("a").exists());
         assert!(sessions.join("stray.txt").exists()); // stray file never touched
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn prune_never_removes_a_session_still_waiting_for_its_transcript() {
+        let tmp = std::env::temp_dir().join(format!("meetscribe-prune-pending-{}", std::process::id()));
+        let sessions = tmp.join("sessions");
+        fs::create_dir_all(sessions.join("owed")).unwrap();
+        fs::create_dir_all(sessions.join("done")).unwrap();
+        fs::write(sessions.join("owed").join(PENDING_MARKER), "Chrome\nChrome — 2026-10-01\n").unwrap();
+
+        let later = mtime_epoch(&sessions.join("owed")) + 100 * SECS_PER_DAY;
+        let r = prune_sessions(&sessions, 30, later).unwrap();
+        assert_eq!(r, PruneReport { removed: 1, kept: 1 });
+        assert!(sessions.join("owed").exists());
+        assert!(!sessions.join("done").exists());
 
         fs::remove_dir_all(&tmp).ok();
     }

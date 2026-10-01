@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::{self, Config};
 use crate::detect::{self, MeetingDetector};
-use crate::{export, pipeline, session, status};
+use crate::{export, maintenance, pipeline, session, status};
 
 /// How often to poll for a meeting while idle.
 const POLL_INTERVAL: Duration = Duration::from_millis(1500);
@@ -254,6 +254,10 @@ pub(crate) fn run_daemon(argv: &[String]) -> Result<()> {
     board.update(|a| a.paused = was_paused);
     let (jobs, transcriber) = spawn_transcriber(Arc::clone(&board), run_transcribe_job)
         .context("daemon: could not start the transcription worker")?;
+    for (dir, label, title) in pending_sessions(&cfg.sessions_dir) {
+        log::info!("resuming a transcription the last run did not reach: {}", dir.display());
+        queue_job(&jobs, job_for(&cfg, dir, label, title));
+    }
 
     // Consecutive capture-start failures for the currently-detected app — throttles the error log
     // and backs off, so a persistently-denied grant doesn't spin+spam at the poll rate.
@@ -399,7 +403,9 @@ fn write_status(base: &Path, state: status::DaemonState, app: Option<String>) {
     }
 }
 
-/// One finished recording waiting for transcribe+store+export.
+/// One finished recording waiting for transcribe+store+export. The queue itself is in memory, so
+/// each queued session dir also carries a `PENDING_MARKER` file (label, then title): it outlives a
+/// restart, the next start re-queues it, and retention never prunes the dir while it is there.
 struct TranscribeJob {
     dir: PathBuf,
     /// Friendly app label, shown by the tray while this job runs.
@@ -422,8 +428,8 @@ fn spawn_transcriber(
             let mut next = rx.recv().ok();
             while let Some(job) = next {
                 if SHUTDOWN.load(Ordering::SeqCst) {
-                    log::info!(
-                        "shutdown requested — WAVs kept at {}, skipping transcription",
+                    log::warn!(
+                        "shutdown requested — {} stays pending; it is transcribed on the next start",
                         job.dir.display()
                     );
                 } else {
@@ -442,8 +448,59 @@ fn spawn_transcriber(
     Ok((tx, handle))
 }
 
+fn job_for(cfg: &DaemonConfig, dir: PathBuf, label: String, title: String) -> TranscribeJob {
+    let opts = pipeline::PipelineOpts {
+        model: cfg.model.clone(),
+        lang: cfg.lang.clone(),
+        title: Some(title),
+        db_path: cfg.db_path.clone(),
+        export_dir: dir.clone(),
+        no_store: false,
+        speaker_model: Some(cfg.speaker_model.clone()),
+        split: cfg.split,
+        diarizer_bin: cfg.diarizer_bin.clone(),
+        diarizer_model: cfg.diarizer_model.clone(),
+        diarizer_rttm: None,
+    };
+    TranscribeJob { dir, label, opts }
+}
+
+/// Mark the session dir pending (best-effort: without the marker the job still runs now, it just
+/// would not survive a restart), then hand the job to the worker.
+fn queue_job(jobs: &mpsc::Sender<TranscribeJob>, job: TranscribeJob) {
+    let title = job.opts.title.as_deref().unwrap_or_default();
+    let marker = job.dir.join(maintenance::PENDING_MARKER);
+    if let Err(e) = std::fs::write(&marker, format!("{}\n{title}\n", job.label)) {
+        log::warn!("could not write {} — this meeting will not be retried after a restart: {e}", marker.display());
+    }
+    log::info!("queued {} for transcription", job.dir.display());
+    if let Err(mpsc::SendError(job)) = jobs.send(job) {
+        log::error!("transcription worker is gone — WAVs kept at {}", job.dir.display());
+    }
+}
+
+/// Session dirs still marked pending — queued but never attempted (the daemon stopped first) —
+/// oldest first, as `(dir, label, title)`. Dir names are UTC stamps, so name order is time order.
+fn pending_sessions(sessions_dir: &Path) -> Vec<(PathBuf, String, String)> {
+    let Ok(entries) = std::fs::read_dir(sessions_dir) else { return Vec::new() };
+    let mut found: Vec<(PathBuf, String, String)> = entries
+        .filter_map(|e| {
+            let dir = e.ok()?.path();
+            let text = std::fs::read_to_string(dir.join(maintenance::PENDING_MARKER)).ok()?;
+            let mut lines = text.lines();
+            let label = lines.next().filter(|l| !l.is_empty()).unwrap_or("meeting").to_string();
+            let title = lines.next().map(str::to_string).unwrap_or_else(|| label.clone());
+            Some((dir, label, title))
+        })
+        .collect();
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found
+}
+
 /// Transcribe+store+export one session. Every failure, including a panic inside the pipeline, is
-/// logged and contained: the WAVs are kept and the worker moves on to the next meeting.
+/// logged and contained: the WAVs are kept and the worker moves on to the next meeting. The pending
+/// marker is cleared after ANY attempt, so a session that always fails cannot retry on every start
+/// (`meetscribe transcribe <dir>` re-runs it by hand).
 fn run_transcribe_job(job: &TranscribeJob) {
     log::info!("transcribing {} …", job.dir.display());
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -467,6 +524,9 @@ fn run_transcribe_job(job: &TranscribeJob) {
             job.dir.display()
         ),
     }
+    if let Err(e) = std::fs::remove_file(job.dir.join(maintenance::PENDING_MARKER)) {
+        log::warn!("could not clear the pending marker in {}: {e}", job.dir.display());
+    }
 }
 
 /// Record one meeting (`app` holds the mic), then gate it and queue it for transcription. Returns
@@ -481,10 +541,7 @@ fn record_and_queue(
     let started = crate::now_epoch();
     let dir = cfg.sessions_dir.join(export::stamp_compact(started));
     let label = detect::app_label(app);
-    log::info!(
-        "meeting detected — {label} ({app}) took the mic → recording to {}",
-        dir.display()
-    );
+    log::info!("meeting detected — {label} ({app}) took the mic → recording to {}", dir.display());
 
     // Stop predicate: the app released the mic for MEETING_END_DEBOUNCE, or we were signalled.
     // The detector is polled at most every DETECT_POLL_DURING_CAPTURE (the capture loop ticks far
@@ -530,56 +587,19 @@ fn record_and_queue(
         return Ok(());
     }
 
-    if SHUTDOWN.load(Ordering::SeqCst) {
-        log::info!(
-            "shutdown requested — WAVs kept at {}, skipping transcription",
-            dir.display()
-        );
-        return Ok(());
-    }
-
-    let opts = pipeline::PipelineOpts {
-        model: cfg.model.clone(),
-        lang: cfg.lang.clone(),
-        title: Some(format!("{label} — {}", export::fmt_utc(started))),
-        db_path: cfg.db_path.clone(),
-        export_dir: dir.clone(),
-        no_store: false,
-        speaker_model: Some(cfg.speaker_model.clone()),
-        split: cfg.split,
-        diarizer_bin: cfg.diarizer_bin.clone(),
-        diarizer_model: cfg.diarizer_model.clone(),
-        diarizer_rttm: None,
-    };
-    log::info!("queued {} for transcription", dir.display());
-    let job = TranscribeJob {
-        dir,
-        label: label.to_string(),
-        opts,
-    };
-    if let Err(mpsc::SendError(job)) = jobs.send(job) {
-        log::error!(
-            "transcription worker is gone — WAVs kept at {}",
-            job.dir.display()
-        );
-    }
+    // Queued even on shutdown: the marker survives the restart and the next start transcribes it.
+    let title = format!("{label} — {}", export::fmt_utc(started));
+    queue_job(jobs, job_for(cfg, dir, label.to_string(), title));
     Ok(())
 }
 
 /// Disk/log hygiene: prune old session dirs + rotate the daemon logs (both config-driven, both
 /// best-effort — a failure is logged, never fatal). Runs at startup and once per day.
 fn run_maintenance(cfg: &DaemonConfig) {
-    match crate::maintenance::prune_sessions(
-        &cfg.sessions_dir,
-        cfg.sessions_days,
-        crate::now_epoch(),
-    ) {
+    match crate::maintenance::prune_sessions(&cfg.sessions_dir, cfg.sessions_days, crate::now_epoch())
+    {
         Ok(r) if r.removed > 0 => {
-            log::info!(
-                "retention: pruned {} old session(s) (kept {})",
-                r.removed,
-                r.kept
-            );
+            log::info!("retention: pruned {} old session(s) (kept {})", r.removed, r.kept);
         }
         Ok(_) => {}
         Err(e) => log::warn!("retention: session prune failed: {e}"),
@@ -639,6 +659,36 @@ mod tests {
     fn shown_on_disk(base: &Path) -> (DaemonState, Option<String>) {
         let s = status::Status::read(base).expect("status.json written");
         (s.state, s.app)
+    }
+
+    /// A restart must not lose queued meetings: whatever the last run marked pending and never
+    /// reached is found again, oldest first, with the label and title it was queued under.
+    #[test]
+    fn pending_sessions_are_found_again_oldest_first() {
+        let sessions = temp_base("pending");
+        for (name, marker) in [
+            ("20261001T170000Z", Some("Meet\nMeet — 2026-10-01 17:00 UTC\n")),
+            ("20261001T130000Z", Some("Chrome\nChrome — 2026-10-01 13:00 UTC\n")),
+            ("20261001T150000Z", None), // transcribed already: no marker
+        ] {
+            std::fs::create_dir_all(sessions.join(name)).unwrap();
+            if let Some(m) = marker {
+                std::fs::write(sessions.join(name).join(maintenance::PENDING_MARKER), m).unwrap();
+            }
+        }
+        let found = pending_sessions(&sessions);
+        let got: Vec<(String, &str, &str)> = found
+            .iter()
+            .map(|(d, l, t)| (d.file_name().unwrap().to_string_lossy().into_owned(), l.as_str(), t.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("20261001T130000Z".to_string(), "Chrome", "Chrome — 2026-10-01 13:00 UTC"),
+                ("20261001T170000Z".to_string(), "Meet", "Meet — 2026-10-01 17:00 UTC"),
+            ]
+        );
+        std::fs::remove_dir_all(&sessions).ok();
     }
 
     #[test]
