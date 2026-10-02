@@ -132,6 +132,10 @@ fn codesign(bin: &Path, identity: &str) -> Result<()> {
     Ok(())
 }
 
+/// `ProcessType` is `Standard`, not `Background`: launchd spawns a Background job with a policy the
+/// process cannot lift (`spawn type = background`), and whisper ran 2.4× slower under it (measured
+/// 2026-10-02: RTF 0.62 vs 0.25). Capture is unaffected either way. Whisper still yields to calls —
+/// the transcription child drops ITSELF to background while one is recorded (`status::spawn_call_yield`).
 fn plist_contents(dest_bin: &Path, home: &Path, out_log: &Path, err_log: &Path) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -153,7 +157,7 @@ fn plist_contents(dest_bin: &Path, home: &Path, out_log: &Path, err_log: &Path) 
         <false/>
     </dict>
     <key>ProcessType</key>
-    <string>Background</string>
+    <string>Standard</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>HOME</key>
@@ -530,6 +534,18 @@ mod tests {
     }
 
     /// Ambiguity must never be resolved by guessing — it lists every candidate instead.
+    #[test]
+    fn the_agent_runs_at_standard_priority_so_transcription_is_not_throttled() {
+        let p = plist_contents(
+            Path::new("/Users/someone/.meetscribe/bin/meetscribe"),
+            Path::new("/Users/someone"),
+            Path::new("/Users/someone/.meetscribe/logs/meetscribe.out.log"),
+            Path::new("/Users/someone/.meetscribe/logs/meetscribe.err.log"),
+        );
+        assert!(p.contains("<key>ProcessType</key>\n    <string>Standard</string>"), "{p}");
+        assert!(!p.contains("<string>Background</string>"));
+    }
+
     #[test]
     fn errors_and_lists_candidates_when_ambiguous() {
         let found = parse_identities(TWO);

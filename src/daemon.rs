@@ -252,7 +252,11 @@ pub(crate) fn run_daemon(argv: &[String]) -> Result<()> {
     let mut was_paused = status::is_paused(&cfg.base);
     let board = Arc::new(StatusBoard::new(cfg.base.clone()));
     board.update(|a| a.paused = was_paused);
-    let (jobs, transcriber) = spawn_transcriber(Arc::clone(&board), run_transcribe_job)
+    // Transcription runs in a child process of this very binary (`meetscribe transcribe`).
+    let exe = std::env::current_exe().context("daemon: cannot resolve its own executable")?;
+    let child_base = cfg.base.clone();
+    let (jobs, transcriber) =
+        spawn_transcriber(Arc::clone(&board), move |job| run_transcribe_job(job, &exe, &child_base))
         .context("daemon: could not start the transcription worker")?;
     for (dir, label, title) in pending_sessions(&cfg.sessions_dir) {
         log::info!("resuming a transcription the last run did not reach: {}", dir.display());
@@ -497,35 +501,143 @@ fn pending_sessions(sessions_dir: &Path) -> Vec<(PathBuf, String, String)> {
     found
 }
 
-/// Transcribe+store+export one session. Every failure, including a panic inside the pipeline, is
-/// logged and contained: the WAVs are kept and the worker moves on to the next meeting. The pending
-/// marker is cleared after ANY attempt, so a session that always fails cannot retry on every start
-/// (`meetscribe transcribe <dir>` re-runs it by hand).
-fn run_transcribe_job(job: &TranscribeJob) {
-    log::info!("transcribing {} …", job.dir.display());
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        pipeline::transcribe_and_store(&job.dir, &job.opts)
-    }));
+/// How the transcription child ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildOutcome {
+    Exited(i32),
+    Signaled(i32),
+    /// Never started, or lost track of it (`try_wait` failed).
+    Failed,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Marker {
+    Keep,
+    Clear,
+}
+
+/// What happens to a session's `pending` marker after its transcription child ends. Success clears
+/// it. A child that ended while the daemon was shutting down was (or may have been) stopped by us,
+/// so the marker stays and the next start retries. Any other failure clears it — the WAVs stay and
+/// `meetscribe transcribe <dir>` re-runs it by hand — so a session that always crashes whisper
+/// cannot retry on every start.
+fn marker_after(outcome: ChildOutcome, shutting_down: bool) -> Marker {
     match outcome {
-        Ok(Ok(out)) => log::info!(
-            "stored{} → {} ({} segments)",
-            out.stored_id
-                .map(|id| format!(" meeting id {id}"))
-                .unwrap_or_default(),
-            out.md_path.display(),
-            out.segments.len()
-        ),
-        Ok(Err(e)) => log::error!(
-            "transcription failed for {} — WAVs kept: {e}",
-            job.dir.display()
-        ),
-        Err(_) => log::error!(
-            "transcription panicked for {} — WAVs kept",
-            job.dir.display()
-        ),
+        ChildOutcome::Exited(0) => Marker::Clear,
+        _ if shutting_down => Marker::Keep,
+        _ => Marker::Clear,
     }
-    if let Err(e) = std::fs::remove_file(job.dir.join(maintenance::PENDING_MARKER)) {
-        log::warn!("could not clear the pending marker in {}: {e}", job.dir.display());
+}
+
+/// The `meetscribe transcribe` argv (after the subcommand) that reproduces `opts` exactly. Every
+/// field is passed, because the CLI's defaults (`es`, split on, repo-relative models) are wrong for
+/// the daemon and unknown flags are ignored, not rejected. Pinned by a round-trip test against
+/// `parse_transcribe_args`. `--yield-to-calls` makes the child drop to background priority while a
+/// call is being recorded (see `status::spawn_call_yield`).
+fn child_args(dir: &Path, opts: &pipeline::PipelineOpts, base: &Path) -> Vec<String> {
+    let path = |p: &Path| p.display().to_string();
+    let mut a = vec![
+        path(dir),
+        "--model".into(),
+        path(&opts.model),
+        "--lang".into(),
+        opts.lang.clone(),
+        "--db".into(),
+        path(&opts.db_path),
+        "--export-dir".into(),
+        path(&opts.export_dir),
+        "--diarizer-bin".into(),
+        path(&opts.diarizer_bin),
+        "--diarizer-model".into(),
+        path(&opts.diarizer_model),
+        "--yield-to-calls".into(),
+        path(base),
+    ];
+    if let Some(t) = &opts.title {
+        a.extend(["--title".into(), t.clone()]);
+    }
+    if let Some(m) = &opts.speaker_model {
+        a.extend(["--speaker-model".into(), path(m)]);
+    }
+    if let Some(r) = &opts.diarizer_rttm {
+        a.extend(["--diarizer-rttm".into(), path(r)]);
+    }
+    if !opts.split {
+        a.push("--no-split".into());
+    }
+    if opts.no_store {
+        a.push("--no-store".into());
+    }
+    a
+}
+
+/// Transcribe+store+export one session in a child process (`meetscribe transcribe`), so a whisper
+/// `abort()` can never take down the daemon or a recording in progress. The child's log lines go to
+/// the daemon's stderr (one log); its stdout — the full transcript — is discarded.
+fn run_transcribe_job(job: &TranscribeJob, exe: &Path, base: &Path) {
+    log::info!("transcribing {} …", job.dir.display());
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("transcribe")
+        .args(child_args(&job.dir, &job.opts, base))
+        .current_dir(&job.dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null());
+    let outcome = run_child(cmd);
+    let shutting_down = SHUTDOWN.load(Ordering::SeqCst);
+    match outcome {
+        ChildOutcome::Exited(0) => log::info!("transcribed {}", job.dir.display()),
+        other => log::error!("transcription failed for {} ({other:?}) — WAVs kept", job.dir.display()),
+    }
+    match marker_after(outcome, shutting_down) {
+        Marker::Keep => log::warn!(
+            "{} stays pending; it is transcribed on the next start",
+            job.dir.display()
+        ),
+        Marker::Clear => {
+            if let Err(e) = std::fs::remove_file(job.dir.join(maintenance::PENDING_MARKER)) {
+                log::warn!("could not clear the pending marker in {}: {e}", job.dir.display());
+            }
+        }
+    }
+}
+
+/// Run `cmd` to completion. On shutdown, send the child SIGTERM rather than wait out a long
+/// transcription (the marker keeps the session for the next start). The child stays in the
+/// daemon's process group, so if the daemon itself is killed, launchd takes the child down too
+/// instead of leaving an orphan that could store a meeting the next start transcribes again.
+fn run_child(mut cmd: std::process::Command) -> ChildOutcome {
+    use std::os::unix::process::ExitStatusExt;
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("could not start the transcription child: {e}");
+            return ChildOutcome::Failed;
+        }
+    };
+    let mut terminated = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return match (status.code(), status.signal()) {
+                    (Some(code), _) => ChildOutcome::Exited(code),
+                    (None, Some(sig)) => ChildOutcome::Signaled(sig),
+                    (None, None) => ChildOutcome::Failed,
+                };
+            }
+            Ok(None) => {}
+            Err(e) => {
+                log::error!("lost track of the transcription child: {e}");
+                let _ = child.kill();
+                let _ = child.wait();
+                return ChildOutcome::Failed;
+            }
+        }
+        if !terminated && SHUTDOWN.load(Ordering::SeqCst) {
+            // SAFETY: signalling our own, not yet reaped, child.
+            unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+            terminated = true;
+        }
+        std::thread::sleep(Duration::from_millis(250));
     }
 }
 
@@ -709,6 +821,57 @@ mod tests {
         assert_eq!(a.shown(), (DaemonState::Paused, None));
         a.paused = false;
         assert_eq!(a.shown(), (DaemonState::Idle, None));
+    }
+
+    /// The daemon's argv for its child must parse back into exactly the options it holds — the CLI
+    /// silently ignores unknown flags and its defaults are wrong for the daemon, so drift here would
+    /// quietly drop speaker names, the split or the configured language.
+    #[test]
+    fn child_args_round_trip_through_the_cli_parser() {
+        let base = PathBuf::from("/Users/someone/.meetscribe");
+        let dir = base.join("sessions/20261001-190352");
+        for split in [true, false] {
+            let mut j = job(&dir, "Chrome");
+            j.opts.lang = "en".to_string();
+            j.opts.split = split;
+            j.opts.no_store = false;
+            j.opts.title = Some("Chrome — 2026-10-01 19:03 UTC".to_string());
+            j.opts.speaker_model = Some(base.join("models/speaker/campplus.onnx"));
+            let argv = child_args(&dir, &j.opts, &base);
+            let parsed = crate::parse_transcribe_args(&argv).unwrap().expect("not --help");
+            assert_eq!(parsed.dir, dir);
+            assert_eq!(parsed.opts, j.opts, "split = {split}");
+            assert_eq!(parsed.yield_to_calls, Some(base.clone()));
+        }
+    }
+
+    #[test]
+    fn the_marker_survives_only_a_shutdown_interrupted_attempt() {
+        use ChildOutcome::*;
+        for (outcome, shutting_down, want) in [
+            (Exited(0), false, Marker::Clear),
+            (Exited(0), true, Marker::Clear),
+            (Exited(1), false, Marker::Clear),
+            (Signaled(libc::SIGABRT), false, Marker::Clear),
+            (Failed, false, Marker::Clear),
+            (Signaled(libc::SIGTERM), true, Marker::Keep),
+            (Signaled(libc::SIGINT), true, Marker::Keep),
+            (Exited(1), true, Marker::Keep),
+        ] {
+            assert_eq!(marker_after(outcome, shutting_down), want, "{outcome:?} shutting_down={shutting_down}");
+        }
+    }
+
+    /// The reason transcription is a child process: whisper.cpp has aborted before (`34a8290`).
+    /// An aborting child must be reported, not take this process with it.
+    #[test]
+    fn an_aborting_child_is_reported_and_the_parent_survives() {
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "kill -ABRT $$"]);
+        assert_eq!(run_child(cmd), ChildOutcome::Signaled(libc::SIGABRT));
+        let mut ok = std::process::Command::new("/bin/sh");
+        ok.args(["-c", "exit 0"]);
+        assert_eq!(run_child(ok), ChildOutcome::Exited(0));
     }
 
     /// The bug this worker exists for: while a long transcription runs, the capture loop must be
