@@ -533,7 +533,7 @@ mod tests {
         assert!(err.contains(SIGN_IDENTITY_ENV), "{err}");
     }
 
-    /// Ambiguity must never be resolved by guessing — it lists every candidate instead.
+    /// A Background agent throttles whisper 2.4× and launchd's policy cannot be lifted from inside.
     #[test]
     fn the_agent_runs_at_standard_priority_so_transcription_is_not_throttled() {
         let p = plist_contents(
@@ -546,6 +546,7 @@ mod tests {
         assert!(!p.contains("<string>Background</string>"));
     }
 
+    /// Ambiguity must never be resolved by guessing — it lists every candidate instead.
     #[test]
     fn errors_and_lists_candidates_when_ambiguous() {
         let found = parse_identities(TWO);

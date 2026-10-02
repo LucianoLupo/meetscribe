@@ -133,7 +133,9 @@ pub(crate) fn run_daemon(argv: &[String]) -> Result<()> {
             }
             "--model" | "-m" => {
                 if let Some(v) = it.next() {
-                    model_override = Some(PathBuf::from(v));
+                    // Absolute now: the transcription child runs in the session dir, so a relative
+                    // path would resolve somewhere else than the startup check saw.
+                    model_override = Some(std::path::absolute(v).unwrap_or_else(|_| PathBuf::from(v)));
                 }
             }
             "--once" => once = true,
@@ -517,8 +519,8 @@ enum Marker {
 }
 
 /// What happens to a session's `pending` marker after its transcription child ends. Success clears
-/// it. A child that ended while the daemon was shutting down was (or may have been) stopped by us,
-/// so the marker stays and the next start retries. Any other failure clears it — the WAVs stay and
+/// it. A child that failed while the daemon was shutting down was most likely stopped by the same
+/// signal (Ctrl-C reaches the whole foreground group), so the marker stays and the next start retries. Any other failure clears it — the WAVs stay and
 /// `meetscribe transcribe <dir>` re-runs it by hand — so a session that always crashes whisper
 /// cannot retry on every start.
 fn marker_after(outcome: ChildOutcome, shutting_down: bool) -> Marker {
@@ -601,10 +603,11 @@ fn run_transcribe_job(job: &TranscribeJob, exe: &Path, base: &Path) {
     }
 }
 
-/// Run `cmd` to completion. On shutdown, send the child SIGTERM rather than wait out a long
-/// transcription (the marker keeps the session for the next start). The child stays in the
-/// daemon's process group, so if the daemon itself is killed, launchd takes the child down too
-/// instead of leaving an orphan that could store a meeting the next start transcribes again.
+/// Run `cmd` to completion. A shutdown does not interrupt it: killing the child could land after
+/// its DB insert, and the kept marker would then store the meeting twice. Instead the job finishes
+/// (as the in-process worker did) unless launchd's stop timeout SIGKILLs the job's whole process
+/// group — the child stays in the daemon's group for exactly that, so no orphan can store a meeting
+/// whose marker survived.
 fn run_child(mut cmd: std::process::Command) -> ChildOutcome {
     use std::os::unix::process::ExitStatusExt;
     let mut child = match cmd.spawn() {
@@ -614,7 +617,6 @@ fn run_child(mut cmd: std::process::Command) -> ChildOutcome {
             return ChildOutcome::Failed;
         }
     };
-    let mut terminated = false;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -631,11 +633,6 @@ fn run_child(mut cmd: std::process::Command) -> ChildOutcome {
                 let _ = child.wait();
                 return ChildOutcome::Failed;
             }
-        }
-        if !terminated && SHUTDOWN.load(Ordering::SeqCst) {
-            // SAFETY: signalling our own, not yet reaped, child.
-            unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
-            terminated = true;
         }
         std::thread::sleep(Duration::from_millis(250));
     }
