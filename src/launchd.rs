@@ -9,6 +9,7 @@
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 /// FROZEN, permanently. The bundle-id binds the TCC grant (microphone + system audio) and
 /// is also the launchd label, the plist filename, and the `codesign --identifier`.
@@ -25,6 +26,16 @@ pub(crate) const LABEL: &str = "com.lucianolupo.meetscribe";
 const SIGN_IDENTITY_ENV: &str = "MEETSCRIBE_SIGN_IDENTITY";
 /// True if THIS binary was compiled with the coreml feature — refused for the unattended daemon.
 const BUILT_WITH_COREML: bool = cfg!(feature = "coreml");
+
+/// System tools by ABSOLUTE path. A bare name resolves through `PATH`, where user-writable dirs
+/// (`/opt/homebrew/bin`) precede `/usr/bin`, so any process running as the user could shadow
+/// them and fake a successful sign or load.
+pub(crate) const LAUNCHCTL: &str = "/bin/launchctl";
+const CODESIGN: &str = "/usr/bin/codesign";
+const SECURITY: &str = "/usr/bin/security";
+
+/// `Umask` for the agent: 0o077, so the daemon's files and launchd's log files are owner-only.
+const AGENT_UMASK: u32 = 0o077;
 
 fn uid() -> u32 {
     // SAFETY: getuid is always safe.
@@ -91,7 +102,7 @@ fn resolve_identity(flag: Option<&str>, env: Option<&str>, found: &[String]) -> 
 
 /// Ask the keychain for the available codesigning identities.
 fn find_identities() -> Result<Vec<String>> {
-    let out = Command::new("security")
+    let out = Command::new(SECURITY)
         .args(["find-identity", "-v", "-p", "codesigning"])
         .output()
         .context(
@@ -101,7 +112,15 @@ fn find_identities() -> Result<Vec<String>> {
     Ok(parse_identities(&String::from_utf8_lossy(&out.stdout)))
 }
 
-/// Remove-then-sign at `bin` with the resolved identity + the frozen identifier.
+/// The `Identifier=` value from `codesign -d --verbose=2` output (which codesign prints on
+/// stderr), or `None` for an unsigned binary.
+#[must_use]
+fn signed_identifier(display: &str) -> Option<&str> {
+    display.lines().find_map(|line| line.strip_prefix("Identifier="))
+}
+
+/// Remove-then-sign at `bin` with the resolved identity + the frozen identifier, then VERIFY
+/// the result: a strict signature check plus the identifier the TCC grant is keyed to.
 ///
 /// The explicit `--identifier` is mandatory: rustc's default id embeds a per-build hash, so
 /// omitting it changes the signed identifier on every rebuild and breaks TCC persistence.
@@ -109,10 +128,10 @@ fn find_identities() -> Result<Vec<String>> {
 fn codesign(bin: &Path, identity: &str) -> Result<()> {
     let path = bin.to_str().context("binary path not UTF-8")?;
     // `--remove-signature` may fail on an unsigned file — ignore its status.
-    let _ = Command::new("codesign")
+    let _ = Command::new(CODESIGN)
         .args(["--remove-signature", path])
         .status();
-    let signed = Command::new("codesign")
+    let signed = Command::new(CODESIGN)
         .args([
             "--sign",
             identity,
@@ -129,7 +148,86 @@ fn codesign(bin: &Path, identity: &str) -> Result<()> {
             bin.display()
         );
     }
+    let verified = Command::new(CODESIGN)
+        .args(["--verify", "--strict", path])
+        .status()
+        .context("run codesign --verify")?;
+    anyhow::ensure!(verified.success(), "codesign --verify --strict failed for {}", bin.display());
+    let display = Command::new(CODESIGN)
+        .args(["-d", "--verbose=2", path])
+        .output()
+        .context("run codesign -d")?;
+    let display = String::from_utf8_lossy(&display.stderr);
+    let id = signed_identifier(&display);
+    anyhow::ensure!(
+        id == Some(LABEL),
+        "signed identifier is {id:?}, expected {LABEL} — the TCC grant would not carry over"
+    );
     Ok(())
+}
+
+/// Poll `done` every `interval` until it returns true or `timeout` passes. Returns whether it
+/// became true.
+#[must_use]
+fn wait_until(mut done: impl FnMut() -> bool, timeout: Duration, interval: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if done() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(interval);
+    }
+}
+
+/// True once launchd no longer knows the agent. `bootout` returns before a cleanly shutting-down
+/// daemon has exited, and a `bootstrap` issued meanwhile fails ("Bootstrap failed: 5").
+#[must_use]
+fn agent_unloaded() -> bool {
+    Command::new(LAUNCHCTL)
+        .args(["print", &format!("gui/{}/{LABEL}", uid())])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| !s.success())
+}
+
+/// XML-escape a value interpolated into the plist, so any path yields a well-formed plist.
+#[must_use]
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Write `contents` to `path` atomically: a synced sibling temp file, then `rename` over the
+/// target, so an interrupted install or a power loss never leaves a truncated plist behind.
+fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    let name = path.file_name().context("atomic write target has no file name")?;
+    let tmp = path.with_file_name(format!(".{}.tmp", name.to_string_lossy()));
+    let written = std::fs::File::create(&tmp)
+        .and_then(|mut f| f.write_all(contents.as_bytes()).and_then(|()| f.sync_all()))
+        .with_context(|| format!("write {}", tmp.display()))
+        .and_then(|()| {
+            std::fs::rename(&tmp, path)
+                .with_context(|| format!("rename {} → {}", tmp.display(), path.display()))
+        });
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 /// `ProcessType` is `Standard`, not `Background`: launchd spawns a Background job with a policy the
@@ -158,6 +256,8 @@ fn plist_contents(dest_bin: &Path, home: &Path, out_log: &Path, err_log: &Path) 
     </dict>
     <key>ProcessType</key>
     <string>Standard</string>
+    <key>Umask</key>
+    <integer>{umask}</integer>
     <key>EnvironmentVariables</key>
     <dict>
         <key>HOME</key>
@@ -171,10 +271,11 @@ fn plist_contents(dest_bin: &Path, home: &Path, out_log: &Path, err_log: &Path) 
 </plist>
 "#,
         LABEL = LABEL,
-        bin = dest_bin.display(),
-        home = home.display(),
-        out = out_log.display(),
-        err = err_log.display(),
+        umask = AGENT_UMASK,
+        bin = xml_escape(&dest_bin.display().to_string()),
+        home = xml_escape(&home.display().to_string()),
+        out = xml_escape(&out_log.display().to_string()),
+        err = xml_escape(&err_log.display().to_string()),
     )
 }
 
@@ -313,9 +414,9 @@ pub(crate) fn run_install(argv: &[String]) -> Result<()> {
         std::fs::create_dir_all(d).with_context(|| format!("create {}", d.display()))?;
     }
 
-    // 0. Resolve the signing identity BEFORE anything destructive. Step 1 stops the running
-    //    daemon and step 2 overwrites its binary, so failing here — rather than at the sign —
-    //    leaves a working install untouched.
+    // 0. Resolve the signing identity BEFORE anything else, so an identity problem fails fast
+    //    with a copy-pasteable fix. (Step 1 signs a staged copy, so even a failed sign there
+    //    leaves the working install untouched.)
     let env_identity = std::env::var(SIGN_IDENTITY_ENV).ok();
     let identity = resolve_identity(
         identity.as_deref(),
@@ -324,17 +425,58 @@ pub(crate) fn run_install(argv: &[String]) -> Result<()> {
     )?;
     log::info!("signing identity: {identity}");
 
-    // 1. Idempotent: stop any running instance so the copy below never leaves it on a stale inode.
-    let _ = Command::new("launchctl")
+    // 1. Copy THIS binary (the one being run) to a temp file beside the stable path, sign and
+    //    VERIFY it there. A failed sign leaves the working install (binary + running agent)
+    //    untouched.
+    let src = std::env::current_exe().context("resolve current exe")?;
+    let staged = dest_bin.with_file_name(".meetscribe.new");
+    std::fs::copy(&src, &staged)
+        .with_context(|| format!("copy {} → {}", src.display(), staged.display()))?;
+    if let Err(e) = codesign(&staged, &identity) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(e);
+    }
+
+    // 1b. Logs are owner-only: the dir, and any log files launchd created before `Umask` was
+    //     set. Done before the bootout so a failure here also leaves the agent running.
+    use std::os::unix::fs::PermissionsExt;
+    let restrict = |path: &Path, mode: u32| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .with_context(|| format!("chmod {mode:o} {}", path.display()))
+    };
+    let owner_only = restrict(&logs_dir, 0o700).and_then(|()| {
+        [&out_log, &err_log]
+            .into_iter()
+            .filter(|log| log.exists())
+            .try_for_each(|log| restrict(log, 0o600))
+    });
+    if let Err(e) = owner_only {
+        let _ = std::fs::remove_file(&staged);
+        return Err(e);
+    }
+
+    // 2. Only now stop any running instance, then swap the verified binary in atomically
+    //    (`rename` within one directory keeps the signature and never exposes a partial file).
+    let _ = Command::new(LAUNCHCTL)
         .args(["bootout", &format!("gui/{}/{LABEL}", uid())])
         .status();
-
-    // 2. Copy THIS binary (the one being run) to the stable path, then re-sign there.
-    let src = std::env::current_exe().context("resolve current exe")?;
-    std::fs::copy(&src, &dest_bin)
-        .with_context(|| format!("copy {} → {}", src.display(), dest_bin.display()))?;
-    codesign(&dest_bin, &identity)?;
-    log::info!("installed binary → {} (re-signed)", dest_bin.display());
+    // `bootout` is asynchronous: wait for the old daemon to finish its clean shutdown, or the
+    // bootstrap in step 5 races it and fails.
+    if !wait_until(agent_unloaded, Duration::from_secs(30), Duration::from_millis(250)) {
+        log::warn!("{LABEL} still loaded 30s after bootout — continuing; step 5 retries the load");
+    }
+    if let Err(e) = std::fs::rename(&staged, &dest_bin) {
+        let _ = std::fs::remove_file(&staged);
+        bail!(
+            "move {} → {} failed ({e}). The agent was stopped; the previous binary is unchanged — \
+             restart it with: launchctl bootstrap gui/{} {}",
+            staged.display(),
+            dest_bin.display(),
+            uid(),
+            plist_path(&home).display()
+        );
+    }
+    log::info!("installed binary → {} (re-signed + verified)", dest_bin.display());
 
     // 3. Provision the model at the daemon's absolute path.
     match std::fs::canonicalize(&model_src) {
@@ -370,15 +512,25 @@ pub(crate) fn run_install(argv: &[String]) -> Result<()> {
     let pp = plist_path(&home);
     std::fs::create_dir_all(pp.parent().expect("plist has parent"))
         .with_context(|| format!("create {}", pp.parent().unwrap().display()))?;
-    std::fs::write(&pp, plist).with_context(|| format!("write {}", pp.display()))?;
+    write_atomic(&pp, &plist)?;
     log::info!("wrote LaunchAgent → {}", pp.display());
 
     // 5. Load it (RunAtLoad starts the daemon now + at every login).
     let pp_str = pp.to_str().context("plist path not UTF-8")?;
-    let status = Command::new("launchctl")
-        .args(["bootstrap", &format!("gui/{}", uid()), pp_str])
-        .status()
-        .context("run launchctl bootstrap")?;
+    let bootstrap = || {
+        Command::new(LAUNCHCTL)
+            .args(["bootstrap", &format!("gui/{}", uid()), pp_str])
+            .status()
+            .context("run launchctl bootstrap")
+    };
+    let mut status = bootstrap()?;
+    if !status.success() {
+        // One retry: a slow shutdown can still be releasing the label.
+        log::warn!("launchctl bootstrap failed (status {:?}) — retrying once in 2s", status.code());
+        std::thread::sleep(Duration::from_secs(2));
+        let _ = wait_until(agent_unloaded, Duration::from_secs(10), Duration::from_millis(250));
+        status = bootstrap()?;
+    }
     if !status.success() {
         bail!(
             "launchctl bootstrap failed (status {:?}). The plist is written at {} — you can load it \
@@ -405,7 +557,7 @@ pub(crate) fn run_uninstall(argv: &[String]) -> Result<()> {
     }
     let home = crate::home_dir().context("uninstall: cannot resolve $HOME")?;
     let pp = plist_path(&home);
-    let _ = Command::new("launchctl")
+    let _ = Command::new(LAUNCHCTL)
         .args(["bootout", &format!("gui/{}/{LABEL}", uid())])
         .status();
     if pp.exists() {
@@ -544,6 +696,129 @@ mod tests {
         );
         assert!(p.contains("<key>ProcessType</key>\n    <string>Standard</string>"), "{p}");
         assert!(!p.contains("<string>Background</string>"));
+    }
+
+    /// A legitimate home path containing `&` (e.g. "Tom & Jerry") must still yield a plist that
+    /// macOS accepts — every interpolated path is XML-escaped. Checked with the system `plutil`.
+    #[test]
+    fn plist_stays_valid_xml_when_paths_contain_special_characters() {
+        let home = Path::new("/Users/Tom & Jerry <dev>");
+        let p = plist_contents(
+            &home.join(".meetscribe/bin/meetscribe"),
+            home,
+            &home.join(".meetscribe/logs/meetscribe.out.log"),
+            &home.join(".meetscribe/logs/meetscribe.err.log"),
+        );
+        let file = std::env::temp_dir().join(format!("meetscribe-plist-test-{}.plist", std::process::id()));
+        std::fs::write(&file, &p).expect("temp dir is writable");
+        let lint = Command::new("/usr/bin/plutil").arg("-lint").arg(&file).output().expect("plutil exists on macOS");
+        let _ = std::fs::remove_file(&file);
+        assert!(
+            lint.status.success(),
+            "implementation bug: plist is not valid XML: {}\n{p}",
+            String::from_utf8_lossy(&lint.stdout)
+        );
+        assert!(p.contains("/Users/Tom &amp; Jerry &lt;dev&gt;"), "{p}");
+    }
+
+    /// System tools are invoked by absolute path: a bare name resolves through `PATH`, where a
+    /// user-writable dir (e.g. `/opt/homebrew/bin`) precedes `/usr/bin`. Scans the call sites
+    /// themselves, so reverting any one of them back to a bare name fails this test.
+    #[test]
+    fn system_tools_are_invoked_by_absolute_path() {
+        for tool in [LAUNCHCTL, CODESIGN, SECURITY] {
+            assert!(Path::new(tool).is_absolute(), "implementation bug: {tool} is not absolute");
+            assert!(Path::new(tool).exists(), "{tool} missing on this macOS");
+        }
+        let sources = [
+            ("launchd.rs", include_str!("launchd.rs")),
+            ("tray.rs", include_str!("tray.rs")),
+            ("speakers.rs", include_str!("speakers.rs")),
+        ];
+        for (file, src) in sources {
+            for tool in ["launchctl", "codesign", "security", "afplay", "open"] {
+                let bare = format!("Command::new(\"{tool}\")");
+                assert!(!src.contains(&bare), "implementation bug: {file} runs `{tool}` through PATH");
+            }
+        }
+    }
+
+    /// Verbatim stderr shape of `codesign -d --verbose=2 <bin>`.
+    const DISPLAY: &str = "Executable=/Users/someone/.meetscribe/bin/meetscribe\n\
+        Identifier=com.lucianolupo.meetscribe\nFormat=Mach-O thin (arm64)\n\
+        CodeDirectory v=20400 size=66878 flags=0x0(none) hashes=2084+2 location=embedded\n";
+
+    #[test]
+    fn reads_the_signed_identifier() {
+        assert_eq!(signed_identifier(DISPLAY), Some("com.lucianolupo.meetscribe"));
+        assert_eq!(signed_identifier("code object is not signed at all\n"), None);
+    }
+
+    /// Real keychain + real codesign, on a temp copy of this test binary: sign, strict-verify,
+    /// identifier check. Never touches launchd or ~/.meetscribe. Needs a codesigning identity, so
+    /// it is opt-in: `cargo test --bin meetscribe -- --ignored signs_and_verifies`.
+    #[test]
+    #[ignore = "needs a real codesigning identity in the keychain"]
+    fn signs_and_verifies_a_staged_copy_with_the_real_identity() {
+        let identity = resolve_identity(None, None, &find_identities().expect("security runs"))
+            .expect("exactly one codesigning identity");
+        let staged = std::env::temp_dir().join(format!("meetscribe-sign-test-{}", std::process::id()));
+        std::fs::copy(std::env::current_exe().expect("test exe"), &staged).expect("copy test exe");
+        let result = codesign(&staged, &identity);
+        let _ = std::fs::remove_file(&staged);
+        result.expect("sign + verify + identifier check all pass");
+    }
+
+    /// `wait_until` returns as soon as the condition holds, and gives up after the timeout.
+    #[test]
+    fn wait_until_polls_until_done_or_timeout() {
+        let mut calls = 0;
+        let became = wait_until(
+            || {
+                calls += 1;
+                calls >= 3
+            },
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+        );
+        assert!(became, "condition met on the 3rd poll");
+        assert_eq!(calls, 3, "stops polling once done");
+
+        let start = Instant::now();
+        assert!(!wait_until(|| false, Duration::from_millis(30), Duration::from_millis(5)));
+        assert!(start.elapsed() >= Duration::from_millis(30), "waited the full timeout");
+        assert!(start.elapsed() < Duration::from_secs(2), "did not hang past the timeout");
+    }
+
+    /// Files the daemon (and launchd, for the log paths) creates are owner-only.
+    #[test]
+    fn the_agent_creates_files_owner_only() {
+        let p = plist_contents(
+            Path::new("/Users/someone/.meetscribe/bin/meetscribe"),
+            Path::new("/Users/someone"),
+            Path::new("/Users/someone/.meetscribe/logs/meetscribe.out.log"),
+            Path::new("/Users/someone/.meetscribe/logs/meetscribe.err.log"),
+        );
+        assert!(p.contains("<key>Umask</key>\n    <integer>63</integer>"), "{p}");
+    }
+
+    /// The plist is replaced by rename, not rewritten in place: the target gets a NEW inode (a
+    /// plain `fs::write` would keep the old one), has the new contents, and no temp file remains.
+    #[test]
+    fn write_atomic_swaps_in_a_new_file_and_leaves_no_temp() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("meetscribe-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir is writable");
+        let file = dir.join("agent.plist");
+        std::fs::write(&file, "old").expect("seed file");
+        let before = std::fs::metadata(&file).expect("seeded").ino();
+        write_atomic(&file, "new").expect("atomic write succeeds");
+        assert_ne!(std::fs::metadata(&file).expect("exists").ino(), before, "rewritten in place, not swapped");
+        assert_eq!(std::fs::read_to_string(&file).expect("file exists"), "new");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir).expect("dir readable").collect();
+        assert_eq!(leftovers.len(), 1, "temp file left behind: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Ambiguity must never be resolved by guessing — it lists every candidate instead.

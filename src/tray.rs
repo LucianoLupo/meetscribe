@@ -302,7 +302,7 @@ mod imp {
     }
 
     fn open_path(path: &Path) {
-        if let Err(e) = Command::new("open").arg(path).status() {
+        if let Err(e) = Command::new("/usr/bin/open").arg(path).status() {
             log::warn!("tray: `open {}` failed: {e}", path.display());
         }
     }
@@ -312,7 +312,7 @@ mod imp {
     fn stop_daemon(pid: Option<u32>) {
         let uid = unsafe { libc::getuid() };
         let target = format!("gui/{uid}/{}", crate::launchd::LABEL);
-        let _ = Command::new("launchctl").args(["bootout", &target]).status();
+        let _ = Command::new(crate::launchd::LAUNCHCTL).args(["bootout", &target]).status();
         if let Some(pid) = pid
             && pid_alive(pid)
         {
