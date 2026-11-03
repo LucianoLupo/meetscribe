@@ -311,7 +311,7 @@ fn play(rt: &tokio::runtime::Runtime, db_path: &Path, mid: i64, label: &str, cli
     );
     for (path, t) in &files {
         println!("  ▶ {}  ({})", export::fmt_timestamp(*t), path.display());
-        let status = Command::new("afplay").arg(path).status();
+        let status = Command::new("/usr/bin/afplay").arg(path).status();
         match status {
             Ok(s) if s.success() => {}
             Ok(s) => log::warn!("afplay exited with {s} for {}", path.display()),
