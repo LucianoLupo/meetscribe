@@ -9,6 +9,7 @@
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 /// FROZEN, permanently. The bundle-id binds the TCC grant (microphone + system audio) and
 /// is also the launchd label, the plist filename, and the `codesign --identifier`.
@@ -163,6 +164,34 @@ fn codesign(bin: &Path, identity: &str) -> Result<()> {
         "signed identifier is {id:?}, expected {LABEL} — the TCC grant would not carry over"
     );
     Ok(())
+}
+
+/// Poll `done` every `interval` until it returns true or `timeout` passes. Returns whether it
+/// became true.
+#[must_use]
+fn wait_until(mut done: impl FnMut() -> bool, timeout: Duration, interval: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if done() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(interval);
+    }
+}
+
+/// True once launchd no longer knows the agent. `bootout` returns before a cleanly shutting-down
+/// daemon has exited, and a `bootstrap` issued meanwhile fails ("Bootstrap failed: 5").
+#[must_use]
+fn agent_unloaded() -> bool {
+    Command::new(LAUNCHCTL)
+        .args(["print", &format!("gui/{}/{LABEL}", uid())])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| !s.success())
 }
 
 /// XML-escape a value interpolated into the plist, so any path yields a well-formed plist.
@@ -431,6 +460,11 @@ pub(crate) fn run_install(argv: &[String]) -> Result<()> {
     let _ = Command::new(LAUNCHCTL)
         .args(["bootout", &format!("gui/{}/{LABEL}", uid())])
         .status();
+    // `bootout` is asynchronous: wait for the old daemon to finish its clean shutdown, or the
+    // bootstrap in step 5 races it and fails.
+    if !wait_until(agent_unloaded, Duration::from_secs(30), Duration::from_millis(250)) {
+        log::warn!("{LABEL} still loaded 30s after bootout — continuing; step 5 retries the load");
+    }
     if let Err(e) = std::fs::rename(&staged, &dest_bin) {
         let _ = std::fs::remove_file(&staged);
         bail!(
@@ -483,10 +517,20 @@ pub(crate) fn run_install(argv: &[String]) -> Result<()> {
 
     // 5. Load it (RunAtLoad starts the daemon now + at every login).
     let pp_str = pp.to_str().context("plist path not UTF-8")?;
-    let status = Command::new(LAUNCHCTL)
-        .args(["bootstrap", &format!("gui/{}", uid()), pp_str])
-        .status()
-        .context("run launchctl bootstrap")?;
+    let bootstrap = || {
+        Command::new(LAUNCHCTL)
+            .args(["bootstrap", &format!("gui/{}", uid()), pp_str])
+            .status()
+            .context("run launchctl bootstrap")
+    };
+    let mut status = bootstrap()?;
+    if !status.success() {
+        // One retry: a slow shutdown can still be releasing the label.
+        log::warn!("launchctl bootstrap failed (status {:?}) — retrying once in 2s", status.code());
+        std::thread::sleep(Duration::from_secs(2));
+        let _ = wait_until(agent_unloaded, Duration::from_secs(10), Duration::from_millis(250));
+        status = bootstrap()?;
+    }
     if !status.success() {
         bail!(
             "launchctl bootstrap failed (status {:?}). The plist is written at {} — you can load it \
@@ -723,6 +767,27 @@ mod tests {
         let result = codesign(&staged, &identity);
         let _ = std::fs::remove_file(&staged);
         result.expect("sign + verify + identifier check all pass");
+    }
+
+    /// `wait_until` returns as soon as the condition holds, and gives up after the timeout.
+    #[test]
+    fn wait_until_polls_until_done_or_timeout() {
+        let mut calls = 0;
+        let became = wait_until(
+            || {
+                calls += 1;
+                calls >= 3
+            },
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+        );
+        assert!(became, "condition met on the 3rd poll");
+        assert_eq!(calls, 3, "stops polling once done");
+
+        let start = Instant::now();
+        assert!(!wait_until(|| false, Duration::from_millis(30), Duration::from_millis(5)));
+        assert!(start.elapsed() >= Duration::from_millis(30), "waited the full timeout");
+        assert!(start.elapsed() < Duration::from_secs(2), "did not hang past the timeout");
     }
 
     /// Files the daemon (and launchd, for the log paths) creates are owner-only.
