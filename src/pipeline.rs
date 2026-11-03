@@ -17,6 +17,7 @@ use crate::{asr, db, diar, export, render, resample, split, spk, transcript, vad
 /// Inputs for one transcribe+store+export run. Designed against BOTH callers (CLI + daemon):
 /// the daemon supplies an ABSOLUTE `model` path (under launchd `cwd=/`, a repo-relative path
 /// resolves to `/models/...`); the CLI supplies its repo-relative default (run from the repo).
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PipelineOpts {
     /// ggml model path. MUST be absolute for the daemon; repo-relative is fine for CLI-from-repo.
     pub model: PathBuf,

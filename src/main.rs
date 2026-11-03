@@ -83,9 +83,57 @@ fn parse_args() -> Args {
     }
 }
 
+/// Parsed `meetscribe transcribe` arguments. The daemon builds the same argv for its transcription
+/// child (`daemon::child_args`), so this parser is the one contract both sides share.
+#[derive(Debug, PartialEq)]
+pub(crate) struct TranscribeArgs {
+    pub dir: PathBuf,
+    pub opts: pipeline::PipelineOpts,
+    /// `--yield-to-calls <base>`: drop to background priority whenever `<base>/status.json` says a
+    /// call is being recorded, and run at normal priority otherwise. Set by the daemon only.
+    pub yield_to_calls: Option<PathBuf>,
+}
+
 /// `meetscribe transcribe <dir> [...]` — thin CLI wrapper over `pipeline::transcribe_and_store`:
 /// parse args, run the pipeline (which stores AND exports), then print the transcript + RTF.
 fn run_transcribe(argv: &[String]) -> Result<()> {
+    let Some(TranscribeArgs { dir, opts, yield_to_calls }) = parse_transcribe_args(argv)? else {
+        return Ok(()); // --help
+    };
+    if let Some(base) = yield_to_calls {
+        status::spawn_call_yield(base);
+    }
+    let out = pipeline::transcribe_and_store(&dir, &opts)?;
+
+    println!("\n===== TRANSCRIPT ({}) =====", dir.display());
+    for s in &out.segments {
+        println!(
+            "[{:7.2}-{:7.2}] {:<7} {}",
+            s.t_start,
+            s.t_end,
+            s.display_label(),
+            s.text
+        );
+    }
+    println!(
+        "\nsegments: {} | meeting: {:.1}s | wall: {:.1}s | RTF: {:.3}x (both channels through whisper)",
+        out.segments.len(),
+        out.meeting_secs,
+        out.wall_secs,
+        out.rtf
+    );
+    if let Some(id) = out.stored_id {
+        println!("stored meeting id {id}");
+    }
+    println!("wrote {}", out.md_path.display());
+    println!("wrote {}", out.json_path.display());
+    Ok(())
+}
+
+/// Parse `meetscribe transcribe` arguments; `Ok(None)` after printing `--help`. Unknown flags are
+/// ignored, so a caller that forgets one silently gets the default — the daemon builds its argv
+/// with `daemon::child_args`, and a round-trip test pins the two together.
+pub(crate) fn parse_transcribe_args(argv: &[String]) -> Result<Option<TranscribeArgs>> {
     let mut dir: Option<PathBuf> = None;
     let mut model = String::from("models/ggml-large-v3.bin");
     let mut speaker_model = PathBuf::from(SPEAKER_MODEL_REL);
@@ -98,6 +146,7 @@ fn run_transcribe(argv: &[String]) -> Result<()> {
     let mut db_path: Option<PathBuf> = None;
     let mut export_dir: Option<PathBuf> = None;
     let mut no_store = false;
+    let mut yield_to_calls: Option<PathBuf> = None;
     let mut it = argv.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -148,6 +197,11 @@ fn run_transcribe(argv: &[String]) -> Result<()> {
                 }
             }
             "--no-store" => no_store = true,
+            "--yield-to-calls" => {
+                if let Some(v) = it.next() {
+                    yield_to_calls = Some(PathBuf::from(v));
+                }
+            }
             "-h" | "--help" => {
                 eprintln!(
                     "usage: meetscribe transcribe <dir> [--title <t>] [--model <ggml.bin>] \
@@ -156,7 +210,7 @@ fn run_transcribe(argv: &[String]) -> Result<()> {
                      --no-split  do not cut far-end chunks at voice changes (the pre-split pipeline)\n\
                      --diarizer-rttm <file>  evaluation: replay these diarizer turns (single-roll session)"
                 );
-                return Ok(());
+                return Ok(None);
             }
             s if !s.starts_with('-') && dir.is_none() => dir = Some(PathBuf::from(s)),
             _ => {}
@@ -176,28 +230,7 @@ fn run_transcribe(argv: &[String]) -> Result<()> {
         diarizer_model,
         diarizer_rttm,
     };
-    let out = pipeline::transcribe_and_store(&dir, &opts)?;
-
-    println!("\n===== TRANSCRIPT ({}) =====", dir.display());
-    for s in &out.segments {
-        println!(
-            "[{:7.2}-{:7.2}] {:<7} {}",
-            s.t_start,
-            s.t_end,
-            s.display_label(),
-            s.text
-        );
-    }
-    println!(
-        "\nsegments: {} | meeting: {:.1}s | wall: {:.1}s | RTF: {:.3}x (both channels through whisper)",
-        out.segments.len(),
-        out.meeting_secs,
-        out.wall_secs,
-        out.rtf
-    );
-    println!("wrote {}", out.md_path.display());
-    println!("wrote {}", out.json_path.display());
-    Ok(())
+    Ok(Some(TranscribeArgs { dir, opts, yield_to_calls }))
 }
 
 /// `~/.meetscribe` — the app's data/config directory (`None` if `$HOME` is unset). The single
