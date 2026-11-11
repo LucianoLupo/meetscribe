@@ -112,8 +112,19 @@ pub(crate) fn transcribe_with_clock(dir: &Path, opts: &PipelineOpts, now: impl F
         Some(Session::open(dir)?.context("session is busy; no attempt was charged")?)
     } else { None };
     if !keyed {
-        if let Some(session) = session.as_mut() { session.protect_outputs()?; }
-        return transcribe_core(dir, dir, opts, session.as_mut());
+        // An explicit manual destination may be a different managed session. Acquire both
+        // nonblocking locks before protecting or changing either session; aliases reuse ours.
+        let same_destination = session.as_ref().is_some_and(|session|
+            crate::recovery::absolute(&opts.export_dir).is_ok_and(|destination| destination == session.dir));
+        let mut destination = if !same_destination && std::fs::symlink_metadata(opts.export_dir.join(STATE_FILE)).is_ok() {
+            Some(Session::open(&opts.export_dir)?.context("manual export destination session is busy")?)
+        } else { None };
+        if let Some(destination) = destination.as_mut() { destination.protect_outputs()?; }
+        let inputs = if let Some(session) = session.as_mut() {
+            session.protect_outputs()?;
+            session.inputs()? // Manual mode changes ingest semantics, not which managed audio is trusted.
+        } else { dir.to_path_buf() };
+        return transcribe_core(dir, &inputs, opts, session.as_mut());
     }
     let managed = session.as_mut().context("--resume requires managed session metadata; legacy work needs verified adoption")?;
     if let Some(key) = &opts.session_key { anyhow::ensure!(key == &managed.state.key, "session key does not match metadata"); }
@@ -143,6 +154,7 @@ pub(crate) fn transcribe_with_clock(dir: &Path, opts: &PipelineOpts, now: impl F
     let result = result.and_then(|output| {
         managed.state.duration_seconds = output.meeting_secs;
         managed.complete(output.md_path.parent().context("publication has no directory")?)?;
+        #[cfg(test)] cutpoint("session_complete");
         Ok(output)
     });
     if let Err(error) = result {
@@ -190,7 +202,7 @@ fn transcribe_core(dir: &Path, audio_dir: &Path, opts: &PipelineOpts, mut manage
             .to_string()
     });
 
-    let inputs = |channel: &str| match managed.as_ref().filter(|_| opts.session_key.is_some()) {
+    let inputs = |channel: &str| match managed.as_ref() {
         Some(session) => session.state.rolls.iter()
             .map(|roll| audio_dir.join(crate::recovery::roll_name(channel, roll.index))).collect(),
         None => discover_channel(audio_dir, channel),
@@ -217,11 +229,11 @@ fn transcribe_core(dir: &Path, audio_dir: &Path, opts: &PipelineOpts, mut manage
     let (mut rolls_split, mut rolls_far, mut fallbacks) = (0usize, 0usize, Vec::<String>::new());
     let mut engine = load_engine(model_str, opts)?;
     let split_on = diarizer.is_some();
-    // Inter-segment gaps the capture layer recorded on rate-roll boundaries (empty for the common
-    // single-segment case). Both channels share the same manifest.
-    let gaps = if opts.session_key.is_some() {
-        managed.as_ref().context("keyed inference has no session")?.state.rolls.iter()
-            .map(|roll| (roll.index, roll.gap_seconds)).collect()
+    // Managed metadata is authoritative for manual runs too: new captures need no legacy manifest.
+    anyhow::ensure!(opts.session_key.is_none() || managed.is_some(), "keyed inference has no session");
+    let offsets = managed.as_ref().map(|session| session.state.roll_offsets());
+    let gaps = if let Some(session) = managed.as_ref() {
+        session.state.rolls.iter().map(|roll| (roll.index, roll.gap_seconds)).collect()
     } else { read_segment_gaps(audio_dir)? };
 
     let t0 = Instant::now();
@@ -242,7 +254,9 @@ fn transcribe_core(dir: &Path, audio_dir: &Path, opts: &PipelineOpts, mut manage
         // recorded inter-segment gap before each rolled segment (segments.txt).
         let mut offset = 0.0f64;
         for (i, path) in files.iter().enumerate() {
-            if i >= 1 {
+            if let Some(start) = offsets.as_ref().and_then(|offsets| offsets.get(i)) {
+                offset = *start;
+            } else if i >= 1 {
                 offset += gaps.get(&(i as u32)).copied().unwrap_or(0.0);
             }
             let (samples, rate) = read_wav_any_rate(path)?;

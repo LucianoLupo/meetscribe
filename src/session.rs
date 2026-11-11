@@ -225,6 +225,7 @@ pub(crate) fn run_capture(
                                 sys_path.display(),
                                 out.gap_frames,
                             ),
+                            managed.is_some(),
                         );
                     } else {
                         // Rate held → the same files continue. A rate-held rebuild can still have
@@ -407,10 +408,11 @@ fn segment_path(dir: &Path, base: &str, segment: u32) -> PathBuf {
     }
 }
 
-/// Append one line to the session's segment manifest, recording each rebuild-induced segment
-/// boundary + the gap between segments. Best-effort (a manifest write failure must not abort
-/// capture).
-fn append_manifest(dir: &Path, line: &str) {
+/// Unmanaged recordings retain their legacy manifest. Managed captures already persist roll
+/// boundaries under their stable lock; never create or rewrite a redundant manifest for them.
+/// Best-effort for unmanaged capture (a manifest write failure must not abort capture).
+fn append_manifest(dir: &Path, line: &str, managed: bool) {
+    if managed { return; }
     let path = dir.join("segments.txt");
     match OpenOptions::new().create(true).append(true).open(&path) {
         Ok(mut f) => {
@@ -438,6 +440,123 @@ fn report(label: &str, path: &Path, n: usize, rms: f32, peak: f32, rate: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_rate_rolls_are_prunable_without_deleting_legacy_manifests() {
+        use crate::{db, recovery};
+        for _ in 0..5 {
+            for (short, existing) in [(false, false), (true, false), (false, true), (true, true)] {
+                let root = std::env::temp_dir().join(format!("meetscribe-rolled-{}", recovery::new_identity()));
+                let dir = root.join("sessions/recording");
+                let mut owner = recovery::Session::begin(&dir, &root.join("archive.db"), &dir,
+                    "org.example.synthetic-call", "Synthetic route-change review", 1_762_880_000).unwrap();
+                for (index, rate, gap) in [(0, 16_000, 0.0), (1, 24_000, 0.1)] {
+                    owner.start_roll(index, rate, gap).unwrap();
+                    let mut mic = WavStream::create(&segment_path(&dir, "mic", index), rate).unwrap();
+                    let mut system = WavStream::create(&segment_path(&dir, "system", index), rate).unwrap();
+                    mic.write(&vec![0.25; rate as usize], 1).unwrap();
+                    system.write(&vec![-0.5; rate as usize], 1).unwrap();
+                    owner.checkpoint(index, mic.checkpoint().unwrap(), system.checkpoint().unwrap()).unwrap();
+                    mic.finalize().unwrap(); system.finalize().unwrap();
+                }
+                let manifest = dir.join("segments.txt");
+                let original = b"operator-retained legacy boundary\n";
+                if existing { std::fs::write(&manifest, original).unwrap(); }
+                // Same publication boundary used by run_capture's successful rate-change branch.
+                append_manifest(&dir, "seg 1 mic=mic.001.wav system=system.001.wav rate=24000 gap_frames=2400", true);
+                if existing { assert_eq!(std::fs::read(&manifest).unwrap(), original); }
+                else { assert!(!manifest.exists(), "managed rolls must rely on persisted metadata, not segments.txt"); }
+                owner.finish_capture(2.1, if short { 3.0 } else { 0.1 }).unwrap();
+                if !short {
+                    owner.reserve(crate::now_epoch(), false).unwrap();
+                    let key = owner.state.key.clone();
+                    let metadata = db::MeetingMeta { title: owner.state.title.clone(), source_dir: owner.dir.display().to_string(),
+                        model: "synthetic-whisper-large-v3".into(), lang: "en".into(), started_at: owner.state.started_at,
+                        duration_secs: 2.1, created_at: 1_762_880_010, capture_status: Some("complete".into()) };
+                    let segments = [crate::transcript::TranscriptSegment { speaker: crate::transcript::Speaker::You,
+                        text: "The route-change release check passed".into(), t_start: 0.1, t_end: 0.9, confidence: 0.94 }];
+                    let (id, row, stored) = crate::new_runtime().unwrap().block_on(async {
+                        let mut archive = owner.archive().await.unwrap();
+                        let id = archive.insert_keyed_meeting_with_voices(&metadata, &segments, &[], &[], &key).await.unwrap();
+                        let row = archive.get_meeting(id).await.unwrap().unwrap();
+                        let stored = archive.load_segments(id).await.unwrap(); archive.close().await.unwrap(); (id, row, stored)
+                    });
+                    let (vocab, _) = crate::render::Vocab::compile(&[]);
+                    let rendered = crate::render::render(&stored, &crate::render::IdentityMap::from_db(&[]), &vocab);
+                    let (md, _) = crate::export::write_managed_exports(&dir, &key, crate::export::Publication::Initial, &row, &rendered).unwrap();
+                    owner.committed(id).unwrap(); owner.complete(md.parent().unwrap()).unwrap();
+                }
+                drop(owner);
+                let pruned = crate::maintenance::prune_sessions(&root.join("sessions"), 30, crate::now_epoch() + 100 * 86_400).unwrap();
+                assert_eq!(pruned.removed, usize::from(!existing), "short={short}, existing={existing}");
+                if existing { assert_eq!(std::fs::read(&manifest).unwrap(), original); }
+                assert_eq!(root.join("archive.db").exists(), !short);
+                std::fs::remove_dir_all(root).unwrap();
+            }
+            let dir = std::env::temp_dir().join(format!("meetscribe-unmanaged-roll-{}", recovery::new_identity()));
+            std::fs::create_dir(&dir).unwrap();
+            let line = "seg 1 mic=mic.001.wav system=system.001.wav rate=24000 gap_frames=2400";
+            append_manifest(&dir, line, false);
+            assert_eq!(std::fs::read_to_string(dir.join("segments.txt")).unwrap(), format!("{line}\n"));
+            assert_eq!(crate::pipeline::read_segment_gaps(&dir).unwrap().get(&1), Some(&0.1));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+        println!(r#"{{"event":"audit_case_complete","case":"f2_rolled_capture_retention","iterations":5}}"#);
+    }
+
+    #[test]
+    fn interrupted_between_channel_flushes_keeps_the_previous_paired_checkpoint() {
+        use crate::recovery;
+        use std::io::{Read, Write};
+        if let Some(root) = std::env::var_os("MEETSCRIBE_TEST_PAIRED_ROOT") {
+            let root = PathBuf::from(root); let dir = root.join("sessions/recording");
+            let mut owner = recovery::Session::begin(&dir, &root.join("archive.db"), &dir,
+                "org.example.synthetic-call", "Paired checkpoint interruption", 1_762_880_000).unwrap();
+            owner.start_roll(0, 16_000, 0.0).unwrap();
+            let mut mic = WavStream::create(&dir.join("mic.wav"), 16_000).unwrap();
+            let mut system = WavStream::create(&dir.join("system.wav"), 16_000).unwrap();
+            mic.write(&vec![0.25; 16_000], 1).unwrap(); system.write(&vec![-0.5; 16_000], 1).unwrap();
+            owner.checkpoint(0, mic.checkpoint().unwrap(), system.checkpoint().unwrap()).unwrap();
+            recovery::atomic_json(&root.join("paired-ack.json"), &serde_json::json!({"event":"paired_checkpoint_held", "frames":16000})).unwrap();
+            std::io::stdin().read_exact(&mut [0u8; 1]).unwrap();
+            mic.write(&vec![0.75; 16_000], 1).unwrap(); system.write(&vec![-0.75; 16_000], 1).unwrap();
+            assert_eq!(mic.checkpoint().unwrap(), 32_000);
+            recovery::atomic_json(&root.join("interrupted-ack.json"), &serde_json::json!({"event":"only_mic_flushed", "frames":32000})).unwrap();
+            std::process::exit(85); // Do not flush the other header or publish a paired receipt.
+        }
+        for _ in 0..5 {
+            let root = std::env::temp_dir().join(format!("meetscribe-paired-cutpoint-{}", recovery::new_identity()));
+            recovery::private_dir(&root).unwrap(); let dir = root.join("sessions/recording");
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "session::tests::interrupted_between_channel_flushes_keeps_the_previous_paired_checkpoint", "--nocapture"])
+                .env("MEETSCRIBE_TEST_PAIRED_ROOT", &root).env("HOME", &root).stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !root.join("paired-ack.json").exists() { assert!(Instant::now() < deadline); std::thread::sleep(Duration::from_millis(2)); }
+            let ack: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("paired-ack.json")).unwrap()).unwrap();
+            assert_eq!(ack["frames"], 16000); assert!(recovery::Session::open(&dir).unwrap().is_none());
+            let metadata = std::fs::read(dir.join(recovery::STATE_FILE)).unwrap();
+            assert!(crate::run_transcribe(&[dir.display().to_string(), "--resume".into(), "--model".into(), root.join("absent.bin").display().to_string()]).is_err());
+            assert_eq!(std::fs::read(dir.join(recovery::STATE_FILE)).unwrap(), metadata);
+            assert_eq!(crate::maintenance::prune_sessions(&root.join("sessions"), 1, crate::now_epoch() + 100 * 86_400).unwrap().removed, 0);
+            child.stdin.take().unwrap().write_all(b"x").unwrap();
+            let output = child.wait_with_output().unwrap(); assert_eq!(output.status.code(), Some(85));
+            let ack: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("interrupted-ack.json")).unwrap()).unwrap(); assert_eq!(ack["frames"], 32000);
+            let original_mic = std::fs::read(dir.join("mic.wav")).unwrap(); let original_system = std::fs::read(dir.join("system.wav")).unwrap();
+            let mut session = recovery::Session::open(&dir).unwrap().unwrap();
+            assert_eq!((session.state.rolls[0].mic_frames, session.state.rolls[0].system_frames), (16_000, 16_000));
+            assert_eq!(session.state.attempts, 0); let input = session.inputs().unwrap();
+            assert_eq!(session.state.capture_status, recovery::CaptureStatus::Partial);
+            for (channel, expected) in [("mic", 0.25f32), ("system", -0.5f32)] {
+                let reader = hound::WavReader::open(input.join(format!("{channel}.wav"))).unwrap(); assert_eq!(reader.len(), 16_000);
+                assert!(reader.into_samples::<f32>().all(|sample| sample.unwrap() == expected));
+            }
+            assert_eq!(std::fs::read(dir.join("mic.wav")).unwrap(), original_mic);
+            assert_eq!(std::fs::read(dir.join("system.wav")).unwrap(), original_system);
+            drop(session); std::fs::remove_dir_all(root).unwrap();
+        }
+        println!(r#"{{"event":"audit_case_complete","case":"f1_paired_checkpoint_interrupt","iterations":5}}"#);
+    }
 
     #[test]
     fn audit_f1_checkpoint_recovery() {

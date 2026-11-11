@@ -572,8 +572,18 @@ fn job_for(cfg: &DaemonConfig, dir: PathBuf, label: String, title: String) -> Tr
 fn queue_job(jobs: &mpsc::Sender<TranscribeJob>, job: TranscribeJob) {
     let title = job.opts.title.as_deref().unwrap_or_default();
     let marker = job.dir.join(maintenance::PENDING_MARKER);
-    if let Err(e) = std::fs::write(&marker, format!("{}\n{title}\n", job.label)) {
-        log::warn!("could not write {} — this meeting will not be retried after a restart: {e}", marker.display());
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&marker) {
+        Ok(mut file) => {
+            if let Err(error) = write!(file, "{}\n{title}\n", job.label) {
+                log::warn!("pending marker write failed; durable session state remains authoritative: {error}");
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            log::info!("existing pending material preserved; durable session state controls recovery");
+        }
+        Err(error) => log::warn!("pending marker unavailable; durable session state controls recovery: {error}"),
     }
     log::info!("queued {} for transcription", job.dir.display());
     if let Err(mpsc::SendError(job)) = jobs.send(job) {
@@ -592,6 +602,14 @@ fn pending_sessions_at(sessions_dir: &Path, now: i64) -> Vec<(PathBuf, String, S
     let mut found: Vec<_> = entries.filter_map(|entry| {
         let dir = entry.ok()?.path();
         let state = crate::recovery::State::read(&dir).ok()?;
+        if state.phase == crate::recovery::Phase::Complete
+            && std::fs::symlink_metadata(dir.join(maintenance::PENDING_MARKER)).is_ok() {
+            let reconciled = (|| -> Result<()> {
+                if let Some(session) = crate::recovery::Session::open(&dir)? { session.reconcile_pending()?; }
+                Ok(())
+            })();
+            if reconciled.is_err() { log::warn!("component=recovery event=pending_reconcile_failed"); }
+        }
         if !state.due(now) { return None; }
         let label = detect::app_label(&state.app).to_string();
         Some((state.started_at, dir, label, state.title))
@@ -619,11 +637,8 @@ enum Marker {
 
 /// Exit zero alone is not completion. Retry budgets live in durable session state,
 /// not in destructive marker removal after a failed child.
-fn marker_after(outcome: ChildOutcome, archive_proven: bool) -> Marker {
-    match outcome {
-        ChildOutcome::Exited(0) if archive_proven => Marker::Clear,
-        _ => Marker::Keep,
-    }
+fn marker_after(_outcome: ChildOutcome, archive_proven: bool) -> Marker {
+    if archive_proven { Marker::Clear } else { Marker::Keep }
 }
 
 /// The `meetscribe transcribe` argv (after the subcommand) that reproduces `opts` exactly. Every
@@ -707,8 +722,11 @@ fn run_transcribe_job_at(job: &TranscribeJob, exe: &Path, base: &Path, now: impl
             }));
         }
     }
-    let archive_proven = crate::recovery::Session::open(&job.dir).ok().flatten()
-        .is_some_and(|session| session.proof(crate::recovery::ProofScope::Archive).unwrap_or(false));
+    let archive_proven = (|| -> Result<bool> {
+        let Some(session) = crate::recovery::Session::open(&job.dir)? else { return Ok(false); };
+        if job.opts.session_key.as_ref().is_some_and(|key| *key != session.state.key) { return Ok(false); }
+        session.reconcile_pending() // Lock remains held through proof and marker removal.
+    })().unwrap_or_else(|_| { log::warn!("component=recovery event=pending_reconcile_failed"); false });
     match outcome {
         ChildOutcome::Exited(0) if archive_proven => log::info!("transcribed {}", job.dir.display()),
         ChildOutcome::Exited(0) => log::warn!("component=recovery event=child_success_without_archive_proof"),
@@ -719,11 +737,7 @@ fn run_transcribe_job_at(job: &TranscribeJob, exe: &Path, base: &Path, now: impl
             "{} stays protected; durable recovery state controls the next attempt",
             job.dir.display()
         ),
-        Marker::Clear => {
-            if let Err(e) = std::fs::remove_file(job.dir.join(maintenance::PENDING_MARKER)) {
-                log::warn!("could not clear the pending marker in {}: {e}", job.dir.display());
-            }
-        }
+        Marker::Clear => log::info!("component=recovery event=completion_reconciled"),
     }
 }
 
@@ -1121,7 +1135,7 @@ mod tests {
     }
 
     #[test]
-    fn the_marker_clears_only_after_success_with_archive_proof() {
+    fn the_marker_clears_only_after_complete_archive_proof_regardless_of_exit() {
         use ChildOutcome::*;
         for (outcome, archive_proven, want) in [
             (Exited(0), false, Marker::Keep),
@@ -1130,9 +1144,11 @@ mod tests {
             (Signaled(libc::SIGABRT), false, Marker::Keep),
             (LaunchFailed, false, Marker::Keep),
             (TrackingLost, false, Marker::Keep),
-            (Signaled(libc::SIGTERM), true, Marker::Keep),
-            (Signaled(libc::SIGINT), true, Marker::Keep),
-            (Exited(1), true, Marker::Keep),
+            (Signaled(libc::SIGTERM), true, Marker::Clear),
+            (Signaled(libc::SIGINT), true, Marker::Clear),
+            (Exited(1), true, Marker::Clear),
+            (TrackingLost, true, Marker::Clear),
+            (LaunchFailed, true, Marker::Clear),
         ] {
             assert_eq!(marker_after(outcome, archive_proven), want, "{outcome:?} archive_proven={archive_proven}");
         }

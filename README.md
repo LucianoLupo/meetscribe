@@ -27,6 +27,10 @@ You:     works for me
 
 ## Quick start
 
+**Already installed?** Read the [legacy/upgrade boundary](docs/DAEMON.md#legacy-recordings-and-upgrade-boundary)
+first. A launchd unload is not proof that an older transcription child or resident tray has exited;
+legacy recordings remain protected rather than being automatically adopted or pruned.
+
 ```bash
 git clone https://github.com/LucianoLupo/meetscribe && cd meetscribe
 

@@ -53,7 +53,7 @@ fn safe_fields(fields: Map<String, Value>) -> Option<Map<String, Value>> {
             "event" => value.as_str().is_some_and(|value| matches!(value,
                 "capture_started" | "roll_started" | "checkpoint_committed" | "capture_finalized" | "capture_failed" |
                 "archive_bound" | "attempt_reserved" | "archive_committed" | "session_complete" | "attention_required" |
-                "attempt_failed" | "committed_inputs_recovered" | "command_failed" | "source_unchanged" |
+                "attempt_failed" | "pending_reconciled" | "committed_inputs_recovered" | "command_failed" | "source_unchanged" |
                 "model_stage_ready" | "model_published" | "runtime_stage_ready" | "runtime_backup_retained" |
                 "runtime_published" | "runtime_restored" | "stop_requested" | "stop_received" | "status_published" | "recovery_scan_failed" | "launch_failure_persist_failed")),
             "session_id" | "instance_id" => value.as_str().is_some_and(|value| value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())),

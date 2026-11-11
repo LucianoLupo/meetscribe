@@ -6,7 +6,7 @@ and so is being told the design is wrong.
 ## Before you can build
 
 Setup, the certificate requirement, and the install loop are in the
-[README](README.md#requirements). The rebuild → re-sign → reinstall cycle and every launchd
+[README](README.md#before-you-start-you-need). The rebuild → re-sign → reinstall cycle and every launchd
 operation live in [`docs/DAEMON.md`](docs/DAEMON.md).
 
 Those are the single source for that recipe and this file deliberately does not repeat it —

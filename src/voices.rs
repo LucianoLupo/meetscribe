@@ -203,19 +203,31 @@ pub fn apply_matches(a: &mut Assembly, enrolled: &[spk::Enrolled]) -> usize {
 /// session's `system.wav` rolls exactly as the live pipeline saw them (same roll order, same
 /// `segments.txt` gaps, same resampler). A range no roll covers comes back `None`.
 pub fn slice_far_end(dir: &Path, ranges: &[(f64, f64)]) -> Result<Vec<Option<Vec<f32>>>> {
-    let files = pipeline::discover_channel(dir, "system");
-    if files.is_empty() {
-        anyhow::bail!("no system.wav in {}", dir.display());
-    }
-    let gaps = pipeline::read_segment_gaps(dir)?;
+    let managed = match std::fs::symlink_metadata(dir.join(crate::recovery::STATE_FILE)) {
+        Ok(_) => Some(crate::recovery::State::read(dir)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let files = if let Some(state) = managed.as_ref() {
+        state.rolls.iter().map(|roll| dir.join(crate::recovery::roll_name("system", roll.index))).collect()
+    } else { pipeline::discover_channel(dir, "system") };
+    if files.is_empty() { anyhow::bail!("no trusted system.wav in {}", dir.display()); }
+    let offsets = managed.as_ref().map(crate::recovery::State::roll_offsets);
+    let gaps = if let Some(state) = managed.as_ref() {
+        state.rolls.iter().map(|roll| (roll.index, roll.gap_seconds)).collect()
+    } else { pipeline::read_segment_gaps(dir)? };
     let rate = resample::TARGET_RATE as f64;
     let mut out: Vec<Option<Vec<f32>>> = vec![None; ranges.len()];
     let mut offset = 0.0f64;
     for (i, path) in files.iter().enumerate() {
-        if i >= 1 {
+        if let Some(start) = offsets.as_ref().and_then(|offsets| offsets.get(i)) {
+            offset = *start;
+        } else if i >= 1 {
             offset += gaps.get(&(i as u32)).copied().unwrap_or(0.0);
         }
-        let (samples, sr) = pipeline::read_wav_any_rate(path)?;
+        let (samples, sr) = if let Some(roll) = managed.as_ref().and_then(|state| state.rolls.get(i)) {
+            (crate::recovery::read_committed_samples(path, roll.sample_rate, roll.system_frames)?, roll.sample_rate)
+        } else { pipeline::read_wav_any_rate(path)? };
         let audio = resample::to_16k_mono(&samples, sr).with_context(|| format!("resample {}", path.display()))?;
         let dur = audio.len() as f64 / rate;
         for (k, &(ts, te)) in ranges.iter().enumerate() {

@@ -74,6 +74,18 @@ impl State {
             && (self.attempts < 4 || self.in_flight) && self.next_retry <= now
     }
 
+    /// Both capture channels start each roll together. An unequal committed prefix leaves a
+    /// channel-specific hole, not permission to start the next roll early for that channel.
+    pub fn roll_offsets(&self) -> Vec<f64> {
+        let mut next = 0.0;
+        self.rolls.iter().enumerate().map(|(index, roll)| {
+            if index > 0 { next += roll.gap_seconds; }
+            let start = next;
+            next += roll.mic_frames.max(roll.system_frames) as f64 / f64::from(roll.sample_rate);
+            start
+        }).collect()
+    }
+
     fn validate(&self) -> Result<()> {
         if self.version != 1 || self.key.len() != 32 || !self.key.bytes().all(|b| b.is_ascii_hexdigit()) {
             bail!("unknown or invalid session identity/version");
@@ -309,6 +321,25 @@ impl Session {
         Ok(true)
     }
 
+    /// Reconcile a stale control marker only while this Session holds the stable lock.
+    /// Child exit status is not evidence: the bound archive and exact publication pair are.
+    pub fn reconcile_pending(&self) -> Result<bool> {
+        if !self.proof(ProofScope::Archive)? { return Ok(false); }
+        let marker = self.dir.join(crate::maintenance::PENDING_MARKER);
+        match fs::symlink_metadata(&marker) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                let owned = format!("{}\n{}\n", crate::detect::app_label(&self.state.app), self.state.title);
+                if metadata.len() != owned.len() as u64 || fs::read(&marker)? != owned.as_bytes() { return Ok(false); }
+                fs::remove_file(marker)?;
+                self.event("pending_reconciled");
+            }
+            Ok(_) => return Ok(false), // Never remove a directory or follow an unknown symlink.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(true)
+    }
+
     pub fn complete(&mut self, publication: &Path) -> Result<()> {
         let markdown = publication.join("transcript.md");
         let json_path = publication.join("transcript.json");
@@ -466,6 +497,21 @@ impl Session {
 
 pub(crate) fn roll_name(channel: &str, index: u32) -> String {
     if index == 0 { format!("{channel}.wav") } else { format!("{channel}.{index:03}.wav") }
+}
+
+/// Read the same committed RIFF prefix recovery trusts, including stale declared data lengths.
+/// Capture symlinks and insufficient/mismatched sample bytes fail closed without modifying files.
+pub(crate) fn read_committed_samples(path: &Path, rate: u32, frames: u64) -> Result<Vec<f32>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let offset = committed_data_offset(path, rate, frames)?;
+    let count = usize::try_from(frames).context("committed sample count exceeds platform capacity")?;
+    let mut source = std::io::BufReader::new(File::open(path)?); source.seek(SeekFrom::Start(offset))?;
+    let mut samples = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut bytes = [0u8; 4]; source.read_exact(&mut bytes)?;
+        samples.push(f32::from_le_bytes(bytes));
+    }
+    Ok(samples)
 }
 
 // RIFF chunk boundaries, not a guessed universal WAV header offset. Only our mono

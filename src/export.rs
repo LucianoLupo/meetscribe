@@ -106,6 +106,7 @@ pub fn write_exports(
     let md_path = dir.join(format!("{basename}.md"));
     let json_path = dir.join(format!("{basename}.json"));
     atomic_export(&md_path, &to_markdown(meeting, segs), PublishMode::Replace)?;
+    #[cfg(test)] crate::pipeline::cutpoint("manual_markdown_published");
     atomic_export(&json_path, &to_json(segs)?, PublishMode::Replace)?;
     Ok((md_path, json_path))
 }

@@ -18,6 +18,14 @@ REQUIRED = {
     'f2_retry_worker': ('iterations', 5), 'f2_child_retry_retention': ('iterations', 5),
     'f2_launch_failure_budget': ('iterations', 5), 'f2_launch_busy_free': ('iterations', 5),
     'f2_launch_reserved_once': ('iterations', 5), 'f2_launch_preserve_ineligible': ('iterations', 5),
+    'f2_rolled_capture_retention': ('iterations', 5),
+    'f2_complete_marker_reconcile': ('iterations', 5), 'f2_complete_marker_guards': ('iterations', 5),
+    'f2_pending_marker_identity': ('iterations', 5), 'f1_shared_roll_timeline': ('iterations', 5),
+    'f1_paired_checkpoint_interrupt': ('iterations', 5), 'f1_playback_committed_reader': ('iterations', 5),
+    'f2_queue_preserves_marker_material': ('iterations', 5), 'f3_cross_session_destination': ('iterations', 5),
+    'f3_manual_store_race': ('iterations', 5), 'f3_manual_no_store_race': ('iterations', 5),
+    'f3_manual_publication_race': ('iterations', 5), 'f3_manual_trusted_prefix': ('iterations', 5),
+    'f3_legacy_overlap_quarantine': ('iterations', 5), 'f3_unmanaged_no_store_child': ('iterations', 5),
     'f3_resume_identity': ('iterations', 5), 'f3_db_race': ('iterations', 5),
     'f3_child_cutpoints': ('iterations', 5), 'f4_merge': ('iterations_per_scenario', 5),
     'f5_self_source': ('iterations', 5), 'f5_interrupted_swap': ('iterations', 5),
@@ -62,13 +70,18 @@ def main():
         valid = [{'case': name, field: minimum} for name, (field, minimum) in REQUIRED.items()]
         next(item for item in valid if item['case'] == 'f4_merge')['scenarios'] = 11
         verify(valid)
-        for invalid in ([], valid[:-1], [dict(item, iterations=0) if item['case'] == 'f1_checkpoint' else item for item in valid]):
+        invalid_cases = [[], valid + [valid[0]]]
+        for name, (field, _) in REQUIRED.items():
+            invalid_cases.append([item for item in valid if item['case'] != name])
+            for value in (0, True):
+                invalid_cases.append([dict(item, **{field: value}) if item['case'] == name else item for item in valid])
+        for invalid in invalid_cases:
             try:
                 verify(invalid)
             except ValueError:
                 continue
             raise AssertionError('invalid execution accounting accepted')
-        event('self_test_passed', rejected_cases=3)
+        event('self_test_passed', rejected_cases=len(invalid_cases))
         return 0
     if args.out is None:
         parser.error('--out is required unless --self-test is selected')

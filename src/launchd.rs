@@ -490,12 +490,10 @@ pub(crate) fn run_install(argv: &[String]) -> Result<()> {
     if let Err(e) = std::fs::rename(&staged, &dest_bin) {
         let _ = std::fs::remove_file(&staged);
         bail!(
-            "move {} → {} failed ({e}). The agent was stopped; the previous binary is unchanged — \
-             restart it with: launchctl bootstrap gui/{} {}",
+            "move {} → {} failed ({e}). The agent was stopped; the previous binary is unchanged. \
+             Preserve artifacts and establish runtime compatibility and legacy-child quiescence before any restart.",
             staged.display(),
-            dest_bin.display(),
-            uid(),
-            plist_path(&home).display()
+            dest_bin.display()
         );
     }
     log::info!("installed binary → {} (re-signed + verified)", dest_bin.display());
