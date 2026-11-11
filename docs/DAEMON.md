@@ -176,6 +176,14 @@ meetscribe detect --watch                                 # what the detector se
 Auto-recorded sessions land in `~/.meetscribe/sessions/<YYYYMMDD-HHMMSS>/` (mic.wav, system.wav,
 transcript.md, transcript.json); meetings are stored in `~/.meetscribe/meetscribe.db` (0600).
 
+Managed automatic transcription has an initial attempt plus three retries, with persisted
+1-, 5-, and 30-minute waits. Failure to launch the transcription executable uses that same
+budget (`child_launch`), including across worker restarts; exhaustion requires attention.
+A busy session lock consumes no attempt. An interrupted child's existing reservation is
+settled once, not charged again when a replacement executable cannot launch. Unknown
+post-launch outcomes are not treated as fresh launch failures. Session metadata preserves
+the retry state, and content-free recovery events appear in the stderr log above.
+
 ## Manual load / unload (without reinstalling)
 ```
 launchctl bootout   gui/$(id -u)/com.lucianolupo.meetscribe                                   # stop

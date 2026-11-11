@@ -28,6 +28,8 @@ pub(crate) struct PipelineOpts {
     /// Where the Markdown+JSON land (defaults, at both call sites, to the capture/session dir).
     pub export_dir: PathBuf,
     pub no_store: bool,
+    pub session_key: Option<String>,
+    pub resume: bool,
     /// Speaker-embedding ONNX model. `None` or a missing file ⇒ transcribe without speaker
     /// identity (logged once), nothing else changes. MUST be absolute for the daemon.
     pub speaker_model: Option<PathBuf>,
@@ -39,6 +41,43 @@ pub(crate) struct PipelineOpts {
     pub diarizer_model: PathBuf,
     /// Evaluation only: replay this RTTM's turns instead of running the diarizer (single roll).
     pub diarizer_rttm: Option<PathBuf>,
+}
+
+/// The expensive inference boundary; file loading, resampling, roll offsets, storage and
+/// publication remain in the real pipeline when a model-free test backend is injected.
+pub(crate) trait SpeechEngine {
+    fn windows(&mut self, audio: &[f32]) -> Result<Vec<vad::SpeechWindow>>;
+    fn transcribe(&mut self, audio: &[f32], lang: &str, words: bool) -> Result<(String, f32, Vec<asr::Word>)>;
+    fn embed(&mut self, audio: &[f32]) -> Result<Option<Vec<f32>>>;
+}
+struct NativeEngine { asr: asr::Asr, embedder: Option<spk::Embedder> }
+impl SpeechEngine for NativeEngine {
+    fn windows(&mut self, audio: &[f32]) -> Result<Vec<vad::SpeechWindow>> { vad::speech_windows(audio) }
+    fn transcribe(&mut self, audio: &[f32], lang: &str, words: bool) -> Result<(String, f32, Vec<asr::Word>)> {
+        if words { self.asr.transcribe_words(audio, lang) }
+        else { self.asr.transcribe(audio, lang).map(|(text, confidence)| (text, confidence, Vec::new())) }
+    }
+    fn embed(&mut self, audio: &[f32]) -> Result<Option<Vec<f32>>> {
+        match self.embedder.as_mut() { Some(embedder) => embedder.embed(audio).map(Some), None => Ok(None) }
+    }
+}
+#[cfg(test)]
+type EngineFactory = fn(&str, &PipelineOpts) -> Result<Box<dyn SpeechEngine>>;
+#[cfg(test)]
+std::thread_local! { static TEST_ENGINE: std::cell::Cell<Option<EngineFactory>> = const { std::cell::Cell::new(None) }; }
+#[cfg(test)]
+pub(crate) fn test_engine(factory: EngineFactory) { TEST_ENGINE.set(Some(factory)); }
+#[cfg(test)]
+std::thread_local! { static TEST_CUTPOINT: std::cell::Cell<Option<fn(&str)>> = const { std::cell::Cell::new(None) }; }
+#[cfg(test)]
+pub(crate) fn test_cutpoints(callback: fn(&str)) { TEST_CUTPOINT.set(Some(callback)); }
+#[cfg(test)]
+pub(crate) fn cutpoint(point: &str) { if let Some(callback) = TEST_CUTPOINT.get() { callback(point); } }
+fn load_engine(model: &str, opts: &PipelineOpts) -> Result<Box<dyn SpeechEngine>> {
+    #[cfg(test)]
+    if let Some(factory) = TEST_ENGINE.get() { return factory(model, opts); }
+    Ok(Box::new(NativeEngine { asr: asr::Asr::load(model).with_context(|| format!("load model {model}"))?,
+        embedder: load_embedder(opts.speaker_model.as_deref()) }))
 }
 
 /// Result of the pipeline. `segments`/`meeting_secs`/`rtf`/`wall_secs` let the CLI wrapper print
@@ -56,11 +95,94 @@ pub(crate) struct PipelineOutput {
     pub meeting_secs: f64,
     pub wall_secs: f64,
     pub rtf: f64,
+    pub capture_status: String,
 }
 
 /// Transcribe every channel segment under `dir`, merge into one time-ordered speaker-labeled
 /// transcript, persist to the DB (unless `no_store`), and write Markdown+JSON exports.
 pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<PipelineOutput> {
+    transcribe_with_clock(dir, opts, crate::now_epoch)
+}
+
+pub(crate) fn transcribe_with_clock(dir: &Path, opts: &PipelineOpts, now: impl Fn() -> i64) -> Result<PipelineOutput> {
+    use crate::recovery::{Session, STATE_FILE};
+    let keyed = opts.resume || opts.session_key.is_some();
+    anyhow::ensure!(!(keyed && opts.no_store), "recovery cannot use --no-store");
+    let mut session = if std::fs::symlink_metadata(dir.join(STATE_FILE)).is_ok() {
+        Some(Session::open(dir)?.context("session is busy; no attempt was charged")?)
+    } else { None };
+    if !keyed {
+        if let Some(session) = session.as_mut() { session.protect_outputs()?; }
+        return transcribe_core(dir, dir, opts, session.as_mut());
+    }
+    let managed = session.as_mut().context("--resume requires managed session metadata; legacy work needs verified adoption")?;
+    if let Some(key) = &opts.session_key { anyhow::ensure!(key == &managed.state.key, "session key does not match metadata"); }
+    anyhow::ensure!(crate::recovery::absolute(&opts.db_path)? == crate::recovery::absolute(&managed.state.db_path)?, "recovery database override differs from persisted destination");
+    anyhow::ensure!(crate::recovery::absolute(&opts.export_dir)? == crate::recovery::absolute(&managed.state.export_dir)?, "recovery export override differs from persisted destination");
+    let mut actual = opts.clone();
+    actual.session_key = Some(managed.state.key.clone());
+    actual.db_path = managed.state.db_path.clone();
+    actual.export_dir = managed.state.export_dir.clone();
+    actual.title = Some(managed.state.title.clone());
+    managed.reserve(now(), opts.resume)?;
+    let result = (|| {
+        let runtime = crate::new_runtime()?;
+        let existing = runtime.block_on(async {
+            let mut db = managed.archive().await?;
+            let id = db.ingest_id(&managed.state.key).await?;
+            db.close().await?;
+            anyhow::Ok(id)
+        })?;
+        if let Some(id) = existing { return render_existing(managed, &actual, id); }
+        let inputs = match managed.inputs() {
+            Ok(inputs) => inputs,
+            Err(error) => { managed.needs_attention("checkpoint_invalid")?; return Err(error); }
+        };
+        transcribe_core(dir, &inputs, &actual, Some(managed))
+    })();
+    let result = result.and_then(|output| {
+        managed.state.duration_seconds = output.meeting_secs;
+        managed.complete(output.md_path.parent().context("publication has no directory")?)?;
+        Ok(output)
+    });
+    if let Err(error) = result {
+        if let Err(persist) = managed.failed("processing", now()) {
+            return Err(error.context(format!("could not persist recovery failure: {persist:#}")));
+        }
+        return Err(error);
+    }
+    result
+}
+
+fn render_existing(managed: &mut crate::recovery::Session, opts: &PipelineOpts, id: i64) -> Result<PipelineOutput> {
+    let started = Instant::now();
+    let runtime = crate::new_runtime()?;
+    let (row, segments, vocabulary, people) = runtime.block_on(async {
+        let mut db = managed.archive().await?;
+        let row = db.get_meeting(id).await?.context("ingest points to a missing meeting")?;
+        let segments = db.load_segments(id).await?;
+        let vocabulary = db.load_enabled_vocab().await?;
+        let people = db.list_speakers().await?;
+        db.close().await?;
+        anyhow::Ok((row, segments, vocabulary, people))
+    })?;
+    let rendered = render::render(&segments, &render::IdentityMap::from_db(&people), &compile_vocab(&vocabulary));
+    managed.state.capture_status = match row.capture_status.as_str() {
+        "partial" => crate::recovery::CaptureStatus::Partial,
+        "complete" => crate::recovery::CaptureStatus::Complete,
+        _ => crate::recovery::CaptureStatus::Unknown,
+    };
+    managed.committed(id)?;
+    let (md_path, json_path) = export::write_managed_exports(&opts.export_dir, &managed.state.key, export::Publication::Recovered, &row, &rendered)?;
+    let wall_secs = started.elapsed().as_secs_f64();
+    Ok(PipelineOutput {
+        segments: rendered, stored_id: Some(id), md_path, json_path, meeting_secs: row.duration_secs,
+        wall_secs, rtf: if row.duration_secs > 0.0 { wall_secs / row.duration_secs } else { 0.0 },
+        capture_status: row.capture_status,
+    })
+}
+
+fn transcribe_core(dir: &Path, audio_dir: &Path, opts: &PipelineOpts, mut managed: Option<&mut crate::recovery::Session>) -> Result<PipelineOutput> {
     let title = opts.title.clone().unwrap_or_else(|| {
         dir.file_name()
             .and_then(|s| s.to_str())
@@ -68,8 +190,13 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
             .to_string()
     });
 
-    let mic_files = discover_channel(dir, "mic");
-    let sys_files = discover_channel(dir, "system");
+    let inputs = |channel: &str| match managed.as_ref().filter(|_| opts.session_key.is_some()) {
+        Some(session) => session.state.rolls.iter()
+            .map(|roll| audio_dir.join(crate::recovery::roll_name(channel, roll.index))).collect(),
+        None => discover_channel(audio_dir, channel),
+    };
+    let mic_files = inputs("mic");
+    let sys_files = inputs("system");
     if mic_files.is_empty() && sys_files.is_empty() {
         anyhow::bail!("no mic.wav/system.wav found in {}", dir.display());
     }
@@ -88,12 +215,14 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
     // Rolls the diarizer covered / far-end rolls seen, and why any roll fell back (per-meeting
     // provenance log line).
     let (mut rolls_split, mut rolls_far, mut fallbacks) = (0usize, 0usize, Vec::<String>::new());
-    let mut asr = asr::Asr::load(model_str).with_context(|| format!("load model {model_str}"))?;
+    let mut engine = load_engine(model_str, opts)?;
     let split_on = diarizer.is_some();
-    let mut embedder = load_embedder(opts.speaker_model.as_deref());
     // Inter-segment gaps the capture layer recorded on rate-roll boundaries (empty for the common
     // single-segment case). Both channels share the same manifest.
-    let gaps = read_segment_gaps(dir)?;
+    let gaps = if opts.session_key.is_some() {
+        managed.as_ref().context("keyed inference has no session")?.state.rolls.iter()
+            .map(|roll| (roll.index, roll.gap_seconds)).collect()
+    } else { read_segment_gaps(audio_dir)? };
 
     let t0 = Instant::now();
     // Each segment travels with its far-end speaker embedding (`None` for the mic channel, for
@@ -121,7 +250,7 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
                 .with_context(|| format!("resample {}", path.display()))?;
             let dur = audio16.len() as f64 / resample::TARGET_RATE as f64;
             let windows =
-                vad::speech_windows(&audio16).with_context(|| format!("vad {}", path.display()))?;
+                engine.windows(&audio16).with_context(|| format!("vad {}", path.display()))?;
             log::info!(
                 "  {} @ {} Hz → {:.1}s, {} speech windows",
                 path.display(),
@@ -155,21 +284,13 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
                     continue;
                 }
                 // Far-end windows are decoded ONCE, with word timings when splitting.
-                let (text, confidence, words) = if far && split_on {
-                    asr.transcribe_words(&audio16[a..b], &opts.lang)?
-                } else {
-                    let (t, c) = asr.transcribe(&audio16[a..b], &opts.lang)?;
-                    (t, c, Vec::new())
-                };
+                let (text, confidence, words) = engine.transcribe(&audio16[a..b], &opts.lang, far && split_on)?;
                 if text.is_empty() {
                     continue;
                 }
-                let embedding = match embedder.as_mut() {
-                    Some(e) if speaker == transcript::Speaker::Others && b - a >= embed_floor => {
-                        Some(e.embed(&audio16[a..b]).context("speaker embedding")?)
-                    }
-                    _ => None,
-                };
+                let embedding = if speaker == transcript::Speaker::Others && b - a >= embed_floor {
+                    engine.embed(&audio16[a..b]).context("speaker embedding")?
+                } else { None };
                 let (t_start, t_end) = (offset + w.start_ms as f64 / 1000.0, offset + w.end_ms as f64 / 1000.0);
                 if far && split_on {
                     awaiting.push((segs.len(), words));
@@ -199,12 +320,9 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
                     for p in ps {
                         let pa = (((p.t_start - offset) * resample::TARGET_RATE as f64).round() as usize).min(audio16.len());
                         let pb = (((p.t_end - offset) * resample::TARGET_RATE as f64).round() as usize).min(audio16.len());
-                        let emb = match embedder.as_mut() {
-                            Some(e) if pb > pa && pb - pa >= embed_floor => {
-                                Some(e.embed(&audio16[pa..pb]).context("piece embedding")?)
-                            }
-                            _ => None,
-                        };
+                        let emb = if pb > pa && pb - pa >= embed_floor {
+                            engine.embed(&audio16[pa..pb]).context("piece embedding")?
+                        } else { None };
                         segs[k].1.1.push((p, emb));
                     }
                 }
@@ -265,9 +383,11 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
         source_dir: dir.display().to_string(),
         model: model_name(&opts.model),
         lang: opts.lang.clone(),
-        started_at: earliest_capture_start(&mic_files, &sys_files),
+        started_at: managed.as_ref().map(|session| session.state.started_at)
+            .unwrap_or_else(|| earliest_capture_start(&mic_files, &sys_files)),
         duration_secs: meeting_secs,
         created_at: crate::now_epoch(),
+        capture_status: managed.as_ref().map(|session| session.state.capture_status.as_str().to_owned()),
     };
 
     // Persist to the DB, then export. A storage failure must NOT discard the transcript: on error
@@ -279,6 +399,7 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
     // Stored: (row, id, vocab rows, the segments re-read from the DB, speakers) — the exports are
     // then rendered from the SAME rows `export <id>` reads, so the daemon's transcript.md carries
     // the same names and corrections. Unstored: no identity, no vocab, rendered from `merged`.
+    let mut storage_error = None;
     let stored = if opts.no_store {
         // No DB handle on this path: render raw, and say so rather than silently differing from
         // what `export <id>` would produce.
@@ -290,7 +411,9 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
     } else {
         let rt = crate::new_runtime()?;
         let res = rt.block_on(async {
-            let mut database = db::Db::open(&opts.db_path).await?;
+            let mut database = if opts.session_key.is_some() {
+                managed.as_deref_mut().context("keyed storage has no session")?.archive().await?
+            } else { db::Db::open(&opts.db_path).await? };
             let enrolled = voices::decode_enrolled(&database.load_enrolled().await?)?;
             let mut matched = voices::apply_matches(&mut assembly, &enrolled);
             // Split-then-name: match path B, apply rule C against path A, then turn the
@@ -309,9 +432,13 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
                 Some((segs, asm)) => (segs, asm),
                 None => (&merged, &assembly),
             };
-            let id = database
-                .insert_meeting_with_voices(&meta, final_segs, &final_asm.clusters, &final_asm.voices)
-                .await?;
+            let id = if let Some(key) = &opts.session_key {
+                database.insert_keyed_meeting_with_voices(&meta, final_segs, &final_asm.clusters, &final_asm.voices, key).await?
+            } else {
+                database.insert_meeting_with_voices(&meta, final_segs, &final_asm.clusters, &final_asm.voices).await?
+            };
+            #[cfg(test)]
+            cutpoint("database_committed");
             let n_clusters = final_asm.clusters.len();
             let row = database
                 .get_meeting(id)
@@ -342,10 +469,8 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
                 // Same rendering inputs as the --no-store branch, deliberately: if these two
                 // diverged, a store failure would produce an on-disk transcript that no later
                 // `export <id>` could reproduce.
-                log::warn!(
-                    "could not persist meeting ({e:#}); exporting without storage, without \
-                     vocabulary corrections and without speaker names"
-                );
+                log::warn!("component=pipeline event=archive_failed class=storage; preserving file export");
+                storage_error = Some(e);
                 None
             }
         }
@@ -363,9 +488,18 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
             render::render_fresh(&merged, &render::IdentityMap::empty(), &render::Vocab::empty()),
         ),
     };
-    let (md_path, json_path) =
-        export::write_exports(&opts.export_dir, "transcript", &row, &rendered)?;
-
+    if let Some(session) = managed.as_deref_mut()
+        && opts.session_key.is_some() {
+        if let Some(id) = stored_id { session.committed(id)?; } else { session.protect_outputs()?; }
+    }
+    let (md_path, json_path) = if let Some(key) = &opts.session_key {
+        let session = managed.as_ref().context("keyed publication has no session")?;
+        let mode = if opts.resume || session.state.attempts > 1 { export::Publication::Recovered } else { export::Publication::Initial };
+        export::write_managed_exports(&opts.export_dir, key, mode, &row, &rendered)?
+    } else { export::write_exports(&opts.export_dir, "transcript", &row, &rendered)? };
+    if let Some(error) = storage_error {
+        return Err(error.context(format!("archive incomplete; exported files preserved at {}", md_path.parent().unwrap_or(&opts.export_dir).display())));
+    }
     Ok(PipelineOutput {
         segments: rendered,
         stored_id,
@@ -374,6 +508,7 @@ pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<Pi
         meeting_secs,
         wall_secs: wall,
         rtf,
+        capture_status: row.capture_status,
     })
 }
 
@@ -562,6 +697,7 @@ fn synth_row(meta: &db::MeetingMeta, segment_count: usize) -> db::MeetingRow {
         duration_secs: meta.duration_secs,
         segment_count: segment_count as i64,
         created_at: meta.created_at,
+        capture_status: meta.capture_status.clone().unwrap_or_else(|| "unknown".into()),
     }
 }
 
@@ -577,6 +713,8 @@ mod tests {
             db_path: PathBuf::from("unused.db"),
             export_dir: PathBuf::from("."),
             no_store: true,
+            session_key: None,
+            resume: false,
             speaker_model: None,
             split,
             diarizer_bin: bin.to_path_buf(),

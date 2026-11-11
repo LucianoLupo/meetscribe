@@ -4,6 +4,8 @@
 //! CoreML is still toggled at build time by the crate `coreml` feature.
 
 use anyhow::{Context, Result};
+use std::sync::Once;
+use std::sync::atomic::{AtomicU64, Ordering};
 use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
 };
@@ -23,6 +25,48 @@ pub struct Word {
 /// accepting whisper's tendency to hallucinate on trailing silence — a separate feature.)
 const MIN_SAMPLES: usize = 16_000 / 10; // 100 ms @ 16 kHz
 
+static NATIVE_LOG_INIT: Once = Once::new();
+static NATIVE_WARNINGS: AtomicU64 = AtomicU64::new(0);
+static NATIVE_ERRORS: AtomicU64 = AtomicU64::new(0);
+
+// Native message bodies can contain decoded words at any level. Never dereference,
+// format or forward them. Atomics cannot unwind across this C callback.
+unsafe extern "C" fn native_log_callback(
+    level: whisper_rs::whisper_rs_sys::ggml_log_level,
+    _text: *const std::ffi::c_char,
+    _user_data: *mut std::ffi::c_void,
+) {
+    match level {
+        whisper_rs::whisper_rs_sys::ggml_log_level_GGML_LOG_LEVEL_WARN => {
+            NATIVE_WARNINGS.fetch_add(1, Ordering::Relaxed);
+        }
+        whisper_rs::whisper_rs_sys::ggml_log_level_GGML_LOG_LEVEL_ERROR => {
+            NATIVE_ERRORS.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+}
+
+fn install_native_diagnostics() {
+    NATIVE_LOG_INIT.call_once(|| {
+        // SAFETY: the static callback ignores pointers and only performs atomic operations.
+        // Both setters retain it for process lifetime; backend init reuses Whisper's callback.
+        unsafe {
+            whisper_rs::set_log_callback(Some(native_log_callback), std::ptr::null_mut());
+            whisper_rs::whisper_rs_sys::ggml_log_set(Some(native_log_callback), std::ptr::null_mut());
+        }
+    });
+}
+
+// Report outside FFI, where ordinary Rust logging is safe. Preserve severity and
+// counts without disclosing native text, including with verbose RUST_LOG.
+fn flush_native_diagnostics() {
+    let warnings = NATIVE_WARNINGS.swap(0, Ordering::Relaxed);
+    let errors = NATIVE_ERRORS.swap(0, Ordering::Relaxed);
+    if warnings > 0 { log::warn!("component=asr event=native_warning count={warnings}"); }
+    if errors > 0 { log::error!("component=asr event=native_error count={errors}"); }
+}
+
 pub struct Asr {
     /// One long-lived decode state, reused across every window. `full()` resets its internal
     /// buffers each call so windows do not bleed into each other; creating a fresh state per
@@ -34,11 +78,15 @@ pub struct Asr {
 
 impl Asr {
     pub fn load(model_path: &str) -> Result<Self> {
-        let ctx = WhisperContext::new_with_params(model_path, WhisperContextParameters::default())
-            .with_context(|| format!("load whisper model {model_path}"))?;
+        install_native_diagnostics();
+        let loaded = WhisperContext::new_with_params(model_path, WhisperContextParameters::default());
+        flush_native_diagnostics();
+        let ctx = loaded.with_context(|| format!("load whisper model {model_path}"))?;
         // Create the decode state once. `WhisperState` holds its own `Arc` to the inner context,
         // so it stays valid after `ctx` is dropped at the end of `load`.
-        let state = ctx.create_state().context("create whisper state")?;
+        let created = ctx.create_state();
+        flush_native_diagnostics();
+        let state = created.context("create whisper state")?;
         let threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
@@ -104,7 +152,9 @@ impl Asr {
         if token_timestamps {
             params.set_token_timestamps(true);
         }
-        self.state.full(params, audio_16k).context("whisper full()")?;
+        let decoded = self.state.full(params, audio_16k);
+        flush_native_diagnostics();
+        decoded.context("whisper full()")?;
         Ok(())
     }
 
@@ -142,6 +192,41 @@ impl Asr {
 mod tests {
     use super::*;
     use crate::{pipeline, resample};
+
+    #[test]
+    fn audit_f7_callback_privacy() {
+        const MARKER: &str = "SYNTHETIC_RELEASE_TEXT_MUST_NOT_LOG";
+        if std::env::var_os("MEETSCRIBE_TEST_NATIVE_LOG").is_some() {
+            crate::diagnostics::init();
+            install_native_diagnostics();
+            let text = std::ffi::CString::new(MARKER).unwrap();
+            for level in 0..=6 {
+                // SAFETY: the callback accepts this live C string and ignores its contents.
+                unsafe { native_log_callback(level, text.as_ptr(), std::ptr::null_mut()); }
+            }
+            // SAFETY: the adapter does not dereference either a null or invalid-encoding message.
+            unsafe {
+                native_log_callback(2, std::ptr::null(), std::ptr::null_mut());
+                native_log_callback(3, [0xffu8, 0].as_ptr().cast(), std::ptr::null_mut());
+            }
+            flush_native_diagnostics();
+            println!("{{\"event\":\"native_callback_ack\"}}");
+            return;
+        }
+        for filter in ["info", "debug"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "asr::tests::audit_f7_callback_privacy", "--nocapture"])
+                .env("MEETSCRIBE_TEST_NATIVE_LOG", filter).env("RUST_LOG", filter)
+                .output().unwrap();
+            assert!(output.status.success(), "native callback child failed: {output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("native_callback_ack"));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!stderr.contains(MARKER), "decoded token leaked at {filter}");
+            assert!(stderr.contains("native_warning"), "safe warning missing at {filter}");
+            assert!(stderr.contains("native_error"), "safe error missing at {filter}");
+        }
+        println!("{{\"event\":\"audit_case_complete\",\"case\":\"f7_callback\",\"log_levels\":2}}");
+    }
 
     /// Split on vs off must not change a single transcript byte. Decodes the audit's 30
     /// multi-speaker far-end chunks with `transcribe` and with `transcribe_words` (token

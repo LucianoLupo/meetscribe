@@ -16,7 +16,12 @@ You:     works for me
 
 > **Status:** v1, used daily by its author. Transcripts only — it doesn't write summaries.
 > Apple Silicon Macs. If something breaks, please open an issue and include your macOS
-> version and `~/.meetscribe/logs/meetscribe.err.log`.
+> version and `~/.meetscribe/logs/meetscribe.err.log`. Review logs for sensitive information
+> before sharing them.
+
+> **Development checkpoint:** this audit-hardening branch is work in progress, not a release.
+> Local automated checks do not establish live capture, upgrade or installation safety;
+> full audit closure and integration verification remain outstanding.
 
 ---
 

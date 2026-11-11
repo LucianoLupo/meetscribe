@@ -8,6 +8,17 @@
 //! toggle the `paused` flag, open folders, and stop the daemon. macOS requires the tray to live on
 //! the main thread, so everything happens inside the `tao` event loop callback.
 
+/// Shared by the actual menu action and model-free control tests; no raw process-control sink.
+fn stop_action(base: &std::path::Path, selected: Option<&crate::status::Instance>,
+    read: impl Fn(u32) -> Option<(u64, u64)>,
+    publish: impl FnOnce(&std::path::Path, &crate::status::Instance) -> std::io::Result<()>) -> std::io::Result<bool> {
+    crate::status::request_stop(base, selected, read, publish)
+}
+
+#[cfg(test)]
+#[path = "audit_control.rs"]
+mod audit_control;
+
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn run_tray(_argv: &[String]) -> anyhow::Result<()> {
     anyhow::bail!("`meetscribe tray` is macOS-only");
@@ -44,6 +55,7 @@ mod imp {
         Recording(String),
         Transcribing(String),
         Paused,
+        Attention(u64, u64),
     }
 
     enum UserEvent {
@@ -126,7 +138,7 @@ mod imp {
         stop_daemon: MenuItem,
         quit_tray: MenuItem,
         shown: Option<Display>,
-        last_pid: Option<u32>,
+        last_instance: Option<status::Instance>,
     }
 
     impl Ui {
@@ -164,14 +176,15 @@ mod imp {
                 stop_daemon,
                 quit_tray,
                 shown: None,
-                last_pid: None,
+                last_instance: None,
             })
         }
 
         /// Re-read status.json + liveness, update the icon (only on change) and the menu labels.
         fn refresh(&mut self, base: &Path) {
-            let (display, pid) = read_display(base);
-            self.last_pid = pid;
+            let (display, instance) = read_display(base);
+            self.last_instance = instance;
+            self.stop_daemon.set_enabled(self.last_instance.is_some());
 
             self.status_item.set_text(status_line(&display));
             match display {
@@ -179,7 +192,7 @@ mod imp {
                     self.pause_item.set_text("Resume");
                     self.pause_item.set_enabled(true);
                 }
-                Display::Idle | Display::Recording(_) | Display::Transcribing(_) => {
+                Display::Idle | Display::Recording(_) | Display::Transcribing(_) | Display::Attention(_, _) => {
                     self.pause_item.set_text("Pause");
                     self.pause_item.set_enabled(true);
                 }
@@ -209,22 +222,24 @@ mod imp {
                 open_path(if dir.exists() { &dir } else { base });
             } else if id == self.open_config.id() {
                 open_path(&crate::config::config_path(base));
-            } else if id == self.stop_daemon.id() {
-                stop_daemon(self.last_pid);
+            } else if id == self.stop_daemon.id()
+                && let Err(error) = super::stop_action(base, self.last_instance.as_ref(), status::process_start, status::write_stop) {
+                log::warn!("component=control event=stop_request_failed error={error}");
             }
             ClickResult::Continue
         }
     }
 
     /// Read status.json and confirm the daemon pid is actually alive.
-    fn read_display(base: &Path) -> (Display, Option<u32>) {
+    fn read_display(base: &Path) -> (Display, Option<status::Instance>) {
         match status::Status::read(base) {
             None => (Display::Down, None),
             Some(s) => {
-                if !pid_alive(s.pid) {
-                    return (Display::Down, Some(s.pid));
-                }
+                let Some(instance) = s.instance.filter(|instance| instance.pid == s.pid && instance.live(status::process_start)) else {
+                    return (Display::Down, None);
+                };
                 let d = match s.state {
+                    DaemonState::Idle if s.pending > 0 || s.attention > 0 => Display::Attention(s.pending, s.attention),
                     DaemonState::Idle => Display::Idle,
                     DaemonState::Paused => Display::Paused,
                     DaemonState::Recording => {
@@ -234,7 +249,7 @@ mod imp {
                         Display::Transcribing(s.app.unwrap_or_else(|| "meeting".to_string()))
                     }
                 };
-                (d, Some(s.pid))
+                (d, Some(instance))
             }
         }
     }
@@ -246,6 +261,7 @@ mod imp {
             Display::Recording(app) => format!("meetscribe: ● recording — {app}"),
             Display::Transcribing(app) => format!("meetscribe: ◐ transcribing — {app}"),
             Display::Paused => "meetscribe: paused".to_string(),
+            Display::Attention(pending, attention) => format!("meetscribe: {pending} pending archive; {attention} need attention"),
         }
     }
 
@@ -257,7 +273,7 @@ mod imp {
             Display::Idle => (60, 180, 90),
             Display::Recording(_) => (220, 55, 50),
             Display::Transcribing(_) => (60, 130, 220),
-            Display::Paused => (230, 170, 40),
+            Display::Paused | Display::Attention(_, _) => (230, 170, 40),
         };
         let (w, h) = (22u32, 22u32);
         let (cx, cy, r) = (10.5f32, 10.5f32, 8.0f32);
@@ -278,12 +294,6 @@ mod imp {
             }
         }
         Icon::from_rgba(rgba, w, h).expect("valid 22x22 rgba icon")
-    }
-
-    fn pid_alive(pid: u32) -> bool {
-        // kill(pid, 0) == 0 → the process exists and we can signal it (same user).
-        // SAFETY: kill with signal 0 performs only an existence/permission check.
-        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
     }
 
     fn toggle_pause(base: &Path) {
@@ -307,20 +317,4 @@ mod imp {
         }
     }
 
-    /// Stop the daemon: bootout the LaunchAgent (the launchd-managed case), and SIGTERM the last
-    /// known pid as a fallback for a manually-started daemon. Both best-effort.
-    fn stop_daemon(pid: Option<u32>) {
-        let uid = unsafe { libc::getuid() };
-        let target = format!("gui/{uid}/{}", crate::launchd::LABEL);
-        let _ = Command::new(crate::launchd::LAUNCHCTL).args(["bootout", &target]).status();
-        if let Some(pid) = pid
-            && pid_alive(pid)
-        {
-            // SAFETY: sending SIGTERM to a pid we own is safe; the daemon finalizes cleanly.
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGTERM);
-            }
-        }
-        log::info!("tray: requested daemon stop ({target})");
-    }
 }

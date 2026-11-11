@@ -36,6 +36,7 @@ pub(crate) fn run_capture(
     out_dir: &Path,
     mut stop: impl FnMut() -> bool,
     rebuild_after: Option<u64>,
+    mut managed: Option<&mut crate::recovery::Session>,
 ) -> Result<CaptureSummary> {
     std::fs::create_dir_all(out_dir)
         .with_context(|| format!("create output dir {}", out_dir.display()))?;
@@ -63,6 +64,7 @@ pub(crate) fn run_capture(
     log::info!("aggregate rate = {rate} Hz (both channels)");
 
     let mut segment: u32 = 0;
+    if let Some(session) = managed.as_deref_mut() { session.start_roll(0, rate, 0.0)?; }
     let mut mic_path = segment_path(out_dir, "mic", segment);
     let mut sys_path = segment_path(out_dir, "system", segment);
     let mut mic_w = WavStream::create(&mic_path, rate).context("open mic.wav")?;
@@ -87,13 +89,20 @@ pub(crate) fn run_capture(
     // Small per-drain scratch buffers (reused) — only a ring's-worth is ever resident.
     let mut mic_raw: Vec<f32> = Vec::new();
     let mut tap_raw: Vec<f32> = Vec::new();
+    let mut last_checkpoint = Instant::now();
 
     loop {
         mic_raw.clear();
         tap_raw.clear();
         cap.drain_into(&mut mic_raw, &mut tap_raw);
-        mic_w.write(&mic_raw, cap.observed_mic_channels());
-        sys_w.write(&tap_raw, cap.observed_tap_channels());
+        mic_w.write(&mic_raw, cap.observed_mic_channels())?;
+        sys_w.write(&tap_raw, cap.observed_tap_channels())?;
+        if last_checkpoint.elapsed() >= Duration::from_secs(2) {
+            let mic_frames = mic_w.checkpoint()?;
+            let system_frames = sys_w.checkpoint()?;
+            if let Some(session) = managed.as_deref_mut() { session.checkpoint(segment, mic_frames, system_frames)?; }
+            last_checkpoint = Instant::now();
+        }
 
         // Mic-dry watchdog. The mic delivers frames continuously once the device has started,
         // even during system silence, so a dry mic = a dropped input route. Gated on the device
@@ -138,8 +147,8 @@ pub(crate) fn run_capture(
             mic_raw.clear();
             tap_raw.clear();
             cap.drain_into(&mut mic_raw, &mut tap_raw);
-            mic_w.write(&mic_raw, cap.observed_mic_channels());
-            sys_w.write(&tap_raw, cap.observed_tap_channels());
+            mic_w.write(&mic_raw, cap.observed_mic_channels())?;
+            sys_w.write(&tap_raw, cap.observed_tap_channels())?;
 
             let mic_before = mic_w.written();
             let sys_before = sys_w.written();
@@ -165,6 +174,12 @@ pub(crate) fn run_capture(
                     mic_last_seen = Instant::now(); // fresh watchdog window for the new device
 
                     if out.rate_changed {
+                        let mic_frames = mic_w.checkpoint()?;
+                        let system_frames = sys_w.checkpoint()?;
+                        if let Some(session) = managed.as_deref_mut() {
+                            session.checkpoint(segment, mic_frames, system_frames)?;
+                            session.start_roll(segment + 1, out.actual_rate, out.gap_frames as f64 / out.actual_rate as f64)?;
+                        }
                         // The new device couldn't hold the original rate → the fixed-header WAV
                         // can't continue. Finalize the current segment, roll to a fresh pair at
                         // the new rate, and record the boundary + gap in the manifest.
@@ -219,8 +234,8 @@ pub(crate) fn run_capture(
                         // BOTH channels with equal silence for the gap.
                         mic_w.reset_channels();
                         sys_w.reset_channels();
-                        mic_w.write_silence(out.gap_frames);
-                        sys_w.write_silence(out.gap_frames);
+                        mic_w.write_silence(out.gap_frames)?;
+                        sys_w.write_silence(out.gap_frames)?;
                         log::info!(
                             "GAP MARKER rebuild #{rebuilds}: padded {} silence frames into both \
                              channels at ~{rate} Hz (mic {mic_before}→{}, system {sys_before}→{})",
@@ -242,8 +257,8 @@ pub(crate) fn run_capture(
     mic_raw.clear();
     tap_raw.clear();
     cap.drain_into(&mut mic_raw, &mut tap_raw);
-    mic_w.write(&mic_raw, cap.observed_mic_channels());
-    sys_w.write(&tap_raw, cap.observed_tap_channels());
+    mic_w.write(&mic_raw, cap.observed_mic_channels())?;
+    sys_w.write(&tap_raw, cap.observed_tap_channels())?;
 
     let duration_secs = started_at.elapsed().as_secs_f64();
     let mic_ch = cap.observed_mic_channels();
@@ -269,6 +284,9 @@ pub(crate) fn run_capture(
         );
     }
 
+    let mic_frames = mic_w.checkpoint()?;
+    let system_frames = sys_w.checkpoint()?;
+    if let Some(session) = managed { session.checkpoint(segment, mic_frames, system_frames)?; }
     let (mic_n, mic_rms, mic_peak) = mic_w.finalize().context("finalize mic.wav")?;
     let (sys_n, sys_rms, sys_peak) = sys_w.finalize().context("finalize system.wav")?;
     report("mic.wav    (You)   ", &mic_path, mic_n, mic_rms, mic_peak, rate);
@@ -315,9 +333,9 @@ impl WavStream {
 
     /// Append a freshly-drained interleaved chunk; write every complete mono frame, keep the
     /// remainder. `observed_channels` latches on the first non-zero value (fixed per device).
-    fn write(&mut self, interleaved: &[f32], observed_channels: u32) {
+    fn write(&mut self, interleaved: &[f32], observed_channels: u32) -> Result<()> {
         if interleaved.is_empty() {
-            return;
+            return Ok(());
         }
         if self.channels == 0 && observed_channels > 0 {
             self.channels = observed_channels as usize;
@@ -327,12 +345,19 @@ impl WavStream {
         let full = self.pending.len() - self.pending.len() % ch;
         for frame in self.pending[..full].chunks_exact(ch) {
             let mono = frame.iter().sum::<f32>() / ch as f32;
-            let _ = self.writer.write_sample(mono);
+            self.writer.write_sample(mono).context("write capture sample")?;
             self.written += 1;
             self.sum_sq += mono as f64 * mono as f64;
             self.peak = self.peak.max(mono.abs());
         }
         self.pending.drain(..full);
+        Ok(())
+    }
+
+    /// Publish a readable prefix without finalizing or moving the write cursor.
+    fn checkpoint(&mut self) -> Result<usize> {
+        self.writer.flush().context("checkpoint capture WAV")?;
+        Ok(self.written)
     }
 
     /// Forget the latched channel count so the next `write` re-latches from the (possibly new)
@@ -346,11 +371,12 @@ impl WavStream {
 
     /// Write `frames` mono zero-samples — used to pad a rebuild gap equally into both channels so
     /// they stay aligned to each other.
-    fn write_silence(&mut self, frames: usize) {
+    fn write_silence(&mut self, frames: usize) -> Result<()> {
         for _ in 0..frames {
-            let _ = self.writer.write_sample(0.0f32);
+            self.writer.write_sample(0.0f32).context("write capture silence")?;
             self.written += 1;
         }
+        Ok(())
     }
 
     /// Mono samples written to this segment so far.
@@ -407,4 +433,52 @@ fn report(label: &str, path: &Path, n: usize, rms: f32, peak: f32, rate: u32) {
         "{label}: {n} samples, {secs:.1}s, RMS={rms:.5}, peak={peak:.5} → {verdict}  [{}]",
         path.display()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audit_f1_checkpoint_recovery() {
+        const FRAMES: usize = 48_000;
+        if let Some(dir) = std::env::var_os("MEETSCRIBE_TEST_CHECKPOINT_DIR") {
+            let dir = PathBuf::from(dir);
+            let mut mic = WavStream::create(&dir.join("mic.wav"), 16_000).unwrap();
+            let mut system = WavStream::create(&dir.join("system.wav"), 16_000).unwrap();
+            mic.write(&vec![0.25; FRAMES], 1).unwrap();
+            system.write(&vec![-0.5; FRAMES], 1).unwrap();
+            assert_eq!(mic.checkpoint().unwrap(), FRAMES);
+            assert_eq!(system.checkpoint().unwrap(), FRAMES);
+            println!("{{\"event\":\"checkpoint_ack\",\"frames\":{FRAMES}}}");
+            // The acknowledged checkpoint must survive without running either destructor.
+            std::process::exit(0);
+        }
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        for iteration in 0..5 {
+            let dir = std::env::temp_dir().join(format!(
+                "meetscribe-checkpoint-{}-{nonce}-{iteration}", std::process::id()
+            ));
+            std::fs::create_dir(&dir).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "session::tests::audit_f1_checkpoint_recovery", "--nocapture"])
+                .env("MEETSCRIBE_TEST_CHECKPOINT_DIR", &dir)
+                .env("HOME", &dir)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "checkpoint child failed: {output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("checkpoint_ack"));
+            for (channel, expected) in [("mic", 0.25f32), ("system", -0.5f32)] {
+                let reader = hound::WavReader::open(dir.join(format!("{channel}.wav"))).unwrap();
+                assert_eq!(reader.len() as usize, FRAMES, "{channel}, iteration {iteration}");
+                assert!(reader.into_samples::<f32>().all(|sample| sample.unwrap() == expected));
+            }
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        println!("{{\"event\":\"audit_case_complete\",\"case\":\"f1_checkpoint\",\"iterations\":5}}");
+    }
 }

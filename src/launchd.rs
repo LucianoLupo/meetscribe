@@ -10,6 +10,11 @@ use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
+#[path = "provision.rs"]
+mod provisioning;
+#[cfg(test)]
+#[path = "audit_provision.rs"]
+mod audit_provision;
 
 /// FROZEN, permanently. The bundle-id binds the TCC grant (microphone + system audio) and
 /// is also the launchd label, the plist filename, and the `codesign --identifier`.
@@ -281,31 +286,25 @@ fn plist_contents(dest_bin: &Path, home: &Path, out_log: &Path, err_log: &Path) 
 
 /// Provision the model at the daemon's absolute path — a symlink to the repo model by default
 /// (avoids duplicating 2.9 GB), or a full copy with `--copy` (repo-independent install).
+#[cfg(test)]
 fn provision_model(src: &Path, dest: &Path, copy: bool) -> Result<()> {
-    // Replace any stale symlink/file at dest.
-    if std::fs::symlink_metadata(dest).is_ok() {
-        std::fs::remove_file(dest).with_context(|| format!("remove stale {}", dest.display()))?;
-    }
-    if copy {
-        std::fs::copy(src, dest)
-            .with_context(|| format!("copy model {} → {}", src.display(), dest.display()))?;
-        log::info!("model copied → {}", dest.display());
-    } else {
-        std::os::unix::fs::symlink(src, dest)
-            .with_context(|| format!("symlink model {} → {}", src.display(), dest.display()))?;
-        log::info!("model symlinked {} → {}", dest.display(), src.display());
-    }
-    Ok(())
+    provisioning::ModelStage::prepare(src, dest, copy)?.publish()
+}
+
+struct DiarizerStage { model: provisioning::ModelStage, runtime: provisioning::RuntimeStage }
+impl DiarizerStage {
+    fn publish(self) -> Result<()> { self.runtime.publish()?; self.model.publish() }
 }
 
 /// Install step 3c — the far-end diarizer. The model is provisioned like the others (symlink, or
 /// copy with `--copy`); the runtime's directory is always COPIED, never symlinked, because the
 /// executable finds its dylibs through `@executable_path`. Missing sources warn and install
 /// nothing: the daemon then transcribes without splitting (fail-open).
+#[cfg(test)]
 fn install_diarizer(model_src: &Path, bin_src: &Path, base: &Path, copy_model: bool) -> Result<()> {
     let model_dest = base.join(crate::DIARIZER_MODEL_REL);
     let bin_dest = base.join(crate::DIARIZER_BIN_REL);
-    let (Ok(model_abs), Ok(bin_abs)) = (std::fs::canonicalize(model_src), std::fs::canonicalize(bin_src)) else {
+    let (Ok(_), Ok(bin_abs)) = (std::fs::canonicalize(model_src), std::fs::canonicalize(bin_src)) else {
         log::warn!(
             "diarizer {} / {} not found — daemon will transcribe but NOT split far-end voices until \
              both are installed (run `bash models/provision.sh` and `bash models/build-diarizer.sh`, \
@@ -315,27 +314,48 @@ fn install_diarizer(model_src: &Path, bin_src: &Path, base: &Path, copy_model: b
         );
         return Ok(());
     };
-    let model_dir = model_dest.parent().expect("diarizer model path has a parent");
-    std::fs::create_dir_all(model_dir).with_context(|| format!("create {}", model_dir.display()))?;
-    provision_model(&model_abs, &model_dest, copy_model)?;
+    let model = provisioning::ModelStage::prepare(model_src, &model_dest, copy_model)?;
+    let source = bin_abs.parent().context("diarizer binary has no parent dir")?;
+    let target = bin_dest.parent().expect("diarizer bin path has a parent");
+    let runtime = provisioning::RuntimeStage::prepare(source, target)?;
+    DiarizerStage { model, runtime }.publish()
+}
 
-    let src_dir = bin_abs.parent().context("diarizer binary has no parent dir")?;
-    let dest_dir = bin_dest.parent().expect("diarizer bin path has a parent");
-    // Replace the whole directory so no stale dylib from an older build survives.
-    if std::fs::symlink_metadata(dest_dir).is_ok() {
-        std::fs::remove_dir_all(dest_dir).with_context(|| format!("remove stale {}", dest_dir.display()))?;
+struct Sources<'a> { model: &'a Path, speaker: &'a Path, diarizer_model: &'a Path, diarizer_bin: &'a Path }
+struct Assets { model: provisioning::ModelStage, speaker: Option<provisioning::ModelStage>, diarizer: Option<DiarizerStage> }
+impl Assets {
+    fn publish(self) -> Result<()> {
+        self.model.publish()?;
+        if let Some(speaker) = self.speaker { speaker.publish()?; }
+        if let Some(diarizer) = self.diarizer { diarizer.publish()?; }
+        Ok(())
     }
-    std::fs::create_dir_all(dest_dir).with_context(|| format!("create {}", dest_dir.display()))?;
-    for entry in std::fs::read_dir(src_dir).with_context(|| format!("read {}", src_dir.display()))? {
-        let path = entry?.path();
-        if path.is_file() {
-            let to = dest_dir.join(path.file_name().expect("file has a name"));
-            std::fs::copy(&path, &to).with_context(|| format!("copy {} → {}", path.display(), to.display()))?;
-        }
-    }
-    anyhow::ensure!(bin_dest.is_file(), "diarizer binary missing after copy: {}", bin_dest.display());
-    log::info!("diarizer installed → {} (+ model {})", dest_dir.display(), model_dest.display());
-    Ok(())
+}
+
+/// Shared installer stop seam: validate and stage every source before invoking the sink.
+fn prepare_then_stop(base: &Path, sources: Sources<'_>, copy: bool, stop: impl FnOnce() -> Result<()>) -> Result<Assets> {
+    prepare_then_stop_with(base, sources, copy, &mut |source, target, copy| provisioning::ModelStage::prepare(source, target, copy), stop)
+}
+fn prepare_then_stop_with(base: &Path, sources: Sources<'_>, copy: bool,
+    prepare_model: &mut impl FnMut(&Path, &Path, bool) -> Result<provisioning::ModelStage>,
+    stop: impl FnOnce() -> Result<()>) -> Result<Assets> {
+    let runtime_target = base.join(crate::DIARIZER_BIN_REL);
+    provisioning::RuntimeStage::reconcile(runtime_target.parent().unwrap(), &mut |from, to| std::fs::rename(from, to))?;
+    let model = prepare_model(sources.model, &base.join("models/ggml-large-v3.bin"), copy)?;
+    let speaker = if sources.speaker.exists() {
+        Some(provisioning::ModelStage::prepare(sources.speaker, &base.join(crate::SPEAKER_MODEL_REL), copy)?)
+    } else { log::warn!("optional speaker model absent; installed artifact preserved"); None };
+    let diarizer = match (std::fs::canonicalize(sources.diarizer_model), std::fs::canonicalize(sources.diarizer_bin)) {
+        (Ok(_), Ok(binary)) => Some(DiarizerStage {
+            model: provisioning::ModelStage::prepare(sources.diarizer_model, &base.join(crate::DIARIZER_MODEL_REL), copy)?,
+            runtime: provisioning::RuntimeStage::prepare(binary.parent().context("diarizer binary has no parent")?,
+                base.join(crate::DIARIZER_BIN_REL).parent().unwrap())?,
+        }),
+        _ => { log::warn!("optional diarizer absent; installed artifacts preserved"); None }
+    };
+    let assets = Assets { model, speaker, diarizer };
+    stop()?;
+    Ok(assets)
 }
 
 /// `meetscribe install [--model <ggml.bin>] [--copy]` — install + load the login LaunchAgent.
@@ -455,16 +475,18 @@ pub(crate) fn run_install(argv: &[String]) -> Result<()> {
         return Err(e);
     }
 
-    // 2. Only now stop any running instance, then swap the verified binary in atomically
-    //    (`rename` within one directory keeps the signature and never exposes a partial file).
-    let _ = Command::new(LAUNCHCTL)
-        .args(["bootout", &format!("gui/{}/{LABEL}", uid())])
-        .status();
-    // `bootout` is asynchronous: wait for the old daemon to finish its clean shutdown, or the
-    // bootstrap in step 5 races it and fails.
-    if !wait_until(agent_unloaded, Duration::from_secs(30), Duration::from_millis(250)) {
-        log::warn!("{LABEL} still loaded 30s after bootout — continuing; step 5 retries the load");
-    }
+    // 2. Prepare all artifacts before the only agent-stop seam. A failed source/copy leaves
+    // both the running agent and its installed artifacts untouched.
+    let assets = match prepare_then_stop(&base, Sources { model: &model_src, speaker: &speaker_src,
+        diarizer_model: &diarizer_model_src, diarizer_bin: &diarizer_bin_src }, copy_model, || {
+        let _ = Command::new(LAUNCHCTL).args(["bootout", &format!("gui/{}/{LABEL}", uid())]).status();
+        anyhow::ensure!(wait_until(agent_unloaded, Duration::from_secs(30), Duration::from_millis(250)),
+            "agent still loaded; replacement artifacts must not be published or bootstrapped");
+        Ok(())
+    }) {
+        Ok(assets) => assets,
+        Err(error) => { let _ = std::fs::remove_file(&staged); return Err(error); }
+    };
     if let Err(e) = std::fs::rename(&staged, &dest_bin) {
         let _ = std::fs::remove_file(&staged);
         bail!(
@@ -478,34 +500,9 @@ pub(crate) fn run_install(argv: &[String]) -> Result<()> {
     }
     log::info!("installed binary → {} (re-signed + verified)", dest_bin.display());
 
-    // 3. Provision the model at the daemon's absolute path.
-    match std::fs::canonicalize(&model_src) {
-        Ok(abs) => provision_model(&abs, &models_dir.join("ggml-large-v3.bin"), copy_model)?,
-        Err(_) => log::warn!(
-            "model {} not found — daemon will CAPTURE but not transcribe until a model is placed \
-             at {} (re-run install with --model <path>)",
-            model_src.display(),
-            models_dir.join("ggml-large-v3.bin").display()
-        ),
-    }
-
-    // 3b. Same for the speaker-embedding model — warn, never fail: the daemon transcribes without
-    //     speaker identity until it is provisioned.
-    match std::fs::canonicalize(&speaker_src) {
-        Ok(abs) => provision_model(&abs, &speaker_dest, copy_model)?,
-        Err(_) => log::warn!(
-            "speaker model {} not found — daemon will transcribe but NOT identify far-end voices \
-             until it is placed at {} (run `bash models/provision.sh`, then re-run install)",
-            speaker_src.display(),
-            speaker_dest.display()
-        ),
-    }
-
-    // 3c. The far-end diarizer (split-then-name) — warn, never fail: without it the daemon
-    //     transcribes exactly as before, just without splitting far-end chunks.
-    if let Err(e) = install_diarizer(&diarizer_model_src, &diarizer_bin_src, &base, copy_model) {
-        log::warn!("diarizer not installed ({e:#}) — daemon will transcribe without splitting");
-    }
+    // 3. Publish validated stages; any error returns before bootstrap. This is not an
+    // all-artifact transaction. Runtime backups and its private recovery journal are retained.
+    assets.publish()?;
 
     // 4. Write the plist (absolute paths + pinned HOME).
     let plist = plist_contents(&dest_bin, &home, &out_log, &err_log);

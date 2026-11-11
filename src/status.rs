@@ -38,8 +38,79 @@ pub struct Status {
     pub since_epoch: i64,
     /// Unix epoch of this write (lets a reader spot a stale file).
     pub updated_epoch: i64,
-    /// Daemon pid — the tray checks it for liveness and to signal Quit.
+    /// Legacy wire field. Never a signaling authority.
     pub pid: u32,
+    #[serde(default)]
+    pub instance: Option<Instance>,
+    #[serde(default)]
+    pub pending: u64,
+    #[serde(default)]
+    pub attention: u64,
+}
+
+/// One daemon lifetime, not merely a recyclable process ID.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Instance {
+    pub pid: u32,
+    pub start_seconds: u64,
+    pub start_micros: u64,
+    pub nonce: String,
+}
+
+impl Instance {
+    pub fn current() -> Option<Self> {
+        let pid = std::process::id();
+        let (start_seconds, start_micros) = process_start(pid)?;
+        Some(Self { pid, start_seconds, start_micros, nonce: crate::recovery::new_identity() })
+    }
+    fn valid(&self) -> bool {
+        (2..=i32::MAX as u32).contains(&self.pid) && self.start_seconds > 0 && self.start_micros < 1_000_000
+            && self.nonce.len() == 32 && self.nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }
+    pub fn live(&self, read: impl Fn(u32) -> Option<(u64, u64)>) -> bool {
+        self.valid() && read(self.pid) == Some((self.start_seconds, self.start_micros))
+    }
+}
+
+/// A failed/short kernel read is unknown, never evidence that a PID belongs to this daemon.
+#[cfg(target_os = "macos")]
+pub fn process_start(pid: u32) -> Option<(u64, u64)> {
+    if !(2..=i32::MAX as u32).contains(&pid) { return None; }
+    // SAFETY: zero is valid for this C integer/array struct; the syscall receives its exact size.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of_val(&info) as i32;
+    // SAFETY: info is writable for size bytes, and pid was range-checked before the signed cast.
+    let got = unsafe { libc::proc_pidinfo(pid as i32, libc::PROC_PIDTBSDINFO, 0,
+        std::ptr::from_mut(&mut info).cast(), size) };
+    if got != size || info.pbi_pid != pid || info.pbi_start_tvsec == 0 || info.pbi_start_tvusec >= 1_000_000 { return None; }
+    Some((info.pbi_start_tvsec, info.pbi_start_tvusec))
+}
+#[cfg(not(target_os = "macos"))]
+pub fn process_start(_pid: u32) -> Option<(u64, u64)> { None }
+
+pub fn write_stop(path: &Path, selected: &Instance) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| std::io::Error::other("control target has no parent"))?;
+    crate::recovery::private_dir(parent).map_err(std::io::Error::other)?;
+    crate::recovery::atomic_json(path, selected).map_err(std::io::Error::other)
+}
+
+/// Revalidate the displayed selection; only ever address that selection. No signal/launchctl fallback.
+pub fn request_stop(
+    base: &Path, selected: Option<&Instance>, read: impl Fn(u32) -> Option<(u64, u64)>,
+    publish: impl FnOnce(&Path, &Instance) -> std::io::Result<()>,
+) -> std::io::Result<bool> {
+    let Some(selected) = selected else { return Ok(false); };
+    let Some(current) = Status::read(base) else { return Ok(false); };
+    if current.pid != selected.pid || current.instance.as_ref() != Some(selected) || !selected.live(read) { return Ok(false); }
+    publish(&base.join("control").join(format!("stop-{}.json", selected.nonce)), selected)?;
+    log::info!(target: "meetscribe::event", "{}", serde_json::json!({"component":"control", "event":"stop_requested", "instance_id":selected.nonce, "outcome":"ok"}));
+    Ok(true)
+}
+
+pub fn stop_requested(base: &Path, own: &Instance) -> bool {
+    if !own.valid() { return false; }
+    let path = base.join("control").join(format!("stop-{}.json", own.nonce));
+    std::fs::read(path).ok().and_then(|bytes| serde_json::from_slice::<Instance>(&bytes).ok()).as_ref() == Some(own)
 }
 
 #[must_use]
@@ -61,10 +132,7 @@ pub fn is_paused(base: &Path) -> bool {
 impl Status {
     /// Write `status.json` atomically (temp + rename) so a reader never sees a half-written file.
     pub fn write(&self, base: &Path) -> std::io::Result<()> {
-        let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        let tmp = base.join(".status.json.tmp");
-        std::fs::write(&tmp, json)?;
-        std::fs::rename(&tmp, status_path(base))
+        crate::recovery::atomic_json(&status_path(base), self).map_err(std::io::Error::other)
     }
 
     /// Read `status.json`, or `None` if it is absent/unreadable/corrupt (the tray then shows a
@@ -144,6 +212,7 @@ mod tests {
             since_epoch: 1_700_000_000,
             updated_epoch: 1_700_000_005,
             pid: 4242,
+            instance: None, pending: 0, attention: 0,
         };
         s.write(&tmp).unwrap();
         assert_eq!(Status::read(&tmp), Some(s));
@@ -164,6 +233,7 @@ mod tests {
             since_epoch: 1_700_000_000,
             updated_epoch: 1_700_000_000,
             pid: 4242,
+            instance: None, pending: 0, attention: 0,
         };
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains(r#""state":"transcribing""#), "unexpected wire form: {json}");
@@ -181,7 +251,7 @@ mod tests {
             (DaemonState::Idle, false),
             (DaemonState::Paused, false),
         ] {
-            let s = Status { state, app: None, since_epoch: 1, updated_epoch: 1, pid: 1 };
+            let s = Status { state, app: None, since_epoch: 1, updated_epoch: 1, pid: 1, instance: None, pending: 0, attention: 0 };
             s.write(&tmp).unwrap();
             assert_eq!(call_is_live(&tmp), live, "{state:?}");
         }
