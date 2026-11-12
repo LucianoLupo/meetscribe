@@ -6,7 +6,7 @@ and so is being told the design is wrong.
 ## Before you can build
 
 Setup, the certificate requirement, and the install loop are in the
-[README](README.md#requirements). The rebuild → re-sign → reinstall cycle and every launchd
+[README](README.md#before-you-start-you-need). The rebuild → re-sign → reinstall cycle and every launchd
 operation live in [`docs/DAEMON.md`](docs/DAEMON.md).
 
 Those are the single source for that recipe and this file deliberately does not repeat it —
@@ -15,15 +15,22 @@ than a cosmetic one.
 
 ## The gate
 
-Both must pass before a PR is ready. CI runs exactly these on `macos-latest`:
+All must pass before a PR is ready. CI runs these on `macos-latest`:
 
 ```bash
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+python3 tests/hardening_gate.py --self-test
+python3 tests/hardening_gate.py --out "$RUNNER_TEMP/meetscribe-hardening"
 ```
 
+The mandatory gate requires per-scenario completion receipts; a successful Cargo exit with
+missing or unexecuted scenarios is not sufficient. For local runs, use a new disposable
+output directory instead of the CI-specific `$RUNNER_TEMP` path. The opt-in real-model
+privacy matrix in `tests/f7_native_privacy.py` is separate and is not counted as CI coverage.
+
 A second CI job pins the toolchain to the declared MSRV (`rust-version` in `Cargo.toml`) and
-runs `cargo check`. If you add a dependency that raises the floor, raise `rust-version` in
+runs `cargo check --locked --all-targets`. If you add a dependency that raises the floor, raise `rust-version` in
 the same PR — `@stable` will not catch it, but that job will.
 
 **Keep the test suite pure.** Nothing in it may require audio hardware, a TCC grant, a

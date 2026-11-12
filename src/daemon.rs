@@ -84,6 +84,7 @@ fn acquire_single_instance_lock(base: &Path) -> Result<std::fs::File> {
     Ok(f)
 }
 
+#[derive(Clone)]
 struct DaemonConfig {
     base: PathBuf,
     sessions_dir: PathBuf,
@@ -253,13 +254,22 @@ pub(crate) fn run_daemon(argv: &[String]) -> Result<()> {
     // state the flag file dictates (so a daemon (re)started while paused stays paused).
     let mut was_paused = status::is_paused(&cfg.base);
     let board = Arc::new(StatusBoard::new(cfg.base.clone()));
+    anyhow::ensure!(board.instance.is_some(), "daemon: cannot verify its process start identity");
     board.update(|a| a.paused = was_paused);
+    board.refresh_counts(&cfg.sessions_dir);
     // Transcription runs in a child process of this very binary (`meetscribe transcribe`).
     let exe = std::env::current_exe().context("daemon: cannot resolve its own executable")?;
     let child_base = cfg.base.clone();
-    let (jobs, transcriber) =
-        spawn_transcriber(Arc::clone(&board), move |job| run_transcribe_job(job, &exe, &child_base))
-        .context("daemon: could not start the transcription worker")?;
+    let recovery_cfg = cfg.clone();
+    let finished_board = Arc::clone(&board);
+    let scan_board = Arc::clone(&board);
+    let finished_sessions = cfg.sessions_dir.clone();
+    let (jobs, transcriber) = spawn_transcriber(
+        Arc::clone(&board),
+        move |job| { run_transcribe_job(job, &exe, &child_base); finished_board.refresh_counts(&finished_sessions); },
+        move || { scan_board.refresh_counts(&recovery_cfg.sessions_dir); pending_sessions(&recovery_cfg.sessions_dir).into_iter()
+            .map(|(dir, label, title)| job_for(&recovery_cfg, dir, label, title)).collect() },
+    ).context("daemon: could not start the transcription worker")?;
     for (dir, label, title) in pending_sessions(&cfg.sessions_dir) {
         log::info!("resuming a transcription the last run did not reach: {}", dir.display());
         queue_job(&jobs, job_for(&cfg, dir, label, title));
@@ -268,7 +278,7 @@ pub(crate) fn run_daemon(argv: &[String]) -> Result<()> {
     // Consecutive capture-start failures for the currently-detected app — throttles the error log
     // and backs off, so a persistently-denied grant doesn't spin+spam at the poll rate.
     let mut capture_fail_streak = 0u32;
-    while !SHUTDOWN.load(Ordering::SeqCst) {
+    while !board.stopping() {
         if last_maintenance.elapsed() >= MAINTENANCE_INTERVAL {
             run_maintenance(&cfg);
             last_maintenance = Instant::now();
@@ -289,14 +299,14 @@ pub(crate) fn run_daemon(argv: &[String]) -> Result<()> {
             board.update(|a| a.paused = paused_now);
         }
         if paused_now {
-            sleep_interruptible(POLL_INTERVAL);
+            sleep_interruptible(POLL_INTERVAL, &board);
             continue;
         }
 
         match detector.active_app() {
             Ok(Some(app)) => {
                 board.update(|a| a.recording = Some(detect::app_label(&app).to_string()));
-                let recorded = record_and_queue(&cfg, &app, &jobs);
+                let recorded = record_and_queue(&cfg, &app, &jobs, &board);
                 board.update(|a| a.recording = None);
                 match recorded {
                     Ok(()) => {
@@ -313,7 +323,7 @@ pub(crate) fn run_daemon(argv: &[String]) -> Result<()> {
                         }
                         let backoff = (POLL_INTERVAL * capture_fail_streak.min(20))
                             .min(Duration::from_secs(30));
-                        sleep_interruptible(backoff);
+                        sleep_interruptible(backoff, &board);
                         continue;
                     }
                 }
@@ -322,7 +332,7 @@ pub(crate) fn run_daemon(argv: &[String]) -> Result<()> {
             Err(e) => log::warn!("detector poll failed (transient): {e}"),
         }
         // Interruptible idle wait.
-        sleep_interruptible(POLL_INTERVAL);
+        sleep_interruptible(POLL_INTERVAL, &board);
     }
 
     // Closing the queue lets the worker finish the job in hand (it skips queued ones on shutdown —
@@ -344,6 +354,8 @@ struct Activity {
     /// App label of the meeting whisper is working on.
     transcribing: Option<String>,
     paused: bool,
+    pending: u64,
+    attention: u64,
 }
 
 impl Activity {
@@ -368,44 +380,83 @@ type Shown = (status::DaemonState, Option<String>);
 /// The [`Activity`] plus what was last written to `status.json`, shared by the capture loop and the
 /// worker. The file is rewritten only when the shown state changes, so `since_epoch` keeps meaning
 /// "since this state began" and the file does not churn each poll.
+type Published = (Shown, u64, u64);
 struct StatusBoard {
     base: PathBuf,
-    inner: Mutex<(Activity, Option<Shown>)>,
+    instance: Option<status::Instance>,
+    inner: Mutex<(Activity, Option<Published>, i64)>,
 }
 
 impl StatusBoard {
     fn new(base: PathBuf) -> Self {
         Self {
             base,
-            inner: Mutex::new((Activity::default(), None)),
+            instance: status::Instance::current(),
+            inner: Mutex::new((Activity::default(), None, 0)),
         }
     }
 
     fn update(&self, change: impl FnOnce(&mut Activity)) {
         // A poisoned lock only means another thread panicked mid-update; the data is still usable.
         let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        let (activity, last) = &mut *guard;
+        let (activity, last, since) = &mut *guard;
         change(activity);
         let shown = activity.shown();
-        if last.as_ref() != Some(&shown) {
-            write_status(&self.base, shown.0, shown.1.clone());
-            *last = Some(shown);
+        let published = (shown.clone(), activity.pending, activity.attention);
+        if last.as_ref() != Some(&published) {
+            let now = crate::now_epoch();
+            if last.as_ref().is_none_or(|last| last.0 != shown) { *since = now; }
+            let snapshot = status::Status { state: shown.0, app: shown.1, since_epoch: *since,
+                updated_epoch: now, pid: std::process::id(), instance: self.instance.clone(),
+                pending: activity.pending, attention: activity.attention };
+            match snapshot.write(&self.base) {
+                Ok(()) => {
+                    log::info!(target: "meetscribe::event", "{}", serde_json::json!({"component":"daemon", "event":"status_published",
+                        "instance_id":self.instance.as_ref().map(|own| own.nonce.as_str()), "daemon_state":snapshot.state,
+                        "pending":snapshot.pending, "attention":snapshot.attention, "outcome":"ok"}));
+                    *last = Some(published);
+                }
+                Err(error) => log::warn!("could not write status file: {error}"),
+            }
         }
     }
-}
 
-/// Write `status.json` for the tray (best-effort — a write failure is logged, never fatal).
-fn write_status(base: &Path, state: status::DaemonState, app: Option<String>) {
-    let now = crate::now_epoch();
-    let s = status::Status {
-        state,
-        app,
-        since_epoch: now,
-        updated_epoch: now,
-        pid: std::process::id(),
-    };
-    if let Err(e) = s.write(base) {
-        log::warn!("could not write status file: {e}");
+    fn stopping(&self) -> bool {
+        if self.instance.as_ref().is_some_and(|own| status::stop_requested(&self.base, own))
+            && !SHUTDOWN.swap(true, Ordering::SeqCst) {
+            log::info!(target: "meetscribe::event", "{}", serde_json::json!({"component":"control", "event":"stop_received",
+                "instance_id":self.instance.as_ref().map(|own| own.nonce.as_str()), "outcome":"ok"}));
+        }
+        SHUTDOWN.load(Ordering::SeqCst)
+    }
+
+    fn refresh_counts(&self, sessions: &Path) { self.refresh_counts_from(std::fs::read_dir(sessions)); }
+
+    fn refresh_counts_from(&self, entries: std::io::Result<impl IntoIterator<Item = std::io::Result<std::fs::DirEntry>>>) {
+        let (mut pending, mut attention) = (0u64, 0u64);
+        let mut incomplete = false;
+        match entries {
+            Err(_) => { attention = 1; incomplete = true; }
+            Ok(entries) => for entry in entries {
+                let entry = match entry { Ok(entry) => entry, Err(_) => { attention += 1; incomplete = true; continue; } };
+                if entry.file_name().to_string_lossy().starts_with('.') { continue; }
+                match entry.file_type() {
+                    Ok(kind) if kind.is_dir() => {},
+                    Ok(kind) if !kind.is_symlink() => continue,
+                    _ => { attention += 1; incomplete = true; continue; }
+                }
+                match crate::recovery::State::read(&entry.path()) {
+                    Ok(state) if state.phase == crate::recovery::Phase::NeedsAttention || state.unarchived_manual_output => attention += 1,
+                    Ok(state) if !matches!(state.phase, crate::recovery::Phase::Complete | crate::recovery::Phase::SkippedShort) => pending += 1,
+                    Ok(_) => {}, Err(_) => attention += 1,
+                }
+            },
+        }
+        if incomplete {
+            log::warn!(target: "meetscribe::event", "{}", serde_json::json!({"component":"daemon", "event":"recovery_scan_failed",
+                "outcome":"attention", "error_class":"storage"}));
+        }
+        self.update(|activity| { activity.pending = pending; activity.attention = attention; });
     }
 }
 
@@ -426,42 +477,87 @@ struct TranscribeJob {
 fn spawn_transcriber(
     board: Arc<StatusBoard>,
     run: impl Fn(&TranscribeJob) + Send + 'static,
+    due: impl Fn() -> Vec<TranscribeJob> + Send + 'static,
 ) -> std::io::Result<(mpsc::Sender<TranscribeJob>, JoinHandle<()>)> {
+    spawn_transcriber_loop(board, run, due, crate::now_epoch, Duration::from_secs(5))
+}
+
+fn job_identity(job: &TranscribeJob) -> String {
+    job.opts.session_key.clone().unwrap_or_else(|| job.dir.display().to_string())
+}
+
+fn spawn_transcriber_loop(
+    board: Arc<StatusBoard>,
+    run: impl Fn(&TranscribeJob) + Send + 'static,
+    due: impl Fn() -> Vec<TranscribeJob> + Send + 'static,
+    now: impl Fn() -> i64 + Send + 'static,
+    poll: Duration,
+) -> std::io::Result<(mpsc::Sender<TranscribeJob>, JoinHandle<()>)> {
+    use std::collections::{HashMap, HashSet, VecDeque};
     let (tx, rx) = mpsc::channel::<TranscribeJob>();
-    let handle = std::thread::Builder::new()
-        .name("transcriber".to_string())
-        .spawn(move || {
-            let mut next = rx.recv().ok();
-            while let Some(job) = next {
-                if SHUTDOWN.load(Ordering::SeqCst) {
-                    log::warn!(
-                        "shutdown requested — {} stays pending; it is transcribed on the next start",
-                        job.dir.display()
-                    );
-                } else {
-                    board.update(|a| a.transcribing = Some(job.label.clone()));
-                    run(&job);
-                }
-                next = match rx.try_recv() {
-                    Ok(job) => Some(job),
-                    Err(_) => {
-                        board.update(|a| a.transcribing = None);
-                        rx.recv().ok()
+    let handle = std::thread::Builder::new().name("transcriber".into()).spawn(move || {
+        let mut queue = VecDeque::new();
+        let mut queued = HashSet::new();
+        let mut recheck_after = HashMap::<String, i64>::new();
+        loop {
+            if queue.is_empty() {
+                board.update(|activity| activity.transcribing = None);
+                match rx.recv_timeout(poll) {
+                    Ok(job) => { queued.insert(job_identity(&job)); queue.push_back(job); }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if !SHUTDOWN.load(Ordering::SeqCst) {
+                            for job in due() {
+                                let key = job_identity(&job);
+                                if recheck_after.get(&key).is_none_or(|deadline| *deadline <= now()) && queued.insert(key) {
+                                    queue.push_back(job);
+                                }
+                            }
+                        }
                     }
-                };
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
             }
-        })?;
+            while let Ok(job) = rx.try_recv() {
+                if queued.insert(job_identity(&job)) { queue.push_back(job); }
+            }
+            if let Some(job) = queue.pop_front() {
+                let key = job_identity(&job);
+                let eligible = job.opts.session_key.is_none() || crate::recovery::State::read(&job.dir).is_ok_and(|state| state.due(now()));
+                if !SHUTDOWN.load(Ordering::SeqCst) && eligible {
+                    let attempted_at = now();
+                    board.update(|activity| activity.transcribing = Some(job.label.clone()));
+                    run(&job);
+                    // A busy orphan owns its metadata; do not race it by saving a deadline.
+                    // This worker-level delay prevents repeated lock probes/spawns without charging attempts.
+                    recheck_after.insert(key.clone(), attempted_at.saturating_add(60));
+                }
+                queued.remove(&key);
+                if crate::recovery::State::read(&job.dir).is_ok_and(|state| matches!(state.phase,
+                    crate::recovery::Phase::Complete | crate::recovery::Phase::NeedsAttention | crate::recovery::Phase::SkippedShort)) {
+                    recheck_after.remove(&key);
+                }
+                // Drain arrivals before clearing the board so a known backlog cannot flash idle.
+                while let Ok(job) = rx.try_recv() {
+                    if queued.insert(job_identity(&job)) { queue.push_back(job); }
+                }
+            }
+        }
+        board.update(|activity| activity.transcribing = None);
+    })?;
     Ok((tx, handle))
 }
 
 fn job_for(cfg: &DaemonConfig, dir: PathBuf, label: String, title: String) -> TranscribeJob {
+    let stored = crate::recovery::State::read(&dir).ok();
     let opts = pipeline::PipelineOpts {
         model: cfg.model.clone(),
         lang: cfg.lang.clone(),
-        title: Some(title),
-        db_path: cfg.db_path.clone(),
-        export_dir: dir.clone(),
+        title: Some(stored.as_ref().map(|state| state.title.clone()).unwrap_or(title)),
+        db_path: stored.as_ref().map(|state| state.db_path.clone()).unwrap_or_else(|| cfg.db_path.clone()),
+        export_dir: stored.as_ref().map(|state| state.export_dir.clone()).unwrap_or_else(|| dir.clone()),
         no_store: false,
+        session_key: stored.map(|state| state.key),
+        resume: false,
         speaker_model: Some(cfg.speaker_model.clone()),
         split: cfg.split,
         diarizer_bin: cfg.diarizer_bin.clone(),
@@ -476,8 +572,18 @@ fn job_for(cfg: &DaemonConfig, dir: PathBuf, label: String, title: String) -> Tr
 fn queue_job(jobs: &mpsc::Sender<TranscribeJob>, job: TranscribeJob) {
     let title = job.opts.title.as_deref().unwrap_or_default();
     let marker = job.dir.join(maintenance::PENDING_MARKER);
-    if let Err(e) = std::fs::write(&marker, format!("{}\n{title}\n", job.label)) {
-        log::warn!("could not write {} — this meeting will not be retried after a restart: {e}", marker.display());
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&marker) {
+        Ok(mut file) => {
+            if let Err(error) = write!(file, "{}\n{title}\n", job.label) {
+                log::warn!("pending marker write failed; durable session state remains authoritative: {error}");
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            log::info!("existing pending material preserved; durable session state controls recovery");
+        }
+        Err(error) => log::warn!("pending marker unavailable; durable session state controls recovery: {error}"),
     }
     log::info!("queued {} for transcription", job.dir.display());
     if let Err(mpsc::SendError(job)) = jobs.send(job) {
@@ -485,22 +591,31 @@ fn queue_job(jobs: &mpsc::Sender<TranscribeJob>, job: TranscribeJob) {
     }
 }
 
-/// Session dirs still marked pending — queued but never attempted (the daemon stopped first) —
-/// oldest first, as `(dir, label, title)`. Dir names are UTC stamps, so name order is time order.
+/// Durable managed sessions eligible now, independently of a legacy pending marker.
+/// Unverified legacy/corrupt sessions are preserved, never silently adopted or inserted.
 fn pending_sessions(sessions_dir: &Path) -> Vec<(PathBuf, String, String)> {
+    pending_sessions_at(sessions_dir, crate::now_epoch())
+}
+
+fn pending_sessions_at(sessions_dir: &Path, now: i64) -> Vec<(PathBuf, String, String)> {
     let Ok(entries) = std::fs::read_dir(sessions_dir) else { return Vec::new() };
-    let mut found: Vec<(PathBuf, String, String)> = entries
-        .filter_map(|e| {
-            let dir = e.ok()?.path();
-            let text = std::fs::read_to_string(dir.join(maintenance::PENDING_MARKER)).ok()?;
-            let mut lines = text.lines();
-            let label = lines.next().filter(|l| !l.is_empty()).unwrap_or("meeting").to_string();
-            let title = lines.next().map(str::to_string).unwrap_or_else(|| label.clone());
-            Some((dir, label, title))
-        })
-        .collect();
-    found.sort_by(|a, b| a.0.cmp(&b.0));
-    found
+    let mut found: Vec<_> = entries.filter_map(|entry| {
+        let dir = entry.ok()?.path();
+        let state = crate::recovery::State::read(&dir).ok()?;
+        if state.phase == crate::recovery::Phase::Complete
+            && std::fs::symlink_metadata(dir.join(maintenance::PENDING_MARKER)).is_ok() {
+            let reconciled = (|| -> Result<()> {
+                if let Some(session) = crate::recovery::Session::open(&dir)? { session.reconcile_pending()?; }
+                Ok(())
+            })();
+            if reconciled.is_err() { log::warn!("component=recovery event=pending_reconcile_failed"); }
+        }
+        if !state.due(now) { return None; }
+        let label = detect::app_label(&state.app).to_string();
+        Some((state.started_at, dir, label, state.title))
+    }).collect();
+    found.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    found.into_iter().map(|(_, dir, label, title)| (dir, label, title)).collect()
 }
 
 /// How the transcription child ended.
@@ -508,8 +623,10 @@ fn pending_sessions(sessions_dir: &Path) -> Vec<(PathBuf, String, String)> {
 enum ChildOutcome {
     Exited(i32),
     Signaled(i32),
-    /// Never started, or lost track of it (`try_wait` failed).
-    Failed,
+    /// The OS did not start a child, so no child could reserve this attempt.
+    LaunchFailed,
+    /// A child started, but its final status is unknown; it may have reserved an attempt.
+    TrackingLost,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -518,17 +635,10 @@ enum Marker {
     Clear,
 }
 
-/// What happens to a session's `pending` marker after its transcription child ends. Success clears
-/// it. A child that failed while the daemon was shutting down was most likely stopped by the same
-/// signal (Ctrl-C reaches the whole foreground group), so the marker stays and the next start retries. Any other failure clears it — the WAVs stay and
-/// `meetscribe transcribe <dir>` re-runs it by hand — so a session that always crashes whisper
-/// cannot retry on every start.
-fn marker_after(outcome: ChildOutcome, shutting_down: bool) -> Marker {
-    match outcome {
-        ChildOutcome::Exited(0) => Marker::Clear,
-        _ if shutting_down => Marker::Keep,
-        _ => Marker::Clear,
-    }
+/// Exit zero alone is not completion. Retry budgets live in durable session state,
+/// not in destructive marker removal after a failed child.
+fn marker_after(_outcome: ChildOutcome, archive_proven: bool) -> Marker {
+    if archive_proven { Marker::Clear } else { Marker::Keep }
 }
 
 /// The `meetscribe transcribe` argv (after the subcommand) that reproduces `opts` exactly. Every
@@ -570,6 +680,8 @@ fn child_args(dir: &Path, opts: &pipeline::PipelineOpts, base: &Path) -> Vec<Str
     if opts.no_store {
         a.push("--no-store".into());
     }
+    if let Some(key) = &opts.session_key { a.extend(["--session-key".into(), key.clone()]); }
+    if opts.resume { a.push("--resume".into()); }
     a
 }
 
@@ -577,6 +689,10 @@ fn child_args(dir: &Path, opts: &pipeline::PipelineOpts, base: &Path) -> Vec<Str
 /// `abort()` can never take down the daemon or a recording in progress. The child's log lines go to
 /// the daemon's stderr (one log); its stdout — the full transcript — is discarded.
 fn run_transcribe_job(job: &TranscribeJob, exe: &Path, base: &Path) {
+    run_transcribe_job_at(job, exe, base, crate::now_epoch);
+}
+
+fn run_transcribe_job_at(job: &TranscribeJob, exe: &Path, base: &Path, now: impl Fn() -> i64) {
     log::info!("transcribing {} …", job.dir.display());
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("transcribe")
@@ -585,36 +701,56 @@ fn run_transcribe_job(job: &TranscribeJob, exe: &Path, base: &Path) {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null());
     let outcome = run_child(cmd);
-    let shutting_down = SHUTDOWN.load(Ordering::SeqCst);
+    if outcome == ChildOutcome::LaunchFailed {
+        let persist = (|| -> Result<()> {
+            let Some(key) = &job.opts.session_key else { return Ok(()); };
+            let Some(mut session) = crate::recovery::Session::open(&job.dir)? else { return Ok(()); };
+            anyhow::ensure!(session.state.key == *key, "launch failure session identity mismatch");
+            let at = now();
+            if !session.state.due(at) { return Ok(()); }
+            // A previous child may already own the durable reservation. Settle that attempt,
+            // rather than charging it again just because this replacement could not launch.
+            if session.state.in_flight {
+                return session.failed("interrupted_attempt", at);
+            }
+            session.reserve(at, false)?;
+            session.failed("child_launch", at)
+        })();
+        if persist.is_err() {
+            log::error!(target: "meetscribe::event", "{}", serde_json::json!({
+                "component":"recovery", "event":"launch_failure_persist_failed", "outcome":"error", "error_class":"storage"
+            }));
+        }
+    }
+    let archive_proven = (|| -> Result<bool> {
+        let Some(session) = crate::recovery::Session::open(&job.dir)? else { return Ok(false); };
+        if job.opts.session_key.as_ref().is_some_and(|key| *key != session.state.key) { return Ok(false); }
+        session.reconcile_pending() // Lock remains held through proof and marker removal.
+    })().unwrap_or_else(|_| { log::warn!("component=recovery event=pending_reconcile_failed"); false });
     match outcome {
-        ChildOutcome::Exited(0) => log::info!("transcribed {}", job.dir.display()),
+        ChildOutcome::Exited(0) if archive_proven => log::info!("transcribed {}", job.dir.display()),
+        ChildOutcome::Exited(0) => log::warn!("component=recovery event=child_success_without_archive_proof"),
         other => log::error!("transcription failed for {} ({other:?}) — WAVs kept", job.dir.display()),
     }
-    match marker_after(outcome, shutting_down) {
+    match marker_after(outcome, archive_proven) {
         Marker::Keep => log::warn!(
-            "{} stays pending; it is transcribed on the next start",
+            "{} stays protected; durable recovery state controls the next attempt",
             job.dir.display()
         ),
-        Marker::Clear => {
-            if let Err(e) = std::fs::remove_file(job.dir.join(maintenance::PENDING_MARKER)) {
-                log::warn!("could not clear the pending marker in {}: {e}", job.dir.display());
-            }
-        }
+        Marker::Clear => log::info!("component=recovery event=completion_reconciled"),
     }
 }
 
-/// Run `cmd` to completion. A shutdown does not interrupt it: killing the child could land after
-/// its DB insert, and the kept marker would then store the meeting twice. Instead the job finishes
-/// (as the in-process worker did) unless launchd's stop timeout SIGKILLs the job's whole process
-/// group — the child stays in the daemon's group for exactly that, so no orphan can store a meeting
-/// whose marker survived.
+/// Run our child to completion. New keyed children hold the session lock and a durable
+/// attempt reservation; retries reconcile the committed mapping rather than inserting twice.
+/// Legacy unkeyed children do not inherit this guarantee and require upgrade quiescence.
 fn run_child(mut cmd: std::process::Command) -> ChildOutcome {
     use std::os::unix::process::ExitStatusExt;
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             log::error!("could not start the transcription child: {e}");
-            return ChildOutcome::Failed;
+            return ChildOutcome::LaunchFailed;
         }
     };
     loop {
@@ -623,7 +759,7 @@ fn run_child(mut cmd: std::process::Command) -> ChildOutcome {
                 return match (status.code(), status.signal()) {
                     (Some(code), _) => ChildOutcome::Exited(code),
                     (None, Some(sig)) => ChildOutcome::Signaled(sig),
-                    (None, None) => ChildOutcome::Failed,
+                    (None, None) => ChildOutcome::TrackingLost,
                 };
             }
             Ok(None) => {}
@@ -631,7 +767,7 @@ fn run_child(mut cmd: std::process::Command) -> ChildOutcome {
                 log::error!("lost track of the transcription child: {e}");
                 let _ = child.kill();
                 let _ = child.wait();
-                return ChildOutcome::Failed;
+                return ChildOutcome::TrackingLost;
             }
         }
         std::thread::sleep(Duration::from_millis(250));
@@ -646,10 +782,14 @@ fn record_and_queue(
     cfg: &DaemonConfig,
     app: &str,
     jobs: &mpsc::Sender<TranscribeJob>,
+    board: &StatusBoard,
 ) -> Result<()> {
     let started = crate::now_epoch();
-    let dir = cfg.sessions_dir.join(export::stamp_compact(started));
+    let suffix = crate::recovery::new_identity();
+    let dir = cfg.sessions_dir.join(format!("{}-{}", export::stamp_compact(started), &suffix[..8]));
     let label = detect::app_label(app);
+    let title = format!("{label} — {}", export::fmt_utc(started));
+    let mut managed = crate::recovery::Session::begin(&dir, &cfg.db_path, &dir, app, &title, started)?;
     log::info!("meeting detected — {label} ({app}) took the mic → recording to {}", dir.display());
 
     // Stop predicate: the app released the mic for MEETING_END_DEBOUNCE, or we were signalled.
@@ -661,7 +801,7 @@ fn record_and_queue(
     let mut last_poll = Instant::now();
     let mut released_since: Option<Instant> = None;
     let stop = move || -> bool {
-        if SHUTDOWN.load(Ordering::SeqCst) {
+        if board.stopping() {
             return true;
         }
         if last_poll.elapsed() >= DETECT_POLL_DURING_CAPTURE {
@@ -677,8 +817,19 @@ fn record_and_queue(
         released_since.is_some_and(|s| s.elapsed() >= MEETING_END_DEBOUNCE)
     };
 
-    let summary = session::run_capture(&dir, stop, None)
-        .with_context(|| format!("capture failed for {label} ({})", dir.display()))?;
+    let summary = match session::run_capture(&dir, stop, None, Some(&mut managed)) {
+        Ok(summary) => {
+            managed.finish_capture(summary.duration_secs, cfg.min_secs)?;
+            summary
+        }
+        Err(error) => {
+            if let Err(state_error) = managed.capture_failed() {
+                log::error!("component=recovery event=capture_state_write_failed error={state_error:#}");
+            }
+            return Err(error.context("managed capture failed; files preserved"));
+        }
+    };
+    drop(managed); // Release capture ownership before the processing child may acquire it.
     log::info!(
         "meeting ended — {label}: captured {:.1}s ({} segment file(s), {} dropped)",
         summary.duration_secs,
@@ -697,7 +848,6 @@ fn record_and_queue(
     }
 
     // Queued even on shutdown: the marker survives the restart and the next start transcribes it.
-    let title = format!("{label} — {}", export::fmt_utc(started));
     queue_job(jobs, job_for(cfg, dir, label.to_string(), title));
     Ok(())
 }
@@ -723,15 +873,19 @@ fn run_maintenance(cfg: &DaemonConfig) {
 }
 
 /// Sleep in small slices so a signal breaks the idle wait promptly (SIGTERM → clean shutdown).
-fn sleep_interruptible(total: Duration) {
+fn sleep_interruptible(total: Duration, board: &StatusBoard) {
     let step = Duration::from_millis(200);
     let mut left = total;
-    while left > Duration::ZERO && !SHUTDOWN.load(Ordering::SeqCst) {
+    while left > Duration::ZERO && !board.stopping() {
         let s = step.min(left);
         std::thread::sleep(s);
         left = left.saturating_sub(s);
     }
 }
+
+#[cfg(test)]
+#[path = "audit_pipeline.rs"]
+mod audit_pipeline;
 
 #[cfg(test)]
 mod tests {
@@ -756,6 +910,8 @@ mod tests {
                 db_path: dir.join("meetscribe.db"),
                 export_dir: dir.to_path_buf(),
                 no_store: true,
+                session_key: None,
+                resume: false,
                 speaker_model: None,
                 split: false,
                 diarizer_bin: dir.join("diarizer"),
@@ -785,6 +941,18 @@ mod tests {
                 std::fs::write(sessions.join(name).join(maintenance::PENDING_MARKER), m).unwrap();
             }
         }
+        // Legacy markers alone are quarantined; only versioned metadata supplies identity.
+        assert!(pending_sessions(&sessions).is_empty());
+        for (name, app, title, started) in [
+            ("later-directory", "us.zoom.xos", "Later release sync", 200),
+            ("earlier-directory", "com.google.Chrome", "Earlier release sync", 100),
+        ] {
+            let dir = sessions.join(name);
+            let mut state = crate::recovery::Session::begin(&dir, &sessions.join("archive.db"), &dir, app, title, started).unwrap();
+            state.start_roll(0, 16_000, 0.0).unwrap();
+            state.checkpoint(0, 16_000, 16_000).unwrap();
+            state.finish_capture(1.0, 0.1).unwrap();
+        }
         let found = pending_sessions(&sessions);
         let got: Vec<(String, &str, &str)> = found
             .iter()
@@ -793,8 +961,8 @@ mod tests {
         assert_eq!(
             got,
             [
-                ("20261001T130000Z".to_string(), "Chrome", "Chrome — 2026-10-01 13:00 UTC"),
-                ("20261001T170000Z".to_string(), "Meet", "Meet — 2026-10-01 17:00 UTC"),
+                ("earlier-directory".to_string(), "Chrome", "Earlier release sync"),
+                ("later-directory".to_string(), "Zoom", "Later release sync"),
             ]
         );
         std::fs::remove_dir_all(&sessions).ok();
@@ -843,19 +1011,146 @@ mod tests {
     }
 
     #[test]
-    fn the_marker_survives_only_a_shutdown_interrupted_attempt() {
+    fn retry_deadlines_progress_during_recording_and_pause_without_restart() {
+        use std::sync::atomic::AtomicI64;
+        for iteration in 0..5 {
+            let base = temp_base(&format!("retry-{iteration}"));
+            let dir = base.join("recording");
+            let mut session = crate::recovery::Session::begin(&dir, &base.join("archive.db"), &dir,
+                "com.google.Chrome", "Retry schedule fixture", 1_762_880_000).unwrap();
+            session.start_roll(0, 16_000, 0.0).unwrap();
+            session.checkpoint(0, 16_000, 16_000).unwrap();
+            session.finish_capture(1.0, 0.1).unwrap();
+            drop(session);
+            let clock = Arc::new(AtomicI64::new(1000));
+            let board = Arc::new(StatusBoard::new(base.clone()));
+            board.update(|activity| { activity.recording = Some("Zoom".into()); activity.paused = true; });
+            let (finished_tx, finished_rx) = mpsc::channel();
+            let run_clock = Arc::clone(&clock);
+            let scan_clock = Arc::clone(&clock);
+            let worker_clock = Arc::clone(&clock);
+            let scan_dir = dir.clone();
+            let (jobs, worker) = spawn_transcriber_loop(Arc::clone(&board), move |job| {
+                let mut session = crate::recovery::Session::open(&job.dir).unwrap().unwrap();
+                let now = run_clock.load(Ordering::SeqCst);
+                session.reserve(now, false).unwrap();
+                session.failed("processing", now).unwrap();
+                let status = (session.state.attempts, session.state.next_retry, session.state.phase);
+                drop(session);
+                finished_tx.send(status).unwrap();
+            }, move || {
+                let state = crate::recovery::State::read(&scan_dir).unwrap();
+                if !state.due(scan_clock.load(Ordering::SeqCst)) { return Vec::new(); }
+                (0..2).map(|_| {
+                    let mut item = job(&scan_dir, "Chrome");
+                    item.opts.session_key = Some(state.key.clone()); item.opts.no_store = false; item
+                }).collect()
+            }, move || worker_clock.load(Ordering::SeqCst), Duration::from_millis(5)).unwrap();
+            for (now, attempt, next) in [(1000, 1, 1060), (1060, 2, 1360), (1360, 3, 3160), (3160, 4, 3160)] {
+                clock.store(now, Ordering::SeqCst);
+                let status = finished_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                assert_eq!(status.0, attempt);
+                if attempt < 4 { assert_eq!(status.1, next); }
+                else { assert_eq!(status.2, crate::recovery::Phase::NeedsAttention); }
+                assert_eq!(shown_on_disk(&base).0, DaemonState::Recording);
+                assert!(finished_rx.recv_timeout(Duration::from_millis(30)).is_err(), "a duplicate job or premature retry ran");
+            }
+            clock.store(100_000, Ordering::SeqCst);
+            assert!(finished_rx.recv_timeout(Duration::from_millis(30)).is_err());
+            drop(jobs); worker.join().unwrap();
+            std::fs::remove_dir_all(base).unwrap();
+        }
+        println!("{{\"event\":\"audit_case_complete\",\"case\":\"f2_retry_worker\",\"iterations\":5}}");
+    }
+
+    #[test]
+    fn inventory_failure_cannot_publish_a_proven_empty_backlog() {
+        for iteration in 0..5 {
+            let base = temp_base(&format!("inventory-{iteration}"));
+            let sessions = base.join("sessions");
+            let owner = crate::recovery::Session::begin(&sessions.join("recording"), &base.join("archive.db"),
+                &base.join("exports"), "org.example.fixture", "Recovery inventory fixture", 1_762_880_000).unwrap();
+            let board = StatusBoard::new(base.clone()); board.refresh_counts(&sessions);
+            assert_eq!(status::Status::read(&base).unwrap().pending, 1);
+            let not_a_directory = base.join("unavailable-inventory"); std::fs::write(&not_a_directory, b"unavailable").unwrap();
+            board.refresh_counts(&not_a_directory);
+            assert!(status::Status::read(&base).unwrap().attention > 0, "an unreadable inventory must not look archived/green");
+            board.refresh_counts(&sessions);
+            let restored = status::Status::read(&base).unwrap();
+            assert_eq!((restored.pending, restored.attention), (1, 0));
+            board.refresh_counts_from(Ok(vec![Err(std::io::Error::other("injected entry-read failure"))]));
+            assert!(status::Status::read(&base).unwrap().attention > 0);
+            board.refresh_counts(&sessions);
+            assert_eq!(status::Status::read(&base).unwrap().pending, 1);
+            drop(owner); std::fs::remove_dir_all(base).unwrap();
+        }
+        println!("{{\"event\":\"audit_case_complete\",\"case\":\"f6_inventory_failure\",\"iterations\":5}}");
+    }
+
+    #[test]
+    fn counts_publish_without_a_coarse_state_change() {
+        let base = temp_base("counts");
+        let board = StatusBoard::new(base.clone());
+        board.update(|_| {});
+        let first = status::Status::read(&base).unwrap();
+        board.update(|activity| { activity.pending = 2; activity.attention = 1; });
+        let second = status::Status::read(&base).unwrap();
+        assert_eq!(second.state, first.state);
+        assert_eq!(second.since_epoch, first.since_epoch);
+        assert_eq!((second.pending, second.attention), (2, 1));
+        assert!(second.instance.is_some());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn addressed_request_interrupts_the_idle_stop_poll() {
+        if std::env::var_os("MEETSCRIBE_TEST_STOP_POLL").is_some() {
+            let base = temp_base("stop-poll-child");
+            let board = StatusBoard::new(base.clone());
+            board.update(|_| {});
+            let own = board.instance.clone().unwrap();
+            assert!(!board.stopping());
+            let request_base = base.clone();
+            let writer = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                status::request_stop(&request_base, Some(&own), status::process_start, status::write_stop).unwrap()
+            });
+            let start = Instant::now();
+            sleep_interruptible(Duration::from_secs(10), &board);
+            assert!(start.elapsed() < Duration::from_secs(3));
+            assert!(writer.join().unwrap());
+            assert!(board.stopping());
+            std::fs::remove_dir_all(base).unwrap();
+            println!("{{\"event\":\"addressed_stop_poll_ack\"}}");
+            return;
+        }
+        for _ in 0..5 {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "daemon::tests::addressed_request_interrupts_the_idle_stop_poll", "--nocapture"])
+                .env("MEETSCRIBE_TEST_STOP_POLL", "1").output().unwrap();
+            assert!(child.status.success(), "stop-poll child failed: {child:?}");
+            assert!(String::from_utf8_lossy(&child.stdout).contains("addressed_stop_poll_ack"), "stop-poll child ran no verified test");
+        }
+        println!("{{\"event\":\"audit_case_complete\",\"case\":\"f6_addressed_poll\",\"iterations\":5}}");
+    }
+
+    #[test]
+    fn the_marker_clears_only_after_complete_archive_proof_regardless_of_exit() {
         use ChildOutcome::*;
-        for (outcome, shutting_down, want) in [
-            (Exited(0), false, Marker::Clear),
+        for (outcome, archive_proven, want) in [
+            (Exited(0), false, Marker::Keep),
             (Exited(0), true, Marker::Clear),
-            (Exited(1), false, Marker::Clear),
-            (Signaled(libc::SIGABRT), false, Marker::Clear),
-            (Failed, false, Marker::Clear),
-            (Signaled(libc::SIGTERM), true, Marker::Keep),
-            (Signaled(libc::SIGINT), true, Marker::Keep),
-            (Exited(1), true, Marker::Keep),
+            (Exited(1), false, Marker::Keep),
+            (Signaled(libc::SIGABRT), false, Marker::Keep),
+            (LaunchFailed, false, Marker::Keep),
+            (TrackingLost, false, Marker::Keep),
+            (Signaled(libc::SIGTERM), true, Marker::Clear),
+            (Signaled(libc::SIGINT), true, Marker::Clear),
+            (Exited(1), true, Marker::Clear),
+            (TrackingLost, true, Marker::Clear),
+            (LaunchFailed, true, Marker::Clear),
         ] {
-            assert_eq!(marker_after(outcome, shutting_down), want, "{outcome:?} shutting_down={shutting_down}");
+            assert_eq!(marker_after(outcome, archive_proven), want, "{outcome:?} archive_proven={archive_proven}");
         }
     }
 
@@ -884,10 +1179,10 @@ mod tests {
         let (jobs, worker) = spawn_transcriber(Arc::clone(&board), move |job| {
             started_tx.send(job.label.clone()).unwrap();
             release_rx.lock().unwrap().recv().unwrap();
-        })
+        }, Vec::new)
         .unwrap();
 
-        jobs.send(job(&base, "Chrome")).unwrap();
+        jobs.send(job(&base.join("first"), "Chrome")).unwrap();
         assert_eq!(
             started_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
             "Chrome"
@@ -904,7 +1199,7 @@ mod tests {
             (DaemonState::Recording, Some("Meet".into()))
         );
         board.update(|a| a.recording = None);
-        jobs.send(job(&base, "Meet")).unwrap();
+        jobs.send(job(&base.join("second"), "Meet")).unwrap();
         assert_eq!(
             shown_on_disk(&base),
             (DaemonState::Transcribing, Some("Chrome".into()))

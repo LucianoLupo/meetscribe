@@ -50,7 +50,7 @@ pub fn is_older_than(mtime_epoch: i64, now_epoch: i64, days: u64) -> bool {
 pub const PENDING_MARKER: &str = "pending";
 
 /// Delete session subdirs older than `days` (by mtime). `days == 0` is a no-op (keep forever).
-/// A dir carrying [`PENDING_MARKER`] is never deleted: its transcript is still owed.
+/// A verified archive plus unchanged exports is required; unknown/unfinished work is kept.
 /// `now_epoch` is injected for testability. A per-dir error is logged, not fatal (best-effort).
 pub fn prune_sessions(sessions_dir: &Path, days: u64, now_epoch: i64) -> Result<PruneReport> {
     let mut report = PruneReport::default();
@@ -62,14 +62,20 @@ pub fn prune_sessions(sessions_dir: &Path, days: u64, now_epoch: i64) -> Result<
     for entry in entries {
         let Ok(entry) = entry else { continue };
         let path = entry.path();
-        if !path.is_dir() {
-            continue; // only prune session directories, never stray files
+        if !path.is_dir() || entry.file_name().to_str().is_some_and(|name| name.starts_with('.')) {
+            continue; // The stable .locks registry is never a prunable session.
         }
-        if path.join(PENDING_MARKER).exists() {
-            report.kept += 1; // queued, never transcribed — the daemon still owes it a transcript
-            continue;
-        }
-        if is_older_than(mtime_epoch(&path), now_epoch, days) {
+        let session = match crate::recovery::Session::open(&path) {
+            Ok(Some(session)) => session,
+            _ => { report.kept += 1; continue; }
+        };
+        let eligible = if session.state.phase == crate::recovery::Phase::SkippedShort {
+            session.prunable_short().unwrap_or(false)
+        } else { session.proof(crate::recovery::ProofScope::Retention).unwrap_or(false) };
+        let modified = mtime_epoch(&path);
+        if !eligible || modified == 0 { report.kept += 1; continue; }
+        // session owns the same stable lock through proof, age check and deletion.
+        if is_older_than(modified, now_epoch, days) {
             match fs::remove_dir_all(&path) {
                 Ok(()) => {
                     report.removed += 1;
@@ -140,7 +146,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_removes_old_dirs_keeps_files_and_respects_zero() {
+    fn prune_keeps_unproven_old_dirs_and_respects_zero() {
         let tmp = std::env::temp_dir().join(format!("meetscribe-prune-{}", std::process::id()));
         let sessions = tmp.join("sessions");
         fs::create_dir_all(&sessions).unwrap();
@@ -161,10 +167,10 @@ mod tests {
         assert_eq!(r, PruneReport { removed: 0, kept: 3 });
         assert!(sessions.join("stray.txt").exists());
 
-        // A "now" 100 days in the future makes the fresh dirs count as >30d old → all removed.
+        // Age alone is not archive proof: marker-less legacy directories remain protected.
         let r = prune_sessions(&sessions, 30, now + 100 * SECS_PER_DAY).unwrap();
-        assert_eq!(r, PruneReport { removed: 3, kept: 0 });
-        assert!(!sessions.join("a").exists());
+        assert_eq!(r, PruneReport { removed: 0, kept: 3 });
+        assert!(sessions.join("a").exists());
         assert!(sessions.join("stray.txt").exists()); // stray file never touched
 
         fs::remove_dir_all(&tmp).ok();
@@ -180,9 +186,9 @@ mod tests {
 
         let later = mtime_epoch(&sessions.join("owed")) + 100 * SECS_PER_DAY;
         let r = prune_sessions(&sessions, 30, later).unwrap();
-        assert_eq!(r, PruneReport { removed: 1, kept: 1 });
+        assert_eq!(r, PruneReport { removed: 0, kept: 2 });
         assert!(sessions.join("owed").exists());
-        assert!(!sessions.join("done").exists());
+        assert!(sessions.join("done").exists(), "absence of pending is not archive proof");
 
         fs::remove_dir_all(&tmp).ok();
     }

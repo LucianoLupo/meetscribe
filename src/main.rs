@@ -29,6 +29,10 @@ mod speakers;
 mod export;
 mod detect;
 mod session;
+mod recovery;
+mod diagnostics;
+#[cfg(test)]
+mod audit_recovery;
 mod pipeline;
 mod daemon;
 mod launchd;
@@ -97,14 +101,21 @@ pub(crate) struct TranscribeArgs {
 /// `meetscribe transcribe <dir> [...]` — thin CLI wrapper over `pipeline::transcribe_and_store`:
 /// parse args, run the pipeline (which stores AND exports), then print the transcript + RTF.
 fn run_transcribe(argv: &[String]) -> Result<()> {
+    run_transcribe_using(argv, pipeline::transcribe_and_store)
+}
+
+fn run_transcribe_using(argv: &[String], run: impl FnOnce(&Path, &pipeline::PipelineOpts) -> Result<pipeline::PipelineOutput>) -> Result<()> {
     let Some(TranscribeArgs { dir, opts, yield_to_calls }) = parse_transcribe_args(argv)? else {
         return Ok(()); // --help
     };
     if let Some(base) = yield_to_calls {
         status::spawn_call_yield(base);
     }
-    let out = pipeline::transcribe_and_store(&dir, &opts)?;
+    let out = run(&dir, &opts)?;
 
+    if out.capture_status != "complete" {
+        eprintln!("capture status: {} (see paired Markdown; JSON segment shape is unchanged)", out.capture_status);
+    }
     println!("\n===== TRANSCRIPT ({}) =====", dir.display());
     for s in &out.segments {
         println!(
@@ -147,27 +158,34 @@ pub(crate) fn parse_transcribe_args(argv: &[String]) -> Result<Option<Transcribe
     let mut export_dir: Option<PathBuf> = None;
     let mut no_store = false;
     let mut yield_to_calls: Option<PathBuf> = None;
+    let mut session_key = None;
+    let mut resume = false;
+    let mut provided_models = std::collections::HashSet::new();
     let mut it = argv.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--model" | "-m" => {
                 if let Some(v) = it.next() {
                     model = v.clone();
+                    provided_models.insert("model");
                 }
             }
             "--speaker-model" => {
                 if let Some(v) = it.next() {
                     speaker_model = PathBuf::from(v);
+                    provided_models.insert("speaker");
                 }
             }
             "--diarizer-model" => {
                 if let Some(v) = it.next() {
                     diarizer_model = PathBuf::from(v);
+                    provided_models.insert("diarizer_model");
                 }
             }
             "--diarizer-bin" => {
                 if let Some(v) = it.next() {
                     diarizer_bin = PathBuf::from(v);
+                    provided_models.insert("diarizer_bin");
                 }
             }
             "--no-split" => split = false,
@@ -197,6 +215,8 @@ pub(crate) fn parse_transcribe_args(argv: &[String]) -> Result<Option<Transcribe
                 }
             }
             "--no-store" => no_store = true,
+            "--resume" => resume = true,
+            "--session-key" => session_key = Some(it.next().context("--session-key needs a value")?.clone()),
             "--yield-to-calls" => {
                 if let Some(v) = it.next() {
                     yield_to_calls = Some(PathBuf::from(v));
@@ -206,7 +226,8 @@ pub(crate) fn parse_transcribe_args(argv: &[String]) -> Result<Option<Transcribe
                 eprintln!(
                     "usage: meetscribe transcribe <dir> [--title <t>] [--model <ggml.bin>] \
                      [--speaker-model <onnx>] [--diarizer-model <gguf>] [--diarizer-bin <exe>] \
-                     [--no-split] [--lang <code>] [--db <path>] [--export-dir <dir>] [--no-store]\n\n\
+                     [--no-split] [--lang <code>] [--db <path>] [--export-dir <dir>] [--no-store] [--resume]\n\n\
+                     --resume  reconcile a managed session in its verified original archive\n\n\
                      --no-split  do not cut far-end chunks at voice changes (the pre-split pipeline)\n\
                      --diarizer-rttm <file>  evaluation: replay these diarizer turns (single-roll session)"
                 );
@@ -217,19 +238,40 @@ pub(crate) fn parse_transcribe_args(argv: &[String]) -> Result<Option<Transcribe
         }
     }
     let dir = dir.context("transcribe: missing <dir> (e.g. `meetscribe transcribe capture`)")?;
-    let opts = pipeline::PipelineOpts {
+    let db_given = db_path.is_some();
+    let export_given = export_dir.is_some();
+    let mut opts = pipeline::PipelineOpts {
         model: PathBuf::from(model),
         lang,
         title,
         db_path: db_path.unwrap_or_else(default_db_path),
         export_dir: export_dir.unwrap_or_else(|| dir.clone()),
         no_store,
+        session_key,
+        resume,
         speaker_model: Some(speaker_model),
         split,
         diarizer_bin,
         diarizer_model,
         diarizer_rttm,
     };
+    anyhow::ensure!(!(opts.no_store && (opts.resume || opts.session_key.is_some())), "--resume/session recovery cannot use --no-store");
+    if opts.resume {
+        let state = recovery::State::read(&dir).context("--resume requires managed metadata; preserve unverified legacy work")?;
+        if db_given { anyhow::ensure!(recovery::absolute(&opts.db_path)? == recovery::absolute(&state.db_path)?, "--resume database override mismatch"); }
+        if export_given { anyhow::ensure!(recovery::absolute(&opts.export_dir)? == recovery::absolute(&state.export_dir)?, "--resume export override mismatch"); }
+        if let Some(title) = &opts.title { anyhow::ensure!(title == &state.title, "--resume preserves the original title"); }
+        opts.db_path = state.db_path;
+        opts.export_dir = state.export_dir;
+        opts.title = Some(state.title);
+        opts.session_key = Some(state.key);
+        let base = base_dir().context("--resume needs an absolute installed HOME")?;
+        anyhow::ensure!(base.is_absolute(), "--resume needs an absolute installed HOME");
+        if !provided_models.contains("model") { opts.model = base.join("models/ggml-large-v3.bin"); }
+        if !provided_models.contains("speaker") { opts.speaker_model = Some(base.join(SPEAKER_MODEL_REL)); }
+        if !provided_models.contains("diarizer_model") { opts.diarizer_model = base.join(DIARIZER_MODEL_REL); }
+        if !provided_models.contains("diarizer_bin") { opts.diarizer_bin = base.join(DIARIZER_BIN_REL); }
+    }
     Ok(Some(TranscribeArgs { dir, opts, yield_to_calls }))
 }
 
@@ -320,16 +362,17 @@ fn run_list(argv: &[String]) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:>3}  {:<20}  {:>9}  {:>5}  TITLE",
-        "ID", "DATE", "DURATION", "SEGS"
+        "{:>3}  {:<20}  {:>9}  {:>5}  {:<8} TITLE",
+        "ID", "DATE", "DURATION", "SEGS", "CAPTURE"
     );
     for m in &meetings {
         println!(
-            "{:>3}  {:<20}  {:>9}  {:>5}  {}",
+            "{:>3}  {:<20}  {:>9}  {:>5}  {:<8} {}",
             m.id,
             export::fmt_utc(m.started_at),
             export::fmt_duration(m.duration_secs),
             m.segment_count,
+            m.capture_status,
             m.title
         );
     }
@@ -411,6 +454,11 @@ fn run_export(argv: &[String]) -> Result<()> {
     }
 
     let (row, rendered) = load_rendered(&db_path, id, raw)?;
+    if row.capture_status != "complete" { eprintln!("capture status: {} (paired Markdown preserves this status)", row.capture_status); }
+    let mut ownership = if export_dir.join(recovery::STATE_FILE).exists() {
+        Some(recovery::Session::open(&export_dir)?.context("export destination session is busy")?)
+    } else { None };
+    if let Some(session) = ownership.as_mut() { session.protect_outputs()?; }
     let (md_path, json_path) =
         export::write_exports(&export_dir, &format!("meeting-{id}"), &row, &rendered)?;
     println!("wrote {}", md_path.display());
@@ -527,9 +575,11 @@ fn run_rerender(argv: &[String]) -> Result<()> {
         changed += 1;
 
         if write {
-            std::fs::write(&md_path, &md).with_context(|| format!("write {}", md_path.display()))?;
-            std::fs::write(&json_path, &json)
-                .with_context(|| format!("write {}", json_path.display()))?;
+            let mut ownership = if dir.join(recovery::STATE_FILE).exists() {
+                Some(recovery::Session::open(&dir)?.context("rerender source session is busy")?)
+            } else { None };
+            if let Some(session) = ownership.as_mut() { session.protect_outputs()?; }
+            export::write_exports(&dir, "transcript", row, &rendered)?;
             println!("meeting {id}: rewrote {}", dir.display());
         } else {
             println!("meeting {id}: would rewrite {}", dir.display());
@@ -837,9 +887,15 @@ fn run_detect(argv: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+fn main() -> std::process::ExitCode {
+    diagnostics::init();
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => { diagnostics::command_failed(&error); std::process::ExitCode::FAILURE }
+    }
+}
 
+fn run() -> Result<()> {
     // Subcommand dispatch. Anything unrecognized falls through to the capture flow
     // (back-compatible: `meetscribe --seconds 300` still records).
     let argv: Vec<String> = std::env::args().collect();
@@ -884,7 +940,7 @@ fn main() -> Result<()> {
     let sf = stop_flag.clone();
     let stop = move || sf.load(Ordering::Acquire) || deadline.is_some_and(|d| Instant::now() >= d);
 
-    let summary = session::run_capture(&args.out_dir, stop, args.rebuild_after)?;
+    let summary = session::run_capture(&args.out_dir, stop, args.rebuild_after, None)?;
     log::info!(
         "capture finished: {:.1}s, {} segment(s), {} rebuild(s), num_buffers={}, {} sample(s) dropped",
         summary.duration_secs,

@@ -43,6 +43,7 @@ pub struct MeetingMeta {
     pub started_at: i64, // unix epoch seconds — real meeting time (earliest capture WAV mtime)
     pub duration_secs: f64,
     pub created_at: i64, // unix epoch seconds — ingest time
+    pub capture_status: Option<String>,
 }
 
 /// A persisted meeting row (what `list`/`export`/`get_meeting` read back).
@@ -57,13 +58,14 @@ pub struct MeetingRow {
     pub duration_secs: f64,
     pub segment_count: i64,
     pub created_at: i64,
+    pub capture_status: String,
 }
 
 const MEETING_COLS: &str =
-    "id, title, source_dir, model, lang, started_at, duration_secs, segment_count, created_at";
+    "id, title, source_dir, model, lang, started_at, duration_secs, segment_count, created_at, COALESCE(capture_status, 'unknown') AS capture_status";
 
 /// Schema version this binary knows how to produce. Bump with each new ladder rung.
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 
 /// A stored segment: the raw ASR contract plus the row identity and the (nullable) speaker
 /// identity, resolved through `segment_voices` → `voice_clusters`. Both are `None` for the mic
@@ -219,6 +221,28 @@ impl Db {
         Ok(Self { conn })
     }
 
+    /// Open a bound archive without creating, migrating or switching an unknown database.
+    pub async fn open_existing(path: &Path, expected_archive_id: &str) -> Result<Self> {
+        let conn = SqliteConnection::connect_with(&SqliteConnectOptions::new()
+            .filename(path).create_if_missing(false).foreign_keys(true)).await
+            .context("open bound archive")?;
+        let mut db = Self { conn };
+        if db.archive_id().await? != expected_archive_id {
+            anyhow::bail!("archive identity mismatch; files preserved");
+        }
+        Ok(db)
+    }
+
+    pub async fn archive_id(&mut self) -> Result<String> {
+        sqlx::query_scalar("SELECT archive_id FROM archive_identity WHERE singleton = 1")
+            .fetch_one(&mut self.conn).await.context("read archive identity")
+    }
+
+    pub async fn ingest_id(&mut self, key: &str) -> Result<Option<i64>> {
+        sqlx::query_scalar("SELECT meeting_id FROM session_ingests WHERE session_key = ?")
+            .bind(key).fetch_optional(&mut self.conn).await.context("lookup session ingest")
+    }
+
     /// In-memory DB for tests. Routes through the IDENTICAL prepare path as `open` so tests
     /// exercise the real ladder rather than a hand-built schema.
     #[cfg(test)]
@@ -282,11 +306,42 @@ impl Db {
         clusters: &[NewCluster],
         voices: &[SegmentVoice],
     ) -> Result<i64> {
-        let mut tx = self.conn.begin().await.context("begin insert tx")?;
+        self.insert_session_meeting(meta, segs, clusters, voices, None).await
+    }
+
+    pub async fn insert_keyed_meeting_with_voices(
+        &mut self,
+        meta: &MeetingMeta,
+        segs: &[TranscriptSegment],
+        clusters: &[NewCluster],
+        voices: &[SegmentVoice],
+        key: &str,
+    ) -> Result<i64> {
+        if key.len() != 32 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            anyhow::bail!("invalid session ingest identity");
+        }
+        self.insert_session_meeting(meta, segs, clusters, voices, Some(key)).await
+    }
+
+    async fn insert_session_meeting(
+        &mut self,
+        meta: &MeetingMeta,
+        segs: &[TranscriptSegment],
+        clusters: &[NewCluster],
+        voices: &[SegmentVoice],
+        key: Option<&str>,
+    ) -> Result<i64> {
+        let mut tx = self.conn.begin_with("BEGIN IMMEDIATE").await.context("begin insert tx")?;
+        if let Some(key) = key
+            && let Some(id) = sqlx::query_scalar::<_, i64>("SELECT meeting_id FROM session_ingests WHERE session_key = ?")
+                .bind(key).fetch_optional(&mut *tx).await? {
+            tx.commit().await?;
+            return Ok(id);
+        }
         let res = sqlx::query(
             "INSERT INTO meetings \
-             (title, source_dir, model, lang, started_at, duration_secs, segment_count, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+             (title, source_dir, model, lang, started_at, duration_secs, segment_count, created_at, capture_status) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(meta.title.as_str())
         .bind(meta.source_dir.as_str())
@@ -296,6 +351,7 @@ impl Db {
         .bind(meta.duration_secs)
         .bind(segs.len() as i64)
         .bind(meta.created_at)
+        .bind(meta.capture_status.as_deref().unwrap_or("unknown"))
         .execute(&mut *tx)
         .await
         .context("insert meeting")?;
@@ -330,7 +386,10 @@ impl Db {
             })
             .collect::<Result<_>>()?;
         write_clusters(&mut tx, meeting_id, clusters, &by_id, meta.created_at).await?;
-
+        if let Some(key) = key {
+            sqlx::query("INSERT INTO session_ingests (session_key, meeting_id) VALUES (?, ?)")
+                .bind(key).bind(meeting_id).execute(&mut *tx).await?;
+        }
         tx.commit().await.context("commit insert tx")?;
         Ok(meeting_id)
     }
@@ -640,7 +699,8 @@ impl Db {
         Ok(())
     }
 
-    /// Recompute a cluster's centroid and counts (after `merge`).
+    /// Recompute a cluster's centroid and counts (primitive regression fixture).
+    #[cfg(test)]
     pub async fn update_cluster_stats(
         &mut self,
         cluster_id: i64,
@@ -663,7 +723,8 @@ impl Db {
         Ok(())
     }
 
-    /// Move every window of `from` into `to` (the `merge` primitive).
+    /// Move every window of `from` into `to` (primitive regression fixture).
+    #[cfg(test)]
     pub async fn move_segments(&mut self, from_cluster: i64, to_cluster: i64) -> Result<u64> {
         let res = sqlx::query("UPDATE segment_voices SET cluster_id = ? WHERE cluster_id = ?")
             .bind(to_cluster)
@@ -675,6 +736,7 @@ impl Db {
     }
 
     /// Delete a cluster; its windows and its voiceprints go with it (cascade).
+    #[cfg(test)]
     pub async fn delete_cluster(&mut self, cluster_id: i64) -> Result<()> {
         sqlx::query("DELETE FROM voice_clusters WHERE id = ?")
             .bind(cluster_id)
@@ -682,6 +744,73 @@ impl Db {
             .await
             .context("delete cluster")?;
         Ok(())
+    }
+
+    /// Merge cluster membership, confirmation and enrollment in one transaction.
+    /// A manual victim must identify the same person as the existing keep cluster.
+    pub async fn merge_clusters(
+        &mut self,
+        meeting_id: i64,
+        keep: &str,
+        others: &[&str],
+        created_at: i64,
+    ) -> Result<(u64, i64, f64)> {
+        let mut tx = self.conn.begin_with("BEGIN IMMEDIATE").await.context("begin merge tx")?;
+        if others.is_empty() {
+            anyhow::bail!("speakers merge: pass one or more clusters to fold into {keep}");
+        }
+        let sql = format!("SELECT {CLUSTER_COLS} FROM voice_clusters WHERE meeting_id = ? AND cluster = ?");
+        let row = sqlx::query(&sql).bind(meeting_id).bind(keep)
+            .fetch_optional(&mut *tx).await?
+            .with_context(|| format!("meeting {meeting_id} has no cluster '{keep}'"))?;
+        let a = cluster_from_row(&row)?;
+        let mut seen = std::collections::HashSet::new();
+        let mut victims = Vec::with_capacity(others.len());
+        for &label in others {
+            if label == keep { anyhow::bail!("speakers merge: '{keep}' cannot be merged into itself"); }
+            if !seen.insert(label) { anyhow::bail!("speakers merge: duplicate victim '{label}'"); }
+            let row = sqlx::query(&sql).bind(meeting_id).bind(label)
+                .fetch_optional(&mut *tx).await?
+                .with_context(|| format!("meeting {meeting_id} has no cluster '{label}'"))?;
+            let b = cluster_from_row(&row)?;
+            if b.assigned_by.as_deref() == Some("manual") && b.speaker_id != a.speaker_id {
+                anyhow::bail!("cluster {label} carries a different manual name than {keep} — unlabel it first");
+            }
+            victims.push(b);
+        }
+        let manual = a.assigned_by.as_deref() == Some("manual")
+            || victims.iter().any(|b| b.assigned_by.as_deref() == Some("manual"));
+        let manual_speaker = if manual { Some(a.speaker_id.context("manual merge cluster has no speaker")?) } else { None };
+        let mut moved = 0u64;
+        for victim in &victims {
+            moved += sqlx::query("UPDATE segment_voices SET cluster_id = ? WHERE cluster_id = ?")
+                .bind(a.id).bind(victim.id).execute(&mut *tx).await?.rows_affected();
+            sqlx::query("DELETE FROM voice_clusters WHERE id = ?")
+                .bind(victim.id).execute(&mut *tx).await?;
+        }
+        let rows = sqlx::query(
+            "SELECT sv.segment_id, sv.inherited, sv.embedding, ts.t_start, ts.t_end \
+             FROM segment_voices sv JOIN transcript_segments ts ON ts.id = sv.segment_id \
+             WHERE sv.cluster_id = ? ORDER BY ts.t_start",
+        ).bind(a.id).fetch_all(&mut *tx).await?;
+        let windows = rows.iter().map(window_from_row).collect::<Result<Vec<_>>>()?;
+        let (centroid, n, secs) = crate::voices::stats_from(&windows)?;
+        let blob = crate::spk::to_blob(&centroid);
+        let dim = centroid.len() as i64;
+        sqlx::query("UPDATE voice_clusters SET centroid = ?, dim = ?, n_windows = ?, speech_secs = ? WHERE id = ?")
+            .bind(&blob).bind(dim).bind(n).bind(secs).bind(a.id).execute(&mut *tx).await?;
+        if let Some(speaker) = manual_speaker {
+            sqlx::query("UPDATE voice_clusters SET speaker_id = ?, assigned_by = 'manual', match_score = NULL, skipped = 0 WHERE id = ?")
+                .bind(speaker).bind(a.id).execute(&mut *tx).await?;
+            sqlx::query("DELETE FROM voiceprints WHERE cluster_id = ?")
+                .bind(a.id).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO voiceprints (speaker_id, meeting_id, cluster_id, embedding, dim, sample_secs, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+                .bind(speaker).bind(meeting_id).bind(a.id).bind(&blob).bind(dim).bind(secs).bind(created_at)
+                .execute(&mut *tx).await?;
+        }
+        tx.commit().await.context("commit merge tx")?;
+        log::info!("component=speakers event=merge_committed meeting_id={meeting_id} windows={n} victims={}", others.len());
+        Ok((moved, n, secs))
     }
 
     /// Replace ALL of a meeting's clusters (the retro `speakers cluster` path). One short
@@ -818,6 +947,7 @@ fn meeting_from_row(r: &SqliteRow) -> Result<MeetingRow> {
         duration_secs: r.try_get("duration_secs")?,
         segment_count: r.try_get("segment_count")?,
         created_at: r.try_get("created_at")?,
+        capture_status: r.try_get("capture_status")?,
     })
 }
 
@@ -942,6 +1072,7 @@ async fn apply_migrations(conn: &mut SqliteConnection) -> Result<()> {
         match v {
             0 => run_migration(conn, 0, 1, MIGRATION_V1).await?,
             1 => run_migration(conn, 1, 2, MIGRATION_V2).await?,
+            2 => run_migration(conn, 2, 3, MIGRATION_V3).await?,
             other => anyhow::bail!("no migration registered from schema v{other}"),
         }
     }
@@ -1011,6 +1142,14 @@ const MIGRATION_V2: &[&str] = &[
         created_at  INTEGER NOT NULL)",
     "CREATE INDEX IF NOT EXISTS idx_segment_voices_cluster ON segment_voices(cluster_id)",
     "CREATE INDEX IF NOT EXISTS idx_voice_clusters_meeting ON voice_clusters(meeting_id)",
+];
+
+/// v2 → v3: archive identity, capture completeness and atomic ingest provenance.
+const MIGRATION_V3: &[&str] = &[
+    "CREATE TABLE archive_identity (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), archive_id TEXT NOT NULL UNIQUE)",
+    "INSERT INTO archive_identity (singleton, archive_id) VALUES (1, lower(hex(randomblob(16))))",
+    "ALTER TABLE meetings ADD COLUMN capture_status TEXT NULL CHECK (capture_status IN ('unknown', 'complete', 'partial'))",
+    "CREATE TABLE session_ingests (session_key TEXT NOT NULL UNIQUE, meeting_id INTEGER NOT NULL UNIQUE REFERENCES meetings(id) ON DELETE CASCADE)",
 ];
 
 /// Run one ladder rung inside `BEGIN IMMEDIATE`, re-checking the version inside the transaction
@@ -1117,6 +1256,40 @@ async fn init_schema(conn: &mut SqliteConnection) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn v3_archive_identity_and_completeness_survive_reopen() {
+        let dir = tempdir();
+        let path = dir.join("archive.db");
+        seed_v1(&path).await;
+        let mut conn = SqliteConnection::connect_with(
+            &SqliteConnectOptions::new().filename(&path).foreign_keys(true)
+        ).await.unwrap();
+        run_migration(&mut conn, 1, 2, MIGRATION_V2).await.unwrap();
+        assert_eq!(read_user_version(&mut conn).await.unwrap(), 2);
+        conn.close().await.unwrap();
+
+        let mut db = Db::open(&path).await.unwrap();
+        assert_eq!(db.schema_version().await.unwrap(), 3, "recovery requires schema v3");
+        let archive: String = sqlx::query_scalar("SELECT archive_id FROM archive_identity WHERE singleton = 1")
+            .fetch_one(&mut db.conn).await.unwrap();
+        assert_eq!(archive.len(), 32);
+        assert!(archive.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        let status: Option<String> = sqlx::query_scalar("SELECT capture_status FROM meetings WHERE id = 1")
+            .fetch_one(&mut db.conn).await.unwrap();
+        assert_eq!(status, None, "legacy completeness must not be guessed");
+        assert_eq!(db.load_segments(1).await.unwrap()[0].seg.text, "legacy");
+        assert_eq!(db.list_vocab().await.unwrap().len(), 1);
+        db.close().await.unwrap();
+
+        let mut db = Db::open(&path).await.unwrap();
+        let reopened: String = sqlx::query_scalar("SELECT archive_id FROM archive_identity WHERE singleton = 1")
+            .fetch_one(&mut db.conn).await.unwrap();
+        assert_eq!(reopened, archive);
+        assert_eq!(db.list_meetings().await.unwrap().len(), 1);
+        db.close().await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn seg(sp: Speaker, t: f64, text: &str) -> TranscriptSegment {
         TranscriptSegment { speaker: sp, text: text.into(), t_start: t, t_end: t + 1.0, confidence: 0.9 }
     }
@@ -1144,6 +1317,7 @@ mod tests {
             started_at: 1_752_900_000,
             duration_secs: 312.5,
             created_at: 1_752_900_400,
+            capture_status: None,
         }
     }
 
@@ -1189,7 +1363,7 @@ mod tests {
 
     /// Every table the ladder produces. A rung that adds a table must add it here, or the
     /// fresh-vs-migrated check silently stops covering it.
-    const ALL_TABLES: [&str; 7] = [
+    const ALL_TABLES: [&str; 9] = [
         "meetings",
         "transcript_segments",
         "vocab_corrections",
@@ -1197,6 +1371,8 @@ mod tests {
         "voice_clusters",
         "segment_voices",
         "voiceprints",
+        "archive_identity",
+        "session_ingests",
     ];
 
     /// A 4-byte-per-value blob for a small fake embedding.
@@ -1330,13 +1506,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ladder_upgrades_a_populated_v1_db_to_v2_and_is_idempotent() {
+    async fn ladder_upgrades_a_populated_v1_db_to_v3_and_is_idempotent() {
         let tmp = tempdir();
         let path = tmp.join("m.db");
         seed_v1(&path).await;
 
         let mut db = open_file(&path).await.unwrap();
-        assert_eq!(db.schema_version().await.unwrap(), 2);
+        assert_eq!(db.schema_version().await.unwrap(), SCHEMA_VERSION);
         assert_eq!(db.list_meetings().await.unwrap().len(), 1);
         assert_eq!(db.list_vocab().await.unwrap().len(), 1, "v1 rows survive the v2 rung");
         // Unclustered legacy segments read back with no identity at all.
@@ -1347,7 +1523,7 @@ mod tests {
         db.close().await.unwrap();
 
         let mut db = open_file(&path).await.unwrap();
-        assert_eq!(db.schema_version().await.unwrap(), 2);
+        assert_eq!(db.schema_version().await.unwrap(), SCHEMA_VERSION);
         db.close().await.unwrap();
         std::fs::remove_dir_all(&tmp).ok();
     }

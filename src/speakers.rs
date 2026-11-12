@@ -16,6 +16,10 @@ use anyhow::{Context, Result, bail};
 
 use crate::{db, export, spk, voices};
 
+#[cfg(test)]
+#[path = "audit_speakers.rs"]
+mod audit_tests;
+
 const USAGE: &str = "usage: meetscribe speakers <list|play|label|unlabel|skip|merge|split|cluster|match|rename> [...]\n\
     \n\
     \x20 list [--pending]                          people (with voiceprint counts) | voices still to name\n\
@@ -405,34 +409,7 @@ fn rename(rt: &tokio::runtime::Runtime, db_path: &Path, sid: i64, first: &str, l
 fn merge_clusters(rt: &tokio::runtime::Runtime, db_path: &Path, mid: i64, keep: &str, others: &[&str]) -> Result<()> {
     let (moved, n, secs) = rt.block_on(async {
         let mut db = db::Db::open(db_path).await?;
-        let a = cluster_or_bail(&mut db, mid, keep).await?;
-        let mut victims = Vec::new();
-        for label in others {
-            if *label == keep {
-                bail!("speakers merge: '{keep}' cannot be merged into itself");
-            }
-            let b = cluster_or_bail(&mut db, mid, label).await?;
-            if b.assigned_by.as_deref() == Some("manual") && b.speaker_id != a.speaker_id {
-                bail!(
-                    "cluster {label} carries a different manual name than {keep} — `speakers unlabel {mid} {label}` first"
-                );
-            }
-            victims.push(b);
-        }
-        let mut moved = 0;
-        for b in &victims {
-            moved += db.move_segments(b.id, a.id).await?;
-            db.delete_cluster(b.id).await?;
-        }
-        let windows = db.cluster_windows(a.id).await?;
-        let (centroid, n, secs) = voices::stats_from(&windows)?;
-        db.update_cluster_stats(a.id, &spk::to_blob(&centroid), centroid.len() as i64, n, secs).await?;
-        // A manual label's voiceprint IS the centroid; refresh it to the merged one.
-        if let (Some("manual"), Some(sid)) = (a.assigned_by.as_deref(), a.speaker_id) {
-            db.delete_voiceprints_for_cluster(a.id).await?;
-            let fresh = db.get_cluster(mid, keep).await?.context("cluster vanished")?;
-            db.add_voiceprint(sid, &fresh, crate::now_epoch()).await?;
-        }
+        let (moved, n, secs) = db.merge_clusters(mid, keep, others, crate::now_epoch()).await?;
         db.close().await?;
         anyhow::Ok((moved, n, secs))
     })?;

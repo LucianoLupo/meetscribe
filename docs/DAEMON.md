@@ -32,16 +32,17 @@ Keys (all optional; unknown keys are warned and ignored, missing keys default):
 - `[detector] allowlist_extra = ["com.example.App"]` — extra meeting apps (identifier or dotted
   sub-identifier), ADDED to the built-ins. `use_builtin_allowlist = false` uses ONLY your extras.
 - `[daemon] lang = "es"` · `min_secs = 20.0` — transcription language + minimum session length.
-- `[retention] sessions_days = 0` — delete session folders older than N days (**0 = keep forever**,
-  the default; the meeting + transcript stay in the DB, so `export <id>` still works). ·
+- `[retention] sessions_days = 0` — prune eligible managed session folders older than N days
+  (**0 = keep forever**, the default). Eligibility requires stable ownership and either a verified
+  matching archive/export pair or a clean short capture; unknown, edited and legacy material stays. ·
   `log_max_mb = 10` — rotate the daemon log over N MB (keeps one `.1` backup; 0 = never).
 
 Disk/log hygiene (session prune + log rotation) runs at daemon startup and once per day.
 
-⚠️ **`retention.sessions_days > 0` deletes the audio permanently**, with no confirmation and no
-error. Transcripts survive in the DB, but anything that needs the WAVs again — re-transcribing with
-a better model, or the planned speaker enrollment — is gone for those meetings. `0` is the default
-for that reason.
+⚠️ **`retention.sessions_days > 0` permanently deletes eligible audio without a confirmation**.
+Prune failures are logged; age alone is not permission to delete unarchived or unknown material.
+Verified archived transcripts survive, but later re-transcription or voice sampling needs retained
+WAVs. Keep `0` when those operations may still be needed.
 
 ## Vocabulary corrections — stored text vs written text
 
@@ -91,21 +92,17 @@ result lives in its own tables (`speakers`, `voice_clusters`, `segment_voices`, 
 ## Schema migrations
 
 The database carries a `PRAGMA user_version` and upgrades itself on first open by a newer binary.
-Before installing a build that bumps it:
+Treat installation as a separate, explicitly approved quiet-window operation. First arrange a
+consistent SQLite backup and prove restore/integrity on a disposable copy. Do not copy a live
+SQLite file as if that were a verified backup, or migrate while a meeting is being stored.
 
-```
-cp ~/.meetscribe/meetscribe.db ~/.meetscribe/meetscribe.db.pre-vN   # 1. back up
-launchctl bootout gui/$(id -u)/com.lucianolupo.meetscribe           # 2. stop the daemon
-meetscribe list                                                     # 3. migrate + smoke-read
-sqlite3 ~/.meetscribe/meetscribe.db 'PRAGMA user_version'           # 4. confirm the bump
-```
+Migrations remain additive/read-compatible, but **do not blindly resume an old binary as a writer**:
+its recovery/retention logic does not understand the new session sidecars. If an upgrade fails,
+preserve files, use read-only inspection and prefer a forward fix. Restoring an older backup can
+discard newer meetings and requires a separate decision.
 
-Then rebuild → re-sign → `meetscribe install` as usual. To revert, **reinstall the old binary** —
-migrations are additive (never a NOT NULL column, never a rename), so an older binary reads a newer
-database. Restore the backup only if a rung failed half-way, which the transactional ladder is built
-to prevent; restoring it otherwise discards every meeting captured since the copy.
-
-Rungs so far: v1 `vocab_corrections`; v2 the four speaker-identity tables (CREATE only, no ALTER).
+Rungs: v1 `vocab_corrections`; v2 speaker-identity tables; v3 archive identity, keyed session ingests
+and capture completeness. Existing meeting IDs/text remain; legacy completeness is unknown.
 
 ⚠️ Migrating turns `list` and `export` into **writers** on their first run under a new binary. The
 database uses SQLite's default rollback journal (no WAL), so writers serialize — run the migration
@@ -120,7 +117,10 @@ green = idle · red = recording · amber = paused · gray = daemon stopped. Menu
 - **Open recordings folder** / **Open config file**, and **Stop background daemon**.
 
 Launch it manually (`meetscribe tray &`) or add a login LaunchAgent for it. The daemon and tray talk
-only through the two files, so the tray never touches audio and adds no risk to capture.
+through status/pause files and instance-addressed Stop requests. Stop is bound to the selected
+process-start identity and nonce, not a reusable PID. The tray itself does not capture audio.
+An already-running legacy tray is not upgraded by replacing the daemon binary; retire it separately
+in an approved upgrade window before relying on the new control guarantees.
 
 ## Install (enable at login)
 Run from the repo (so the default `--model models/ggml-large-v3.bin` resolves):
@@ -142,19 +142,29 @@ which is the binary the daemon actually runs. It picks the identity in this orde
 existing install untouched. (Sign `target/debug/meetscribe` by hand only if you want to run
 the **manual capture** flow directly from it, which needs its own TCC grant.)
 
-`install` is **idempotent** and does, in order:
-1. `launchctl bootout` any running instance (so the rebuild→reinstall loop never leaves a stale inode);
-2. **refuse** if the binary was built with the `coreml` feature (an unattended `coreml` daemon would
-   eat the one-time ~23-min CoreML ANE compile on a live meeting — metal-only only);
-3. copy the running binary → `~/.meetscribe/bin/meetscribe` (a **stable path** so future
-   `cargo build`s can't zero the running daemon's signature/TCC grant) and **re-sign** it there;
-4. provision the model at `~/.meetscribe/models/ggml-large-v3.bin` — a **symlink** to the repo model
-   by default (no 2.9 GB copy), or `install --copy` for a repo-independent copy — and, the same way,
-   the speaker model under `~/.meetscribe/models/speaker/` (missing ⇒ warn, the daemon transcribes
-   without speaker identity; `--speaker-model <onnx>` overrides the source);
-5. write `~/Library/LaunchAgents/com.lucianolupo.meetscribe.plist` (absolute paths, pinned `HOME`,
-   `RunAtLoad`, `KeepAlive` on crash);
-6. `launchctl bootstrap gui/$UID` it (starts now + at every login).
+`install` performs these stages; it is **not an all-artifact atomic transaction**:
+1. Refuse a `coreml` daemon build, resolve the identity, then copy/sign/verify a staged binary.
+2. Restrict logs, reconcile an interrupted runtime swap, and validate/stage supplied models and
+   the complete diarizer runtime before the agent-stop seam. Self-sources are no-ops; missing
+   optional sources preserve installed artifacts. Required-source failures leave the agent running.
+3. Request launchd unload and wait for it before publishing replacement artifacts. A timeout
+   prevents publication/bootstrap, but launchd disappearance does not prove old child quiescence.
+4. Publish the staged binary and validated assets. Model publication preserves a usable old file;
+   the runtime keeps backup/journal evidence for reconciliation. Failures return before bootstrap.
+5. Write the plist with absolute paths, pinned HOME, login/crash settings and owner-only logs.
+6. Bootstrap the new agent. Real signing/TCC, live installation and rollback behavior require
+   separate integration validation; source tests do not establish them.
+
+## Legacy recordings and upgrade boundary
+
+Unkeyed legacy recordings are quarantined from automatic recovery and retention, with or without
+a `pending` marker. A stopped parent, unloaded launchd label, elapsed delay or new keyed lock does
+not prove its old transcription children are gone. No automatic legacy-row adoption is enabled.
+Ambiguity preserves those recordings while unrelated new managed captures continue.
+
+Live retirement and existing-row adoption need independently established child quiescence plus
+archive/row identity; neither an operator assertion nor a guessed PID is sufficient. This branch
+does not claim that upgrade acceptance has been exercised on an installed legacy daemon.
 
 ## Rebuild → reinstall loop
 After changing daemon code, **rebuild, re-sign, and reinstall** — do NOT just `cargo build` (that
@@ -175,6 +185,23 @@ meetscribe detect --watch                                 # what the detector se
 ```
 Auto-recorded sessions land in `~/.meetscribe/sessions/<YYYYMMDD-HHMMSS>/` (mic.wav, system.wav,
 transcript.md, transcript.json); meetings are stored in `~/.meetscribe/meetscribe.db` (0600).
+
+Managed automatic transcription has an initial attempt plus three retries, with persisted
+1-, 5-, and 30-minute waits. Failure to launch the transcription executable uses that same
+budget (`child_launch`), including across worker restarts; exhaustion requires attention.
+A busy session lock consumes no attempt. An interrupted child's existing reservation is
+settled once, not charged again when a replacement executable cannot launch. Unknown
+post-launch outcomes are not treated as fresh launch failures. Session metadata preserves
+the retry state, and content-free recovery events appear in the stderr log above.
+
+A persisted Complete session can reconcile its stale `pending` marker after an abnormal child
+exit or on the next scan, but only under the session lock with archive/export proof and the exact
+owned marker contents. Busy, mismatched, edited, symlinked and otherwise unknown material stays.
+
+Managed roll timing uses one shared committed boundary for both channels. Managed manual
+transcription also respects checkpointed prefixes and recorded roll identities; it still appends
+a new meeting, while `--no-store` opens no DB. Unmanaged manual input keeps the legacy full-file
+behavior. Neither recovery nor playback uses uncommitted tails or unknown managed rolls.
 
 ## Manual load / unload (without reinstalling)
 ```
