@@ -611,6 +611,10 @@ fn pending_sessions_at(sessions_dir: &Path, now: i64) -> Vec<(PathBuf, String, S
             if reconciled.is_err() { log::warn!("component=recovery event=pending_reconcile_failed"); }
         }
         if !state.due(now) { return None; }
+        // A held lock means an owner is at work on this session: the capture loop for the whole
+        // of a call, or a transcription started by hand. A capture cut short by a crash holds no
+        // lock and stays due. The probe never waits and releases the lock at once.
+        if matches!(crate::recovery::Session::open(&dir), Ok(None)) { return None; }
         let label = detect::app_label(&state.app).to_string();
         Some((state.started_at, dir, label, state.title))
     }).collect();
@@ -966,6 +970,55 @@ mod tests {
             ]
         );
         std::fs::remove_dir_all(&sessions).ok();
+    }
+
+    /// A recording in progress holds its session lock, so the scan leaves it alone. The same
+    /// session with the lock free and the state still `Recording` is a capture cut short by a
+    /// crash, and that one is due for recovery.
+    #[test]
+    fn the_scan_skips_a_session_whose_lock_is_held() {
+        let sessions = temp_base("scan-held");
+        let dir = sessions.join("recording");
+        let mut owner = crate::recovery::Session::begin(&dir, &sessions.join("archive.db"), &dir,
+            "com.google.Chrome", "Scan fixture", 100).unwrap();
+        owner.start_roll(0, 16_000, 0.0).unwrap();
+        owner.checkpoint(0, 16_000, 16_000).unwrap();
+        assert_eq!(owner.state.phase, crate::recovery::Phase::Recording);
+        assert!(pending_sessions_at(&sessions, 1000).is_empty(), "a recording in progress was offered for transcription");
+        drop(owner);
+        let found = pending_sessions_at(&sessions, 1000);
+        let names: Vec<_> = found.iter().map(|(dir, _, _)| dir.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, ["recording"], "an interrupted recording must stay recoverable");
+        std::fs::remove_dir_all(&sessions).ok();
+    }
+
+    /// The same rule through the worker: no transcription child is started for a recording in
+    /// progress, however often the idle scan runs, and one is started once the lock is free.
+    #[test]
+    fn the_worker_starts_no_job_for_a_recording_in_progress() {
+        let base = temp_base("worker-held");
+        let sessions = base.join("sessions");
+        let dir = sessions.join("recording");
+        let mut owner = crate::recovery::Session::begin(&dir, &base.join("archive.db"), &dir,
+            "com.google.Chrome", "Worker fixture", 100).unwrap();
+        owner.start_roll(0, 16_000, 0.0).unwrap();
+        owner.checkpoint(0, 16_000, 16_000).unwrap();
+        let key = owner.state.key.clone();
+        let (ran_tx, ran_rx) = mpsc::channel();
+        let board = Arc::new(StatusBoard::new(base.clone()));
+        let (jobs, worker) = spawn_transcriber_loop(board, move |job| ran_tx.send(job.dir.clone()).unwrap(), move || {
+            pending_sessions_at(&sessions, 1000).into_iter().map(|(dir, label, _)| {
+                let mut item = job(&dir, &label);
+                item.opts.session_key = Some(key.clone()); item.opts.no_store = false; item
+            }).collect()
+        }, || 1000, Duration::from_millis(5)).unwrap();
+        // About thirty idle scans while the recording holds its lock.
+        assert!(ran_rx.recv_timeout(Duration::from_millis(150)).is_err(), "a job ran for a recording in progress");
+        drop(owner);
+        assert_eq!(ran_rx.recv_timeout(Duration::from_secs(3)).unwrap().file_name().unwrap(), "recording");
+        assert!(ran_rx.recv_timeout(Duration::from_millis(30)).is_err(), "the same session ran twice inside its recheck delay");
+        drop(jobs); worker.join().unwrap();
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
