@@ -16,6 +16,7 @@
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -248,8 +249,19 @@ impl StreamWriter {
     fn create(out_dir: &Path, key: &str, print: bool) -> Result<Self> {
         recovery::private_dir(out_dir)?;
         let path = out_dir.join(format!("{key}.jsonl"));
-        let file = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path)
+        // Opened without truncating: a second reader of the same meeting must meet the first
+        // one's lock before it can empty the stream under it. The lock lasts as long as `file`.
+        let file = OpenOptions::new().write(true).create(true).truncate(false).mode(0o600).open(&path)
             .with_context(|| format!("create live stream {}", path.display()))?;
+        // SAFETY: `file` owns the valid descriptor; flock does not access Rust memory.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                bail!("another live reader already writes this meeting's stream");
+            }
+            return Err(error).context("lock the live stream");
+        }
+        file.set_len(0).context("start the live stream")?;
         Ok(Self { file, path, seq: 0, print })
     }
 
@@ -289,7 +301,7 @@ fn read_state(dir: &Path) -> Result<(State, SystemTime)> {
 
 /// Audio seconds the checkpoint covers, on the meeting's timeline: what had been captured when
 /// the state file was written.
-fn committed_secs(state: &State) -> f64 {
+pub(crate) fn committed_secs(state: &State) -> f64 {
     state.rolls.last().zip(state.roll_offsets().last().copied()).map_or(0.0, |(roll, offset)| {
         offset + roll.mic_frames.max(roll.system_frames) as f64 / f64::from(roll.sample_rate)
     })
@@ -318,6 +330,7 @@ pub(crate) fn run_live(
     let mut stream = StreamWriter::create(&opts.out_dir, &key, opts.print)?;
     stream.event("meeting_started", json!({
         "key": key, "app": detect::app_label(&state.app), "started_at": state.started_at,
+        "model": crate::pipeline::model_name(&opts.model),
     }))?;
     log_event("live_started", &key, json!({}));
 
@@ -349,11 +362,7 @@ pub(crate) fn run_live(
             decoded_secs = decoded_secs.max(window.t_end);
             if text.is_empty() { continue; }
             last_lag_ms = lag_ms(&state, written, window.t_end, SystemTime::now());
-            stream.event("segment", json!({
-                "speaker": window.speaker, "t_start": round(window.t_start, 2), "t_end": round(window.t_end, 2),
-                "text": text, "confidence": round(f64::from(confidence), 3), "lag_ms": last_lag_ms,
-                "decode_ms": decode_ms,
-            }))?;
+            stream.event("segment", segment_fields(&window, &text, confidence, last_lag_ms, decode_ms))?;
             segments += 1;
         }
         if last_heartbeat.elapsed() >= HEARTBEAT {
@@ -377,12 +386,24 @@ pub(crate) fn run_live(
     };
 
     let audio_secs = channels.iter().map(|channel| channel.audio_secs(&state)).fold(0.0, f64::max);
-    stream.event("meeting_ended", json!({"duration_secs": round(audio_secs, 1), "reason": reason}))?;
+    stream.event("meeting_ended", json!({
+        "duration_secs": round(audio_secs, 1), "reason": reason, "segments": segments, "short_windows": short_windows,
+    }))?;
     log_event("live_stopped", &key, json!({
         "audio_secs": round(audio_secs, 1), "decoded_secs": round(decoded_secs, 1),
         "windows": segments, "short_windows": short_windows, "lag_ms": last_lag_ms,
     }));
     Ok(LiveSummary { segments, short_windows, audio_secs, reason, stream: stream.path })
+}
+
+/// The fields of one `segment` line. The times are written as computed (the roll's offset plus
+/// whole milliseconds), not rounded: `speakers cluster` slices the recording at stored times and
+/// refuses one that is off a millisecond boundary of its roll.
+fn segment_fields(window: &Pending, text: &str, confidence: f32, lag_ms: u64, decode_ms: u64) -> Value {
+    json!({
+        "speaker": window.speaker, "t_start": window.t_start, "t_end": window.t_end,
+        "text": text, "confidence": round(f64::from(confidence), 3), "lag_ms": lag_ms, "decode_ms": decode_ms,
+    })
 }
 
 /// One line of the stream as the viewer shows it; `None` for events with nothing to show.
@@ -714,6 +735,12 @@ mod tests {
         assert_eq!((lines[0]["app"].as_str(), lines[0]["key"].as_str()), (Some("Chrome"), Some(session.state.key.as_str())));
         assert_eq!(lines.last().unwrap()["type"], "meeting_ended");
         assert_eq!(lines.last().unwrap()["reason"], "ended");
+        // What a later reader of the stream needs to judge it complete: the model that decoded
+        // it, and how many segment lines it should hold.
+        assert_eq!(lines[0]["model"], "unused");
+        let ended = lines.last().unwrap();
+        assert_eq!((ended["segments"].as_u64(), ended["short_windows"].as_u64()), (Some(0), Some(0)));
+        assert_eq!(lines.iter().filter(|line| line["type"] == "segment").count() as u64, summary.segments);
         assert!(lines.iter().enumerate().all(|(index, line)| line["seq"] == index as u64 && line["v"] == 1));
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(&summary.stream).unwrap().permissions().mode() & 0o777, 0o600);
@@ -754,6 +781,48 @@ mod tests {
         assert_eq!(lag_ms(&state, written, 61.0, now), 2_000, "a moment past the checkpoint is not in the future");
         drop((mic, system));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Two readers on one meeting (a daemon-started one and a hand-started `live watch`) must
+    /// not both write its stream: the second is refused before it can empty the first one's file.
+    #[test]
+    fn a_second_writer_is_refused_and_the_first_stream_is_intact() {
+        let root = temp_root("writer-lock");
+        let out = root.join("live");
+        let key = "a6e79ba0314c4cc2b647f4d25b327011";
+        let mut first = StreamWriter::create(&out, key, false).unwrap();
+        first.event("meeting_started", json!({"key": key})).unwrap();
+        let before = std::fs::read(&first.path).unwrap();
+        assert!(StreamWriter::create(&out, key, false).is_err(), "a second writer was let in");
+        assert_eq!(std::fs::read(&first.path).unwrap(), before, "the refused writer emptied the stream");
+        first.event("heartbeat", json!({})).unwrap();
+        assert_eq!(events(&first.path).iter().map(|line| line["seq"].as_u64().unwrap()).collect::<Vec<_>>(), [0, 1]);
+        // Once the first writer is gone, a new reader starts the stream again from nothing.
+        let path = first.path.clone();
+        drop(first);
+        let again = StreamWriter::create(&out, key, false).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        drop(again);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// `speakers cluster` slices the recording at stored times and refuses a time that is off a
+    /// millisecond boundary of its roll. A roll after a device change starts at an offset on no
+    /// decimal grid, so a time rounded for the stream would no longer match the audio.
+    #[test]
+    fn segment_times_survive_the_stream_on_a_millisecond_of_their_roll() {
+        // The second roll of the fixture above: 3 s of roll 0 and a 0.25 s gap would put it on a
+        // grid, so start it after 95,900 frames at 48 kHz instead.
+        let offset = 0.25 + 95_900.0 / 48_000.0;
+        let window = Pending { speaker: Speaker::Others, t_start: offset + 1_232.0 / 1000.0,
+            t_end: offset + 4_567.0 / 1000.0, audio: Vec::new() };
+        let line = segment_fields(&window, "decoded", 0.91, 3_400, 1_500).to_string();
+        let read: Value = serde_json::from_str(&line).unwrap();
+        for (field, whole_ms) in [("t_start", 1_232.0), ("t_end", 4_567.0)] {
+            let ms = (read[field].as_f64().unwrap() - offset) * 1000.0;
+            assert!((ms - whole_ms).abs() <= 1e-6, "{field} is {ms} ms into its roll, not {whole_ms}");
+        }
+        assert_eq!((read["speaker"].as_str(), read["confidence"].as_f64()), (Some("others"), Some(0.91)));
     }
 
     #[test]

@@ -691,7 +691,7 @@ fn earliest_capture_start(mic: &[PathBuf], sys: &[PathBuf]) -> i64 {
 }
 
 /// Clean model name for storage/display (`models/ggml-large-v3.bin` → `ggml-large-v3`).
-fn model_name(model: &Path) -> String {
+pub(crate) fn model_name(model: &Path) -> String {
     model
         .file_stem()
         .and_then(|s| s.to_str())
