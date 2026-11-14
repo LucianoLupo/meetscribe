@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use silero::{VadConfig, VadSession, VadTransition};
 
@@ -237,6 +238,27 @@ impl Stream {
     }
 }
 
+/// The four events of a stream, as the reader writes them and as promotion reads them back
+/// (`promote.rs`). One description for both sides: a field renamed here cannot leave the gate
+/// reading a stream the reader no longer writes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum StreamEvent {
+    MeetingStarted { key: String, app: String, started_at: i64, model: String },
+    Segment { speaker: Speaker, t_start: f64, t_end: f64, text: String, confidence: f64, lag_ms: u64, decode_ms: u64 },
+    Heartbeat { audio_secs: f64, decoded_secs: f64 },
+    MeetingEnded { duration_secs: f64, reason: String, segments: u64, short_windows: u64 },
+}
+
+/// One line of a stream: an event, the format version and the line's position.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct StreamLine {
+    pub v: u32,
+    pub seq: u64,
+    #[serde(flatten)]
+    pub event: StreamEvent,
+}
+
 /// The append-only stream of one meeting. Every event is one line, written with one `write`, so
 /// a reader (or a killed writer) never sees half an event except possibly a last unfinished line.
 struct StreamWriter {
@@ -266,14 +288,14 @@ impl StreamWriter {
         Ok(Self { file, path, seq: 0, print })
     }
 
-    fn event(&mut self, kind: &str, mut fields: Value) -> Result<()> {
-        fields["v"] = json!(1);
-        fields["seq"] = json!(self.seq);
-        fields["type"] = json!(kind);
-        self.file.write_all(format!("{fields}\n").as_bytes()).context("append to the live stream")?;
+    fn event(&mut self, event: StreamEvent) -> Result<()> {
+        // Through a `Value`, whose keys are sorted: the line's bytes do not depend on the order
+        // of the fields above.
+        let line = serde_json::to_value(StreamLine { v: 1, seq: self.seq, event }).context("encode a live stream event")?;
+        self.file.write_all(format!("{line}\n").as_bytes()).context("append to the live stream")?;
         self.seq += 1;
-        if self.print && let Some(line) = display(&fields) {
-            println!("{line}");
+        if self.print && let Some(shown) = display(&line) {
+            println!("{shown}");
         }
         Ok(())
     }
@@ -302,7 +324,7 @@ fn read_state(dir: &Path) -> Result<(State, SystemTime)> {
 
 /// Audio seconds the checkpoint covers, on the meeting's timeline: what had been captured when
 /// the state file was written.
-fn committed_secs(state: &State) -> f64 {
+pub(crate) fn committed_secs(state: &State) -> f64 {
     state.rolls.last().zip(state.roll_offsets().last().copied()).map_or(0.0, |(roll, offset)| {
         offset + roll.mic_frames.max(roll.system_frames) as f64 / f64::from(roll.sample_rate)
     })
@@ -329,10 +351,10 @@ pub(crate) fn run_live(
     let (mut state, mut written) = read_state(dir).context("the session has no readable state yet")?;
     let key = state.key.clone();
     let mut stream = StreamWriter::create(&opts.out_dir, &key, opts.print)?;
-    stream.event("meeting_started", json!({
-        "key": key, "app": detect::app_label(&state.app), "started_at": state.started_at,
-        "model": crate::pipeline::model_name(&opts.model),
-    }))?;
+    stream.event(StreamEvent::MeetingStarted {
+        key: key.clone(), app: detect::app_label(&state.app).into(), started_at: state.started_at,
+        model: crate::pipeline::model_name(&opts.model),
+    })?;
     log_event("live_started", &key, json!({}));
 
     let mut channels = [Stream::new("mic", Speaker::You)?, Stream::new("system", Speaker::Others)?];
@@ -363,11 +385,11 @@ pub(crate) fn run_live(
             decoded_secs = decoded_secs.max(window.t_end);
             if text.is_empty() { continue; }
             last_lag_ms = lag_ms(&state, written, window.t_end, SystemTime::now());
-            stream.event("segment", segment_fields(&window, &text, confidence, last_lag_ms, decode_ms))?;
+            stream.event(segment_fields(&window, &text, confidence, last_lag_ms, decode_ms))?;
             segments += 1;
         }
         if last_heartbeat.elapsed() >= HEARTBEAT {
-            stream.event("heartbeat", json!({"audio_secs": round(audio_secs, 1), "decoded_secs": round(decoded_secs, 1)}))?;
+            stream.event(StreamEvent::Heartbeat { audio_secs: round(audio_secs, 1), decoded_secs: round(decoded_secs, 1) })?;
             last_heartbeat = Instant::now();
         }
         if last_lag_log.elapsed() >= LAG_LOG {
@@ -387,9 +409,9 @@ pub(crate) fn run_live(
     };
 
     let audio_secs = channels.iter().map(|channel| channel.audio_secs(&state)).fold(0.0, f64::max);
-    stream.event("meeting_ended", json!({
-        "duration_secs": round(audio_secs, 1), "reason": reason, "segments": segments, "short_windows": short_windows,
-    }))?;
+    stream.event(StreamEvent::MeetingEnded {
+        duration_secs: round(audio_secs, 1), reason: reason.into(), segments, short_windows,
+    })?;
     log_event("live_stopped", &key, json!({
         "audio_secs": round(audio_secs, 1), "decoded_secs": round(decoded_secs, 1),
         "segments": segments, "short_windows": short_windows, "lag_ms": last_lag_ms,
@@ -401,11 +423,11 @@ pub(crate) fn run_live(
 /// The fields of one `segment` line. The times are written as computed (the roll's offset plus
 /// whole milliseconds), not rounded: `speakers cluster` slices the recording at stored times and
 /// refuses one that is off a millisecond boundary of its roll.
-fn segment_fields(window: &Pending, text: &str, confidence: f32, lag_ms: u64, decode_ms: u64) -> Value {
-    json!({
-        "speaker": window.speaker, "t_start": window.t_start, "t_end": window.t_end,
-        "text": text, "confidence": round(f64::from(confidence), 3), "lag_ms": lag_ms, "decode_ms": decode_ms,
-    })
+fn segment_fields(window: &Pending, text: &str, confidence: f32, lag_ms: u64, decode_ms: u64) -> StreamEvent {
+    StreamEvent::Segment {
+        speaker: window.speaker, t_start: window.t_start, t_end: window.t_end,
+        text: text.into(), confidence: round(f64::from(confidence), 3), lag_ms, decode_ms,
+    }
 }
 
 /// One line of the stream as the viewer shows it; `None` for events with nothing to show.
@@ -815,11 +837,11 @@ mod tests {
         let out = root.join("live");
         let key = "a6e79ba0314c4cc2b647f4d25b327011";
         let mut first = StreamWriter::create(&out, key, false).unwrap();
-        first.event("meeting_started", json!({"key": key})).unwrap();
+        first.event(StreamEvent::MeetingStarted { key: key.into(), app: "Chrome".into(), started_at: 1_794_443_305, model: "unused".into() }).unwrap();
         let before = std::fs::read(&first.path).unwrap();
         assert!(StreamWriter::create(&out, key, false).is_err(), "a second writer was let in");
         assert_eq!(std::fs::read(&first.path).unwrap(), before, "the refused writer emptied the stream");
-        first.event("heartbeat", json!({})).unwrap();
+        first.event(StreamEvent::Heartbeat { audio_secs: 2.0, decoded_secs: 0.0 }).unwrap();
         assert_eq!(events(&first.path).iter().map(|line| line["seq"].as_u64().unwrap()).collect::<Vec<_>>(), [0, 1]);
         // Once the first writer is gone, a new reader starts the stream again from nothing.
         let path = first.path.clone();
@@ -840,7 +862,7 @@ mod tests {
         let offset = 0.25 + 95_900.0 / 48_000.0;
         let window = Pending { speaker: Speaker::Others, t_start: offset + 1_232.0 / 1000.0,
             t_end: offset + 4_567.0 / 1000.0, audio: Vec::new() };
-        let line = segment_fields(&window, "decoded", 0.91, 3_400, 1_500).to_string();
+        let line = serde_json::to_string(&segment_fields(&window, "decoded", 0.91, 3_400, 1_500)).unwrap();
         let read: Value = serde_json::from_str(&line).unwrap();
         for (field, whole_ms) in [("t_start", 1_232.0), ("t_end", 4_567.0)] {
             let ms = (read[field].as_f64().unwrap() - offset) * 1000.0;
@@ -976,6 +998,40 @@ mod tests {
         let mut more = Vec::new();
         print_from(&path, offset, &mut more).unwrap();
         assert_eq!(String::from_utf8(more).unwrap().trim_end(), format!("── ended · {} ──", export::fmt_duration(3731.0)));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The lines below were written by the build before the events became a type (2ec1d9e) and
+    /// are frozen here: a stream already on disk, and every reader of one, depends on these exact
+    /// bytes. They are NOT regenerated from the type they check.
+    #[test]
+    fn the_typed_events_write_the_same_bytes_as_the_untyped_writer_did() {
+        const FROZEN: &str = concat!(
+            r#"{"app":"Chrome","key":"a6e79ba0314c4cc2b647f4d25b327011","model":"ggml-large-v3","seq":0,"started_at":1794443305,"type":"meeting_started","v":1}"#, "\n",
+            r#"{"confidence":0.914,"decode_ms":1500,"lag_ms":3400,"seq":1,"speaker":"others","t_end":6.814916666666667,"t_start":3.479916666666667,"text":" Hola, ¿se \"escucha\"? ","type":"segment","v":1}"#, "\n",
+            r#"{"confidence":1.0,"decode_ms":7,"lag_ms":0,"seq":2,"speaker":"you","t_end":47.0,"t_start":41.2,"text":"Sí, perfecto.","type":"segment","v":1}"#, "\n",
+            r#"{"audio_secs":52.0,"decoded_secs":48.6,"seq":3,"type":"heartbeat","v":1}"#, "\n",
+            r#"{"duration_secs":3731.0,"reason":"ended","segments":2,"seq":4,"short_windows":5,"type":"meeting_ended","v":1}"#, "\n",
+        );
+        let root = temp_root("frozen");
+        let key = "a6e79ba0314c4cc2b647f4d25b327011";
+        let mut stream = StreamWriter::create(&root, key, false).unwrap();
+        stream.event(StreamEvent::MeetingStarted { key: key.into(), app: "Chrome".into(), started_at: 1_794_443_305,
+            model: crate::pipeline::model_name(Path::new("/m/ggml-large-v3.bin")) }).unwrap();
+        let offset = 0.25 + 95_900.0 / 48_000.0;
+        let window = Pending { speaker: Speaker::Others, t_start: offset + 1_232.0 / 1000.0, t_end: offset + 4_567.0 / 1000.0, audio: Vec::new() };
+        stream.event(segment_fields(&window, " Hola, ¿se \"escucha\"? ", 0.9137, 3_400, 1_500)).unwrap();
+        let window = Pending { speaker: Speaker::You, t_start: 41.2, t_end: 47.0, audio: Vec::new() };
+        stream.event(segment_fields(&window, "Sí, perfecto.", 1.0, 0, 7)).unwrap();
+        stream.event(StreamEvent::Heartbeat { audio_secs: round(52.04, 1), decoded_secs: round(48.649, 1) }).unwrap();
+        stream.event(StreamEvent::MeetingEnded { duration_secs: round(3731.04, 1), reason: "ended".into(), segments: 2, short_windows: 5 }).unwrap();
+        assert_eq!(std::fs::read_to_string(&stream.path).unwrap(), FROZEN);
+        // And the same lines read back into the same events, which is what promotion relies on.
+        let read: Vec<StreamLine> = FROZEN.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(read.iter().map(|line| (line.v, line.seq)).collect::<Vec<_>>(), [(1, 0), (1, 1), (1, 2), (1, 3), (1, 4)]);
+        assert_eq!(read[1].event, StreamEvent::Segment { speaker: Speaker::Others, t_start: offset + 1_232.0 / 1000.0,
+            t_end: offset + 4_567.0 / 1000.0, text: " Hola, ¿se \"escucha\"? ".into(), confidence: 0.914, lag_ms: 3_400, decode_ms: 1_500 });
+        assert_eq!(read[4].event, StreamEvent::MeetingEnded { duration_secs: 3731.0, reason: "ended".into(), segments: 2, short_windows: 5 });
         std::fs::remove_dir_all(root).unwrap();
     }
 }

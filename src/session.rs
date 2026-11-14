@@ -472,7 +472,8 @@ mod tests {
                     let key = owner.state.key.clone();
                     let metadata = db::MeetingMeta { title: owner.state.title.clone(), source_dir: owner.dir.display().to_string(),
                         model: "synthetic-whisper-large-v3".into(), lang: "en".into(), started_at: owner.state.started_at,
-                        duration_secs: 2.1, created_at: 1_762_880_010, capture_status: Some("complete".into()) };
+                        duration_secs: 2.1, created_at: 1_762_880_010, capture_status: Some("complete".into()),
+                        origin: db::TranscriptOrigin::Batch };
                     let segments = [crate::transcript::TranscriptSegment { speaker: crate::transcript::Speaker::You,
                         text: "The route-change release check passed".into(), t_start: 0.1, t_end: 0.9, confidence: 0.94 }];
                     let (id, row, stored) = crate::new_runtime().unwrap().block_on(async {

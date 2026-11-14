@@ -36,6 +36,7 @@ mod diagnostics;
 #[cfg(test)]
 mod audit_recovery;
 mod pipeline;
+mod promote;
 mod daemon;
 mod live;
 mod launchd;
@@ -99,6 +100,9 @@ pub(crate) struct TranscribeArgs {
     /// `--yield-to-calls <base>`: drop to background priority whenever `<base>/status.json` says a
     /// call is being recorded, and run at normal priority otherwise. Set by the daemon only.
     pub yield_to_calls: Option<PathBuf>,
+    /// `--promote-live <dir>`: the directory of live streams. A managed session whose stream is
+    /// complete is stored from it; otherwise the batch pass runs as if the flag were absent.
+    pub promote_live: Option<PathBuf>,
 }
 
 /// `meetscribe transcribe <dir> [...]` — thin CLI wrapper over `pipeline::transcribe_and_store`:
@@ -107,14 +111,14 @@ fn run_transcribe(argv: &[String]) -> Result<()> {
     run_transcribe_using(argv, pipeline::transcribe_and_store)
 }
 
-fn run_transcribe_using(argv: &[String], run: impl FnOnce(&Path, &pipeline::PipelineOpts) -> Result<pipeline::PipelineOutput>) -> Result<()> {
-    let Some(TranscribeArgs { dir, opts, yield_to_calls }) = parse_transcribe_args(argv)? else {
+fn run_transcribe_using(argv: &[String], run: impl FnOnce(&Path, &pipeline::PipelineOpts, Option<&Path>) -> Result<pipeline::PipelineOutput>) -> Result<()> {
+    let Some(TranscribeArgs { dir, opts, yield_to_calls, promote_live }) = parse_transcribe_args(argv)? else {
         return Ok(()); // --help
     };
     if let Some(base) = yield_to_calls {
         status::spawn_call_yield(base);
     }
-    let out = run(&dir, &opts)?;
+    let out = run(&dir, &opts, promote_live.as_deref())?;
 
     if out.capture_status != "complete" {
         eprintln!("capture status: {} (see paired Markdown; JSON segment shape is unchanged)", out.capture_status);
@@ -161,6 +165,7 @@ pub(crate) fn parse_transcribe_args(argv: &[String]) -> Result<Option<Transcribe
     let mut export_dir: Option<PathBuf> = None;
     let mut no_store = false;
     let mut yield_to_calls: Option<PathBuf> = None;
+    let mut promote_live: Option<PathBuf> = None;
     let mut session_key = None;
     let mut resume = false;
     let mut provided_models = std::collections::HashSet::new();
@@ -225,12 +230,16 @@ pub(crate) fn parse_transcribe_args(argv: &[String]) -> Result<Option<Transcribe
                     yield_to_calls = Some(PathBuf::from(v));
                 }
             }
+            "--promote-live" => promote_live = Some(PathBuf::from(it.next().context("--promote-live needs a directory")?)),
             "-h" | "--help" => {
                 eprintln!(
                     "usage: meetscribe transcribe <dir> [--title <t>] [--model <ggml.bin>] \
                      [--speaker-model <onnx>] [--diarizer-model <gguf>] [--diarizer-bin <exe>] \
-                     [--no-split] [--lang <code>] [--db <path>] [--export-dir <dir>] [--no-store] [--resume]\n\n\
-                     --resume  reconcile a managed session in its verified original archive\n\n\
+                     [--no-split] [--lang <code>] [--db <path>] [--export-dir <dir>] [--no-store] [--resume] \
+                     [--promote-live <live dir>]\n\n\
+                     --resume  reconcile a managed session in its verified original archive\n\
+                     --promote-live <dir>  with --resume or --session-key: store the session's live stream \
+                     from <dir> when it is complete, without running whisper; otherwise transcribe as usual\n\n\
                      --no-split  do not cut far-end chunks at voice changes (the pre-split pipeline)\n\
                      --diarizer-rttm <file>  evaluation: replay these diarizer turns (single-roll session)"
                 );
@@ -259,6 +268,8 @@ pub(crate) fn parse_transcribe_args(argv: &[String]) -> Result<Option<Transcribe
         diarizer_rttm,
     };
     anyhow::ensure!(!(opts.no_store && (opts.resume || opts.session_key.is_some())), "--resume/session recovery cannot use --no-store");
+    // Only a managed session has a key to find its stream by and a recorded length to check it against.
+    anyhow::ensure!(promote_live.is_none() || opts.resume || opts.session_key.is_some(), "--promote-live requires --resume or --session-key");
     if opts.resume {
         let state = recovery::State::read(&dir).context("--resume requires managed metadata; preserve unverified legacy work")?;
         if db_given { anyhow::ensure!(recovery::absolute(&opts.db_path)? == recovery::absolute(&state.db_path)?, "--resume database override mismatch"); }
@@ -275,7 +286,7 @@ pub(crate) fn parse_transcribe_args(argv: &[String]) -> Result<Option<Transcribe
         if !provided_models.contains("diarizer_model") { opts.diarizer_model = base.join(DIARIZER_MODEL_REL); }
         if !provided_models.contains("diarizer_bin") { opts.diarizer_bin = base.join(DIARIZER_BIN_REL); }
     }
-    Ok(Some(TranscribeArgs { dir, opts, yield_to_calls }))
+    Ok(Some(TranscribeArgs { dir, opts, yield_to_calls, promote_live }))
 }
 
 /// `~/.meetscribe` — the app's data/config directory (`None` if `$HOME` is unset). The single
@@ -365,17 +376,18 @@ fn run_list(argv: &[String]) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:>3}  {:<20}  {:>9}  {:>5}  {:<8} TITLE",
-        "ID", "DATE", "DURATION", "SEGS", "CAPTURE"
+        "{:>3}  {:<20}  {:>9}  {:>5}  {:<8} {:<6} TITLE",
+        "ID", "DATE", "DURATION", "SEGS", "CAPTURE", "ORIGIN"
     );
     for m in &meetings {
         println!(
-            "{:>3}  {:<20}  {:>9}  {:>5}  {:<8} {}",
+            "{:>3}  {:<20}  {:>9}  {:>5}  {:<8} {:<6} {}",
             m.id,
             export::fmt_utc(m.started_at),
             export::fmt_duration(m.duration_secs),
             m.segment_count,
             m.capture_status,
+            m.origin.as_sql(),
             m.title
         );
     }
@@ -925,25 +937,38 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+/// Run the subcommand `argv[1]` names; `None` when it names none, which is a capture.
+fn run_subcommand(argv: &[String]) -> Option<Result<()>> {
+    let rest = argv.get(2..).unwrap_or_default();
+    Some(match argv.get(1)?.as_str() {
+        "transcribe" => run_transcribe(rest),
+        "list" => run_list(rest),
+        "export" => run_export(rest),
+        "rerender" => run_rerender(rest),
+        "vocab" => run_vocab(rest),
+        "speakers" => speakers::run_speakers(rest),
+        "detect" => run_detect(rest),
+        "daemon" => daemon::run_daemon(rest),
+        "live" => live::run(rest),
+        "tray" => tray::run_tray(rest),
+        "install" => launchd::run_install(rest),
+        "uninstall" => launchd::run_uninstall(rest),
+        // A live-stored meeting's Markdown names this command. Until it exists it must fail here:
+        // an unknown word falls through to the capture below and starts a recording.
+        "finalize" => {
+            // Said in plain words too: the error below reaches the terminal only as a class.
+            eprintln!("meetscribe finalize is not available in this build; nothing was changed");
+            Err(anyhow::anyhow!("`meetscribe finalize` is not part of this build yet; nothing was changed"))
+        }
+        _ => return None,
+    })
+}
+
 fn run() -> Result<()> {
     // Subcommand dispatch. Anything unrecognized falls through to the capture flow
     // (back-compatible: `meetscribe --seconds 300` still records).
     let argv: Vec<String> = std::env::args().collect();
-    match argv.get(1).map(String::as_str) {
-        Some("transcribe") => return run_transcribe(&argv[2..]),
-        Some("list") => return run_list(&argv[2..]),
-        Some("export") => return run_export(&argv[2..]),
-        Some("rerender") => return run_rerender(&argv[2..]),
-        Some("vocab") => return run_vocab(&argv[2..]),
-        Some("speakers") => return speakers::run_speakers(&argv[2..]),
-        Some("detect") => return run_detect(&argv[2..]),
-        Some("daemon") => return daemon::run_daemon(&argv[2..]),
-        Some("live") => return live::run(&argv[2..]),
-        Some("tray") => return tray::run_tray(&argv[2..]),
-        Some("install") => return launchd::run_install(&argv[2..]),
-        Some("uninstall") => return launchd::run_uninstall(&argv[2..]),
-        _ => {}
-    }
+    if let Some(result) = run_subcommand(&argv) { return result; }
 
     let args = parse_args();
 

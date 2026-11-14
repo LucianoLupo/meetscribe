@@ -33,6 +33,7 @@ fn backend(_model: &str, opts: &pipeline::PipelineOpts) -> Result<Box<dyn pipeli
     let root = PathBuf::from(std::env::var_os("MEETSCRIBE_PIPELINE_FIXTURE_ROOT").context("fixture root absent")?);
     anyhow::ensure!(!root.join("forbid-inference").exists(), "inference must not run after a committed ingest");
     cutpoint("engine_loaded");
+    fs::write(root.join("engine-ran"), b"inference backend was created\n")?;
     Ok(Box::new(SyntheticEngine { root, db: opts.db_path.clone(), no_store: opts.no_store }))
 }
 fn cutpoint(point: &str) {
@@ -56,6 +57,11 @@ fn cutpoint(point: &str) {
 fn pipeline_child() {
     let root = PathBuf::from(std::env::var_os("MEETSCRIBE_PIPELINE_FIXTURE_ROOT").expect("fixture root required"));
     crate::diagnostics::init(); pipeline::test_engine(backend); pipeline::test_cutpoints(cutpoint);
+    // A promotion test may shorten the wait for the live reader: "<stale ms> <cap ms>".
+    if let Ok(limits) = fs::read_to_string(root.join("promote-wait")) {
+        let mut ms = limits.split_whitespace().map(|value| Duration::from_millis(value.parse().unwrap()));
+        crate::promote::test_wait(crate::promote::Wait { stale: ms.next().unwrap(), cap: ms.next().unwrap(), poll: Duration::from_millis(5) });
+    }
     recovery::atomic_json(&root.join(format!("entry-{}.json", std::process::id())),
         &serde_json::json!({"event":"pipeline_child_entered", "pid":std::process::id()})).unwrap();
     println!("pipeline_child_entered");
@@ -63,7 +69,7 @@ fn pipeline_child() {
         .filter(|part| !part.is_empty()).map(|part| String::from_utf8(part.to_vec()).unwrap()).collect();
     let now: i64 = fs::read_to_string(root.join("clock")).unwrap().trim().parse().unwrap();
     let result = match argv.first().map(String::as_str) {
-        Some("transcribe") => crate::run_transcribe_using(&argv[1..], |dir, opts| pipeline::transcribe_with_clock(dir, opts, || now)),
+        Some("transcribe") => crate::run_transcribe_using(&argv[1..], |dir, opts, promote_live| pipeline::transcribe_with_clock(dir, opts, promote_live, || now)),
         Some("rerender") => crate::run_rerender(&argv[1..]),
         Some("export") => crate::run_export(&argv[1..]),
         _ => panic!("unsupported sacrificial CLI command"),
@@ -834,4 +840,182 @@ fn ordinary_no_store_child_succeeds_without_a_database() {
         assert!(fixture.dir.join("transcript.json").is_file()); fs::remove_dir_all(fixture.root).unwrap();
     }
     println!(r#"{{"event":"audit_case_complete","case":"f3_unmanaged_no_store_child","iterations":5}}"#);
+}
+
+// ---- Promotion: the live stream becomes the stored transcript (`promote.rs`). The stream is
+// fictional and written by hand in the reader's format; the child is the real argv, parser and
+// pipeline. `child_args` does not pass the flag yet (the daemon is wired later), so it is appended.
+
+fn live_dir(fixture: &Fixture) -> PathBuf { fixture.root.join("live") }
+
+fn stream_events(fixture: &Fixture) -> Vec<serde_json::Value> {
+    let segment = |speaker: &str, t_start: f64, t_end: f64, text: &str| serde_json::json!({"type": "segment", "speaker": speaker,
+        "t_start": t_start, "t_end": t_end, "text": text, "confidence": 0.9, "lag_ms": 3_400, "decode_ms": 900});
+    vec![
+        serde_json::json!({"type": "meeting_started", "key": fixture.state().key, "app": "Chrome", "started_at": START, "model": "ggml-live-fixture"}),
+        segment("you", 0.2, 1.1, "The live release checklist is ready"),
+        serde_json::json!({"type": "heartbeat", "audio_secs": 2.0, "decoded_secs": 1.1}),
+        segment("others", 1.4, 2.6, "We approved the live deployment window"),
+        serde_json::json!({"type": "meeting_ended", "duration_secs": 3.0, "reason": "ended", "segments": 2, "short_windows": 1}),
+    ]
+}
+
+fn write_stream(fixture: &Fixture, events: &[serde_json::Value]) -> PathBuf {
+    recovery::private_dir(&live_dir(fixture)).unwrap();
+    let path = live_dir(fixture).join(format!("{}.jsonl", fixture.state().key));
+    let lines: String = events.iter().enumerate().map(|(seq, event)| {
+        let mut line = event.clone(); line["v"] = serde_json::json!(1); line["seq"] = serde_json::json!(seq); format!("{line}\n")
+    }).collect();
+    fs::write(&path, lines).unwrap(); path
+}
+
+fn promote_argv(fixture: &Fixture, job: &TranscribeJob) -> Vec<String> {
+    let mut argv = transcribe_argv(fixture, job);
+    argv.extend(["--promote-live".to_string(), live_dir(fixture).display().to_string()]); argv
+}
+
+fn proofs(fixture: &Fixture) -> (bool, bool) {
+    let session = recovery::Session::open(&fixture.dir).unwrap().unwrap();
+    (session.proof(recovery::ProofScope::Archive).unwrap(), session.proof(recovery::ProofScope::Retention).unwrap())
+}
+
+#[test]
+fn a_complete_live_stream_is_stored_without_inference_and_only_once() {
+    for _ in 0..3 {
+        let (fixture, owner) = Fixture::new(); drop(owner);
+        write_stream(&fixture, &stream_events(&fixture));
+        fs::write(fixture.root.join("forbid-inference"), b"the live stream is the transcript\n").unwrap();
+        let argv = promote_argv(&fixture, &fixture.job());
+        let output = child_output(&fixture, spawn_cli(&fixture, &argv));
+        assert!(output.status.success(), "promotion failed: {output:?}");
+        assert!(!fixture.root.join("engine-ran").exists(), "an accepted stream must not load the engine");
+        let rows = fixture.meetings(); assert_eq!(rows.len(), 1); let id = rows[0].id;
+        assert_eq!((rows[0].origin, rows[0].model.as_str(), rows[0].segment_count), (db::TranscriptOrigin::Live, "ggml-live-fixture", 2));
+        assert_eq!((rows[0].duration_secs, rows[0].capture_status.as_str()), (3.0, "complete"));
+        let state = fixture.state();
+        assert_eq!((state.phase, state.attempts, state.meeting_id), (recovery::Phase::Complete, 1, Some(id)));
+        assert_eq!(state.publication.as_deref(), Some(fixture.dir.as_path()), "a first attempt publishes the root pair");
+        let markdown = fs::read_to_string(fixture.dir.join("transcript.md")).unwrap();
+        assert!(markdown.contains(&format!("- **Transcript:** live, provisional — `meetscribe finalize {id}`")));
+        let rendered: Vec<serde_json::Value> = serde_json::from_slice(&fs::read(fixture.dir.join("transcript.json")).unwrap()).unwrap();
+        assert_eq!(rendered.iter().map(|segment| segment["text"].as_str().unwrap()).collect::<Vec<_>>(),
+            ["The live release checklist is ready", "We approved the live deployment window"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("\"event\":\"live_promoted\"") && stderr.contains("\"merged_segments\":2"), "no promotion event in: {stderr}");
+        assert!(!stderr.contains("live deployment window"), "meeting text reached the log");
+        assert_eq!(proofs(&fixture), (true, true), "the files are a render of the stored rows, and only owned files exist");
+
+        // The same command again: a Complete session is not due. It fails and changes nothing.
+        let before = session_snapshot(&fixture.dir); let database = fs::read(&fixture.opts.db_path).unwrap();
+        let again = child_output(&fixture, spawn_cli(&fixture, &argv));
+        assert_eq!(again.status.code(), Some(1));
+        assert_eq!(session_snapshot(&fixture.dir), before); assert_eq!(fs::read(&fixture.opts.db_path).unwrap(), database);
+        assert_eq!(fixture.meetings().len(), 1);
+        // And retention treats the promoted session like any stored one.
+        assert_eq!(maintenance::prune_sessions(&fixture.root.join("sessions"), 30, crate::now_epoch() + 100 * 86_400).unwrap().removed, 1);
+        fs::remove_dir_all(fixture.root).unwrap();
+    }
+}
+
+#[test]
+fn a_stream_that_cannot_be_promoted_runs_the_batch_pass_in_the_same_attempt() {
+    type Arrange = fn(&Fixture);
+    let unfinished: Arrange = |fixture| { let events = stream_events(fixture); write_stream(fixture, &events[..4]); };
+    let cases: [(&str, Arrange); 9] = [
+        ("no_stream", |_| {}),
+        ("unreadable", |fixture| { recovery::private_dir(&live_dir(fixture).join(format!("{}.jsonl", fixture.state().key))).unwrap(); }),
+        ("torn", |fixture| {
+            let path = write_stream(fixture, &stream_events(fixture));
+            let lines = fs::read_to_string(&path).unwrap();
+            let (first, rest) = lines.split_once('\n').unwrap();
+            fs::write(path, format!("{first}\n{{\"v\":1,\"seq\":1,\"type\":\"segm\n{rest}")).unwrap();
+        }),
+        ("reader_gone", |fixture| {
+            let events = stream_events(fixture); let path = write_stream(fixture, &events[..4]);
+            fs::File::options().write(true).open(path).unwrap().set_modified(std::time::SystemTime::now() - Duration::from_secs(31)).unwrap();
+        }),
+        ("timeout", unfinished),
+        ("not_ended", |fixture| { let mut events = stream_events(fixture); events[4]["reason"] = serde_json::json!("stalled"); write_stream(fixture, &events); }),
+        ("key_mismatch", |fixture| { let mut events = stream_events(fixture); events[0]["key"] = serde_json::json!("b".repeat(32)); write_stream(fixture, &events); }),
+        ("duration_mismatch", |fixture| { let mut events = stream_events(fixture); events[4]["duration_secs"] = serde_json::json!(2.5); write_stream(fixture, &events); }),
+        ("empty", |fixture| { let events = stream_events(fixture); let mut ended = events[4].clone(); ended["segments"] = serde_json::json!(0);
+            write_stream(fixture, &[events[0].clone(), ended]); }),
+    ];
+    for (reason, arrange) in cases {
+        let (fixture, owner) = Fixture::new(); drop(owner);
+        arrange(&fixture);
+        // Only the timeout case waits: the reader looks alive and the cap is cut to 100 ms.
+        if reason == "timeout" { fs::write(fixture.root.join("promote-wait"), "30000 100\n").unwrap(); }
+        let output = child_output(&fixture, spawn_cli(&fixture, &promote_argv(&fixture, &fixture.job())));
+        assert!(output.status.success(), "{reason}: the fallback failed: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("\"event\":\"live_promotion_rejected\"") && stderr.contains(&format!("\"reason\":\"{reason}\"")),
+            "{reason}: not logged as rejected for that reason: {stderr}");
+        assert!(!stderr.contains("\"event\":\"live_promoted\""), "{reason}");
+        assert!(fixture.root.join("engine-ran").is_file(), "{reason}: the batch pass did not run");
+        let rows = fixture.meetings(); assert_eq!(rows.len(), 1, "{reason}");
+        assert_eq!((rows[0].origin, rows[0].model.as_str()), (db::TranscriptOrigin::Batch, "synthetic-model"), "{reason}");
+        let state = fixture.state();
+        assert_eq!((state.phase, state.attempts), (recovery::Phase::Complete, 1), "{reason}: exactly one attempt is reserved");
+        assert_eq!(state.publication.as_deref(), Some(fixture.dir.as_path()), "{reason}");
+        assert!(!fs::read_to_string(fixture.dir.join("transcript.md")).unwrap().contains("provisional"), "{reason}");
+        assert_eq!(proofs(&fixture), (true, true), "{reason}");
+        fs::remove_dir_all(fixture.root).unwrap();
+    }
+}
+
+/// The child dies right after the promotion's insert committed. Nothing is stored twice: the next
+/// automatic visit only charges the abandoned attempt, and the visit after it (or an explicit
+/// `--resume`) finds the ingest and publishes the stored live meeting, without the engine.
+#[test]
+fn a_promotion_killed_after_its_commit_is_finished_from_the_stored_meeting() {
+    for explicit_resume in [false, true] {
+        for _ in 0..3 {
+            let (fixture, owner) = Fixture::new(); drop(owner);
+            write_stream(&fixture, &stream_events(&fixture));
+            fs::write(fixture.root.join("forbid-inference"), b"the live stream is the transcript\n").unwrap();
+            fs::write(fixture.root.join("cutpoint"), "live_committed\n").unwrap();
+            let argv = promote_argv(&fixture, &fixture.job());
+            let killed = child_output(&fixture, spawn_cli(&fixture, &argv));
+            assert_eq!(killed.status.code(), Some(85));
+            let ack: serde_json::Value = serde_json::from_slice(&fs::read(fixture.root.join("cutpoint-ack.json")).unwrap()).unwrap();
+            assert_eq!(ack["point"], "live_committed");
+            let rows = fixture.meetings(); assert_eq!(rows.len(), 1); let id = rows[0].id;
+            assert_eq!(rows[0].origin, db::TranscriptOrigin::Live);
+            let state = fixture.state();
+            assert_eq!((state.phase, state.attempts, state.in_flight, state.meeting_id), (recovery::Phase::Ready, 1, true, None));
+            assert!(!fixture.dir.join("transcript.md").exists());
+            fs::remove_file(fixture.root.join("cutpoint")).unwrap();
+
+            if explicit_resume {
+                let mut resume = fixture.job(); resume.opts.resume = true;
+                let resumed = child_output(&fixture, spawn_cli(&fixture, &promote_argv(&fixture, &resume)));
+                assert!(resumed.status.success(), "resume failed: {resumed:?}");
+                assert_eq!(fixture.state().attempts, 1, "an explicit resume starts a new budget");
+            } else {
+                let charged = child_output(&fixture, spawn_cli(&fixture, &argv));
+                assert_eq!(charged.status.code(), Some(1), "the first visit after a kill only charges the abandoned attempt");
+                let state = fixture.state();
+                assert_eq!((state.phase, state.attempts, state.in_flight, state.next_retry), (recovery::Phase::Ready, 1, false, START + 70));
+                assert_eq!(state.error_class.as_deref(), Some("interrupted_attempt"));
+                assert!(!fixture.dir.join("transcript.md").exists()); assert_eq!(fixture.meetings().len(), 1);
+                fs::write(fixture.root.join("clock"), format!("{}\n", state.next_retry)).unwrap();
+                let finished = child_output(&fixture, spawn_cli(&fixture, &argv));
+                assert!(finished.status.success(), "the retry failed: {finished:?}");
+                assert_eq!(fixture.state().attempts, 2);
+            }
+            let state = fixture.state();
+            assert_eq!((state.phase, state.meeting_id), (recovery::Phase::Complete, Some(id)));
+            let rows = fixture.meetings(); assert_eq!(rows.len(), 1, "the retry stored a second meeting");
+            assert_eq!((rows[0].id, rows[0].origin), (id, db::TranscriptOrigin::Live));
+            assert!(!fixture.root.join("engine-ran").exists(), "a stored live meeting must not be decoded again");
+            // A retry publishes beside the root, as a batch retry does.
+            let publication = state.publication.unwrap();
+            assert!(publication.starts_with(fixture.dir.join(".recovered").join(&state.key)));
+            assert!(fs::read_to_string(publication.join("transcript.md")).unwrap().contains(&format!("`meetscribe finalize {id}`")));
+            assert!(!fixture.dir.join("transcript.md").exists());
+            assert_eq!(proofs(&fixture), (true, false), "the archive proof holds; a .recovered directory is not owned capture material");
+            fs::remove_dir_all(fixture.root).unwrap();
+        }
+    }
 }

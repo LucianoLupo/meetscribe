@@ -73,6 +73,11 @@ pub fn to_markdown(m: &MeetingRow, segs: &[RenderedSegment]) -> String {
     out.push_str(&format!("- **Duration:** {}\n", fmt_duration(m.duration_secs)));
     out.push_str(&format!("- **Model:** {} · **Language:** {}\n", m.model, m.lang));
     out.push_str(&format!("- **Capture:** {}\n", m.capture_status));
+    // Only a live-stored meeting gets this line: a batch meeting's Markdown must stay byte for
+    // byte what it was, or `Session::proof` would fail for every session already stored.
+    if m.origin == crate::db::TranscriptOrigin::Live {
+        out.push_str(&format!("- **Transcript:** live, provisional — `meetscribe finalize {}`\n", m.id));
+    }
     out.push_str(&format!("- **Segments:** {}\n\n", m.segment_count));
     out.push_str("---\n\n");
     if segs.is_empty() {
@@ -205,6 +210,7 @@ mod tests {
             segment_count: 2,
             created_at: 1_752_900_400,
             capture_status: "unknown".into(),
+            origin: crate::db::TranscriptOrigin::Batch,
         }
     }
 
@@ -243,6 +249,39 @@ mod tests {
         assert!(md.contains("**[00:00] You:** hola"));
         assert!(md.contains("**[01:05] Others:** chau"));
         assert!(md.contains("UTC"));
+    }
+
+    /// Frozen from the build before meetings had an origin (2ec1d9e), not regenerated from this
+    /// code: `Session::proof` compares a stored session's files with a fresh render, so one
+    /// changed byte for a batch meeting would make every session already on disk unprovable.
+    #[test]
+    fn a_batch_meetings_markdown_is_byte_for_byte_what_it_was() {
+        const FROZEN: &str = "# team sync\n\n- **Date:** 2025-07-19 04:40 UTC\n- **Duration:** 5m 12s\n\
+            - **Model:** ggml-large-v3 · **Language:** es\n- **Capture:** unknown\n- **Segments:** 2\n\n---\n\n\
+            **[00:00] You:** hola\n\n**[01:05] Others:** chau\n\n\n---\n_Source: capture · transcribed 2025-07-19 04:46 UTC_\n";
+        const FROZEN_EMPTY: &str = "# team sync\n\n- **Date:** 2025-07-19 04:40 UTC\n- **Duration:** 5m 12s\n\
+            - **Model:** ggml-large-v3 · **Language:** es\n- **Capture:** complete\n- **Segments:** 0\n\n---\n\n\
+            _(no speech detected)_\n\n---\n_Source: capture · transcribed 2025-07-19 04:46 UTC_\n";
+        let segs = vec![seg(Speaker::You, 0.0, "hola"), seg(Speaker::Others, 65.0, " chau ")];
+        assert_eq!(to_markdown(&row(), &segs), FROZEN);
+        let mut empty = row();
+        empty.segment_count = 0;
+        empty.capture_status = "complete".into();
+        assert_eq!(to_markdown(&empty, &[]), FROZEN_EMPTY);
+    }
+
+    #[test]
+    fn a_live_stored_meeting_says_so_in_one_extra_line() {
+        let segs = vec![seg(Speaker::You, 0.0, "hola"), seg(Speaker::Others, 65.0, "chau")];
+        let mut live = row();
+        live.id = 57;
+        live.origin = crate::db::TranscriptOrigin::Live;
+        let batch = MeetingRow { origin: crate::db::TranscriptOrigin::Batch, ..live.clone() };
+        let (live, batch) = (to_markdown(&live, &segs), to_markdown(&batch, &segs));
+        let extra: Vec<&str> = live.lines().filter(|line| !batch.lines().any(|other| other == *line)).collect();
+        assert_eq!(extra, ["- **Transcript:** live, provisional — `meetscribe finalize 57`"]);
+        assert_eq!(live.lines().count(), batch.lines().count() + 1);
+        assert!(live.contains("- **Capture:** unknown\n- **Transcript:** live"), "the line belongs to the header");
     }
 
     #[test]

@@ -56,10 +56,13 @@ fn safe_fields(fields: Map<String, Value>) -> Option<Map<String, Value>> {
                 "attempt_failed" | "pending_reconciled" | "committed_inputs_recovered" | "command_failed" | "source_unchanged" |
                 "model_stage_ready" | "model_published" | "runtime_stage_ready" | "runtime_backup_retained" |
                 "runtime_published" | "runtime_restored" | "stop_requested" | "stop_received" | "status_published" | "recovery_scan_failed" | "launch_failure_persist_failed" |
-                "live_started" | "live_lag" | "live_stopped" | "live_failed")),
+                "live_started" | "live_lag" | "live_stopped" | "live_failed" |
+                "live_promoted" | "live_promotion_rejected")),
             // Live-lane measurements: numbers only, so a transcript can never ride along.
             "audio_secs" | "decoded_secs" => value.as_f64().is_some_and(|value| value.is_finite() && value >= 0.0),
-            "segments" | "short_windows" | "lag_ms" => value.as_u64().is_some(),
+            "segments" | "short_windows" | "lag_ms" | "merged_segments" | "wait_ms" => value.as_u64().is_some(),
+            // Why a live stream was not stored: one of the gate's reasons, never free text.
+            "reason" => value.as_str().is_some_and(crate::promote::Reject::is_known),
             "session_id" | "instance_id" => value.as_str().is_some_and(|value| value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())),
             "phase" => value.as_str().is_some_and(|value| matches!(value, "Recording" | "Ready" | "Archived" | "Complete" | "NeedsAttention" | "SkippedShort")),
             "attempt" => value.as_u64().is_some_and(|value| value <= 4),
@@ -247,6 +250,36 @@ mod tests {
             let rejected = event(fields);
             assert_eq!(rejected["event"], "invalid_event", "{field}");
             assert!(!rejected.to_string().contains("SYNTHETIC_PRIVATE_SENTENCE"), "{field}");
+        }
+    }
+
+    #[test]
+    fn promotion_events_keep_their_numbers_and_only_a_known_reason() {
+        let event = |fields: Value| formatted(&log::Record::builder().target("meetscribe::event")
+            .args(format_args!("{fields}")).build(), "synthetic-run");
+        let session = "a6e79ba0314c4cc2b647f4d25b327011";
+        let promoted = event(json!({"component":"pipeline", "event":"live_promoted", "session_id":session, "outcome":"ok",
+            "segments":1332, "merged_segments":676, "short_windows":318, "audio_secs":6522.4, "wait_ms":4200,
+            "text":"SYNTHETIC_PRIVATE_SENTENCE"}));
+        assert_eq!((promoted["component"].as_str(), promoted["event"].as_str(), promoted["session_id"].as_str()),
+            (Some("pipeline"), Some("live_promoted"), Some(session)));
+        assert_eq!((promoted["segments"].as_u64(), promoted["merged_segments"].as_u64(), promoted["short_windows"].as_u64(), promoted["wait_ms"].as_u64()),
+            (Some(1332), Some(676), Some(318), Some(4200)));
+        assert_eq!(promoted["audio_secs"].as_f64(), Some(6522.4));
+        assert!(!promoted.to_string().contains("SYNTHETIC_PRIVATE_SENTENCE"));
+        for reason in ["no_stream", "unreadable", "reader_gone", "timeout", "torn", "key_mismatch", "not_ended",
+            "duration_mismatch", "count_mismatch", "empty", "capture_partial", "invalid_segment"] {
+            let rejected = event(json!({"component":"pipeline", "event":"live_promotion_rejected", "session_id":session, "reason":reason}));
+            assert_eq!((rejected["event"].as_str(), rejected["reason"].as_str()), (Some("live_promotion_rejected"), Some(reason)));
+        }
+        // A reason outside the list, or text where a count belongs, withholds the whole event.
+        for (field, value) in [("reason", json!("SYNTHETIC_PRIVATE_SENTENCE")), ("reason", json!(7)),
+            ("merged_segments", json!("SYNTHETIC_PRIVATE_SENTENCE")), ("wait_ms", json!("SYNTHETIC_PRIVATE_SENTENCE"))] {
+            let mut fields = json!({"component":"pipeline", "event":"live_promotion_rejected", "session_id":session});
+            fields[field] = value;
+            let withheld = event(fields);
+            assert_eq!(withheld["event"], "invalid_event", "{field}");
+            assert!(!withheld.to_string().contains("SYNTHETIC_PRIVATE_SENTENCE"), "{field}");
         }
     }
 

@@ -44,6 +44,33 @@ pub struct MeetingMeta {
     pub duration_secs: f64,
     pub created_at: i64, // unix epoch seconds — ingest time
     pub capture_status: Option<String>,
+    pub origin: TranscriptOrigin,
+}
+
+/// Which pass produced the stored transcript. `Live` is the live lane's text stored at hangup:
+/// it has no far-end voices and is provisional until the batch pass replaces it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptOrigin {
+    Batch,
+    Live,
+}
+
+impl TranscriptOrigin {
+    /// Token stored in `meetings.transcript_origin` (schema v4). `NULL` there reads as `Batch`.
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            TranscriptOrigin::Batch => "batch",
+            TranscriptOrigin::Live => "live",
+        }
+    }
+
+    pub fn from_sql(s: &str) -> Option<TranscriptOrigin> {
+        match s {
+            "batch" => Some(TranscriptOrigin::Batch),
+            "live" => Some(TranscriptOrigin::Live),
+            _ => None,
+        }
+    }
 }
 
 /// A persisted meeting row (what `list`/`export`/`get_meeting` read back).
@@ -59,13 +86,14 @@ pub struct MeetingRow {
     pub segment_count: i64,
     pub created_at: i64,
     pub capture_status: String,
+    pub origin: TranscriptOrigin,
 }
 
 const MEETING_COLS: &str =
     "id, title, source_dir, model, lang, started_at, duration_secs, segment_count, created_at, COALESCE(capture_status, 'unknown') AS capture_status";
 
 /// Schema version this binary knows how to produce. Bump with each new ladder rung.
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 4;
 
 /// A stored segment: the raw ASR contract plus the row identity and the (nullable) speaker
 /// identity, resolved through `segment_voices` → `voice_clusters`. Both are `None` for the mic
@@ -233,6 +261,12 @@ impl Db {
         Ok(db)
     }
 
+    /// Bring an already-open bound archive to this binary's schema, on this connection: the file
+    /// `open_existing` verified is the file that is migrated, never another one reached by path.
+    pub async fn migrate(&mut self) -> Result<()> {
+        apply_migrations(&mut self.conn).await
+    }
+
     pub async fn archive_id(&mut self) -> Result<String> {
         sqlx::query_scalar("SELECT archive_id FROM archive_identity WHERE singleton = 1")
             .fetch_one(&mut self.conn).await.context("read archive identity")
@@ -254,6 +288,21 @@ impl Db {
         let mut conn = SqliteConnection::connect_with(&opts).await?;
         prepare_schema(&mut conn).await?;
         Ok(Self { conn })
+    }
+
+    /// A new archive as a v3 binary left it (the ladder stopped one rung short); returns its
+    /// identity. For the upgrade tests: `open` cannot produce one, it always climbs to the top.
+    #[cfg(test)]
+    pub async fn create_v3_archive(path: &Path) -> Result<String> {
+        let mut conn = SqliteConnection::connect_with(&SqliteConnectOptions::new()
+            .filename(path).create_if_missing(true).foreign_keys(true)).await?;
+        init_schema(&mut conn).await?;
+        for (from, statements) in [MIGRATION_V1, MIGRATION_V2, MIGRATION_V3].into_iter().enumerate() {
+            run_migration(&mut conn, from as i32, from as i32 + 1, statements).await?;
+        }
+        let identity = sqlx::query_scalar("SELECT archive_id FROM archive_identity WHERE singleton = 1").fetch_one(&mut conn).await?;
+        conn.close().await?;
+        Ok(identity)
     }
 
     /// The schema version currently on disk.
@@ -338,11 +387,18 @@ impl Db {
             tx.commit().await?;
             return Ok(id);
         }
-        let res = sqlx::query(
+        // A bound archive can still be at schema v3 here (`open_existing` never migrates). A batch
+        // meeting is stored there exactly as before; a live one needs the column that marks it.
+        let has_origin = has_origin_column(&mut tx).await?;
+        anyhow::ensure!(has_origin || meta.origin == TranscriptOrigin::Batch,
+            "a live transcript needs schema v4; this database was not upgraded");
+        let (column, value) = if has_origin { (", transcript_origin", ", ?") } else { ("", "") };
+        let sql = format!(
             "INSERT INTO meetings \
-             (title, source_dir, model, lang, started_at, duration_secs, segment_count, created_at, capture_status) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
+             (title, source_dir, model, lang, started_at, duration_secs, segment_count, created_at, capture_status{column}) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?{value})"
+        );
+        let insert = sqlx::query(&sql)
         .bind(meta.title.as_str())
         .bind(meta.source_dir.as_str())
         .bind(meta.model.as_str())
@@ -351,7 +407,9 @@ impl Db {
         .bind(meta.duration_secs)
         .bind(segs.len() as i64)
         .bind(meta.created_at)
-        .bind(meta.capture_status.as_deref().unwrap_or("unknown"))
+        .bind(meta.capture_status.as_deref().unwrap_or("unknown"));
+        let insert = if has_origin { insert.bind(meta.origin.as_sql()) } else { insert };
+        let res = insert
         .execute(&mut *tx)
         .await
         .context("insert meeting")?;
@@ -396,21 +454,25 @@ impl Db {
 
     /// All meetings, newest first.
     pub async fn list_meetings(&mut self) -> Result<Vec<MeetingRow>> {
-        let sql = format!("SELECT {MEETING_COLS} FROM meetings ORDER BY started_at DESC, id DESC");
+        let mut tx = self.conn.begin().await.context("begin meeting read")?;
+        let sql = format!("SELECT {} FROM meetings ORDER BY started_at DESC, id DESC", meeting_cols(&mut tx).await?);
         let rows = sqlx::query(&sql)
-            .fetch_all(&mut self.conn)
+            .fetch_all(&mut *tx)
             .await
             .context("list meetings")?;
+        tx.commit().await.context("end meeting read")?;
         rows.iter().map(meeting_from_row).collect()
     }
 
     pub async fn get_meeting(&mut self, id: i64) -> Result<Option<MeetingRow>> {
-        let sql = format!("SELECT {MEETING_COLS} FROM meetings WHERE id = ?");
+        let mut tx = self.conn.begin().await.context("begin meeting read")?;
+        let sql = format!("SELECT {} FROM meetings WHERE id = ?", meeting_cols(&mut tx).await?);
         let row = sqlx::query(&sql)
             .bind(id)
-            .fetch_optional(&mut self.conn)
+            .fetch_optional(&mut *tx)
             .await
             .context("get meeting")?;
+        tx.commit().await.context("end meeting read")?;
         match row {
             Some(r) => Ok(Some(meeting_from_row(&r)?)),
             None => Ok(None),
@@ -936,7 +998,26 @@ impl Db {
     }
 }
 
+/// Whether this file has `meetings.transcript_origin` (schema v4). Asked inside the caller's
+/// transaction and never remembered: a connection opened on a v3 file by `open_existing` stays
+/// open while another process migrates that file.
+async fn has_origin_column(conn: &mut SqliteConnection) -> Result<bool> {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pragma_table_info('meetings') WHERE name = 'transcript_origin'")
+        .fetch_one(&mut *conn)
+        .await
+        .map(|count| count > 0)
+        .context("inspect meetings columns")
+}
+
+/// The meeting projection for this file as it is now: a v3 file has no origin column and every
+/// meeting in it is a batch transcript.
+async fn meeting_cols(conn: &mut SqliteConnection) -> Result<String> {
+    let origin = if has_origin_column(conn).await? { "COALESCE(transcript_origin, 'batch')" } else { "'batch'" };
+    Ok(format!("{MEETING_COLS}, {origin} AS transcript_origin"))
+}
+
 fn meeting_from_row(r: &SqliteRow) -> Result<MeetingRow> {
+    let origin: String = r.try_get("transcript_origin")?;
     Ok(MeetingRow {
         id: r.try_get("id")?,
         title: r.try_get("title")?,
@@ -948,6 +1029,7 @@ fn meeting_from_row(r: &SqliteRow) -> Result<MeetingRow> {
         segment_count: r.try_get("segment_count")?,
         created_at: r.try_get("created_at")?,
         capture_status: r.try_get("capture_status")?,
+        origin: TranscriptOrigin::from_sql(&origin).with_context(|| format!("unknown transcript origin '{origin}'"))?,
     })
 }
 
@@ -1073,6 +1155,7 @@ async fn apply_migrations(conn: &mut SqliteConnection) -> Result<()> {
             0 => run_migration(conn, 0, 1, MIGRATION_V1).await?,
             1 => run_migration(conn, 1, 2, MIGRATION_V2).await?,
             2 => run_migration(conn, 2, 3, MIGRATION_V3).await?,
+            3 => run_migration(conn, 3, 4, MIGRATION_V4).await?,
             other => anyhow::bail!("no migration registered from schema v{other}"),
         }
     }
@@ -1150,6 +1233,12 @@ const MIGRATION_V3: &[&str] = &[
     "INSERT INTO archive_identity (singleton, archive_id) VALUES (1, lower(hex(randomblob(16))))",
     "ALTER TABLE meetings ADD COLUMN capture_status TEXT NULL CHECK (capture_status IN ('unknown', 'complete', 'partial'))",
     "CREATE TABLE session_ingests (session_key TEXT NOT NULL UNIQUE, meeting_id INTEGER NOT NULL UNIQUE REFERENCES meetings(id) ON DELETE CASCADE)",
+];
+
+/// v3 → v4: which pass produced the stored transcript. `NULL` reads as `batch`, so existing rows
+/// need no backfill and a v3 binary's inserts into a v4 file stay correct.
+const MIGRATION_V4: &[&str] = &[
+    "ALTER TABLE meetings ADD COLUMN transcript_origin TEXT NULL CHECK (transcript_origin IN ('batch', 'live'))",
 ];
 
 /// Run one ladder rung inside `BEGIN IMMEDIATE`, re-checking the version inside the transaction
@@ -1269,7 +1358,7 @@ mod tests {
         conn.close().await.unwrap();
 
         let mut db = Db::open(&path).await.unwrap();
-        assert_eq!(db.schema_version().await.unwrap(), 3, "recovery requires schema v3");
+        assert_eq!(db.schema_version().await.unwrap(), SCHEMA_VERSION, "a v2 file climbs the whole ladder");
         let archive: String = sqlx::query_scalar("SELECT archive_id FROM archive_identity WHERE singleton = 1")
             .fetch_one(&mut db.conn).await.unwrap();
         assert_eq!(archive.len(), 32);
@@ -1318,6 +1407,7 @@ mod tests {
             duration_secs: 312.5,
             created_at: 1_752_900_400,
             capture_status: None,
+            origin: TranscriptOrigin::Batch,
         }
     }
 
@@ -1705,6 +1795,111 @@ mod tests {
         // Disabled, not deleted — the id (and therefore the application order) is preserved.
         assert_eq!(db.list_vocab().await.unwrap().len(), 2);
         db.close().await.unwrap();
+    }
+
+    /// The raw column, which `get_meeting` hides behind its `COALESCE`.
+    async fn stored_origin(db: &mut Db, id: i64) -> Option<String> {
+        sqlx::query_scalar("SELECT transcript_origin FROM meetings WHERE id = ?").bind(id).fetch_one(&mut db.conn).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_origin_is_stored_and_a_row_without_one_reads_as_batch() {
+        let tmp = tempdir();
+        seed_v0(&tmp.join("legacy.db")).await;
+        // The same on a fresh file and on one that climbed the ladder from v0: `table_info` cannot
+        // show a CHECK, so the constraint is exercised by writing through it.
+        for name in ["fresh.db", "legacy.db"] {
+            let mut db = open_file(&tmp.join(name)).await.unwrap();
+            let segs = vec![seg(Speaker::You, 0.0, "hola")];
+            let batch = db.insert_meeting(&meta(), &segs).await.unwrap();
+            let live = db.insert_meeting(&MeetingMeta { origin: TranscriptOrigin::Live, ..meta() }, &segs).await.unwrap();
+            assert_eq!(db.get_meeting(batch).await.unwrap().unwrap().origin, TranscriptOrigin::Batch, "{name}");
+            assert_eq!(db.get_meeting(live).await.unwrap().unwrap().origin, TranscriptOrigin::Live, "{name}");
+            assert_eq!((stored_origin(&mut db, batch).await.as_deref(), stored_origin(&mut db, live).await.as_deref()), (Some("batch"), Some("live")));
+            // What a v3 binary writes into this file: it does not know the column.
+            let old = sqlx::query("INSERT INTO meetings (title, source_dir, model, lang, started_at, duration_secs, segment_count, created_at, capture_status) \
+                VALUES ('older binary','/tmp/x','m','es',5,1.0,0,5,'complete')").execute(&mut db.conn).await.unwrap().last_insert_rowid();
+            assert_eq!(stored_origin(&mut db, old).await, None);
+            assert_eq!(db.get_meeting(old).await.unwrap().unwrap().origin, TranscriptOrigin::Batch, "{name}: NULL is a batch transcript");
+            let listed: Vec<(i64, TranscriptOrigin)> = db.list_meetings().await.unwrap().iter().map(|m| (m.id, m.origin)).collect();
+            assert!(listed.contains(&(live, TranscriptOrigin::Live)) && listed.contains(&(old, TranscriptOrigin::Batch)), "{name}: {listed:?}");
+            for allowed in [None, Some("batch"), Some("live")] {
+                sqlx::query("UPDATE meetings SET transcript_origin = ? WHERE id = ?").bind(allowed).bind(old)
+                    .execute(&mut db.conn).await.unwrap_or_else(|error| panic!("{name}: {allowed:?} refused: {error}"));
+            }
+            assert!(sqlx::query("UPDATE meetings SET transcript_origin = 'final' WHERE id = ?").bind(old).execute(&mut db.conn).await.is_err(),
+                "{name}: the CHECK must refuse an origin this binary cannot read back");
+            db.close().await.unwrap();
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// `open_existing` never migrates, so a v4 binary reads and writes v3 files: every bound
+    /// session's archive until its next attempt, and every retention proof.
+    #[tokio::test]
+    async fn a_v3_file_is_read_and_written_as_before_and_is_never_guessed_to_stay_v3() {
+        let tmp = tempdir();
+        let path = tmp.join("archive.db");
+        let identity = Db::create_v3_archive(&path).await.unwrap();
+        let mut bound = Db::open_existing(&path, &identity).await.unwrap();
+        assert_eq!(bound.schema_version().await.unwrap(), 3);
+        let segs = vec![seg(Speaker::Others, 0.0, "legacy archive")];
+        let batch = bound.insert_meeting(&meta(), &segs).await.unwrap();
+        assert_eq!(bound.get_meeting(batch).await.unwrap().unwrap().origin, TranscriptOrigin::Batch);
+        assert_eq!(bound.list_meetings().await.unwrap().len(), 1);
+        // A live transcript cannot be marked in a v3 file, and storing it unmarked would make it
+        // look like a full batch transcript for good.
+        let refused = bound.insert_meeting(&MeetingMeta { origin: TranscriptOrigin::Live, ..meta() }, &segs).await;
+        assert!(refused.is_err(), "a live transcript was stored without its mark");
+        assert_eq!(bound.list_meetings().await.unwrap().len(), 1, "the refused insert left nothing behind");
+        assert_eq!(bound.schema_version().await.unwrap(), 3, "reading and writing a v3 file does not migrate it");
+
+        // Another process migrates the file and stores a live meeting while `bound` stays open.
+        let mut other = Db::open(&path).await.unwrap();
+        let live = other.insert_meeting(&MeetingMeta { origin: TranscriptOrigin::Live, ..meta() }, &segs).await.unwrap();
+        other.close().await.unwrap();
+        assert_eq!(bound.get_meeting(live).await.unwrap().unwrap().origin, TranscriptOrigin::Live,
+            "a connection opened on v3 must not keep answering 'batch' after the file was migrated");
+        let after = bound.insert_meeting(&meta(), &segs).await.unwrap();
+        assert_eq!(stored_origin(&mut bound, after).await.as_deref(), Some("batch"));
+        bound.migrate().await.unwrap();
+        assert_eq!(bound.schema_version().await.unwrap(), SCHEMA_VERSION);
+        bound.close().await.unwrap();
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Two processes that open the same bound v3 archive both run the ladder (the daemon's child
+    /// and a manual `--resume`). The rung is applied once and neither fails.
+    #[test]
+    fn two_connections_migrating_one_v3_file_apply_the_rung_once() {
+        use std::sync::{Arc, Barrier};
+        for _ in 0..5 {
+            let tmp = tempdir();
+            let path = tmp.join("archive.db");
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let identity = runtime.block_on(Db::create_v3_archive(&path)).unwrap();
+            let barrier = Arc::new(Barrier::new(2));
+            let migrators: Vec<_> = (0..2).map(|_| {
+                let (path, identity, barrier) = (path.clone(), identity.clone(), Arc::clone(&barrier));
+                std::thread::spawn(move || tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                    let mut db = Db::open_existing(&path, &identity).await.unwrap();
+                    barrier.wait();
+                    db.migrate().await.unwrap();
+                    let version = db.schema_version().await.unwrap();
+                    db.close().await.unwrap();
+                    version
+                }))
+            }).collect();
+            let versions: Vec<i32> = migrators.into_iter().map(|migrator| migrator.join().unwrap()).collect();
+            assert_eq!(versions, [SCHEMA_VERSION, SCHEMA_VERSION]);
+            runtime.block_on(async {
+                let mut db = Db::open_existing(&path, &identity).await.unwrap();
+                let columns = db.table_info("meetings").await.unwrap();
+                assert_eq!(columns.iter().filter(|column| column.starts_with("transcript_origin|")).count(), 1);
+                db.close().await.unwrap();
+            });
+            std::fs::remove_dir_all(&tmp).ok();
+        }
     }
 
     /// Guard the invariant the whole render split rests on: stored transcript text is written

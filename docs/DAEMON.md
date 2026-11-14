@@ -102,11 +102,56 @@ preserve files, use read-only inspection and prefer a forward fix. Restoring an 
 discard newer meetings and requires a separate decision.
 
 Rungs: v1 `vocab_corrections`; v2 speaker-identity tables; v3 archive identity, keyed session ingests
-and capture completeness. Existing meeting IDs/text remain; legacy completeness is unknown.
+and capture completeness; v4 `meetings.transcript_origin` (`batch` or `live`; an empty value reads
+as `batch`, so no existing row is rewritten). Existing meeting IDs/text remain; legacy completeness
+is unknown.
 
 ⚠️ Migrating turns `list` and `export` into **writers** on their first run under a new binary. The
 database uses SQLite's default rollback journal (no WAL), so writers serialize — run the migration
 with the daemon stopped rather than alongside a meeting being stored.
+
+A session keeps the database it was recorded into. Its next transcription attempt (the daemon's
+child or a manual `transcribe --resume`) migrates **that** database, on the connection that has
+just verified its identity, wherever the file is. If that upgrade fails, for instance because
+another process holds the write lock, the attempt fails and is retried like any other; the session
+is not marked as having a foreign archive. Reading never migrates: the retention proof works on a
+v3 file and leaves it at v3, and an older binary that writes into a v4 file leaves the new column
+empty.
+
+## Storing the live transcript (`transcribe --promote-live`)
+
+Not wired into the daemon yet: the daemon never passes this flag, so nothing changes unless you
+run it by hand.
+
+`meetscribe transcribe <session dir> --resume --promote-live <live dir>` (or `--session-key`, with
+`--db` and `--export-dir`) looks for `<live dir>/<session key>.jsonl`, the stream `meetscribe live`
+wrote for that recording. If the stream is provably the whole meeting, it is stored as the meeting
+and whisper does not run. The stored meeting is marked `live` (`meetscribe list` shows it in the
+`ORIGIN` column, and its Markdown carries a "Transcript: live, provisional" line). It has no
+far-end voices or names. The stream itself is left as it is.
+
+Anything else falls back to the normal transcription **in the same attempt**. The log names why,
+without any meeting text:
+
+| `reason` | The stream… |
+|---|---|
+| `no_stream`, `unreadable` | is absent, or is not a regular readable file |
+| `reader_gone`, `timeout` | stopped changing for 30 s, or was still being written after 300 s |
+| `torn` | has a line that does not parse, a gap in `seq`, or an unfinished last line |
+| `key_mismatch`, `not_ended` | belongs to another recording, or its reader stopped early |
+| `duration_mismatch`, `count_mismatch` | does not cover the recorded audio, or lost a segment |
+| `empty` | is complete but has no text (the full pass gets a second look at silence) |
+| `capture_partial`, `invalid_segment` | belongs to a capture recovered after a crash, or has a time outside the recording |
+
+```
+grep 'live_promot' ~/.meetscribe/logs/meetscribe.err.log   # live_promoted / live_promotion_rejected
+```
+
+`live_promoted` carries `segments` (lines in the stream), `merged_segments` (stored, after joining
+neighbours the way the full pass does), `short_windows`, `audio_secs` and `wait_ms`.
+
+The Markdown line names `meetscribe finalize <id>`, the command that will replace a live
+transcript with the full one. It does not exist in this build and exits with an error.
 
 ## Menu-bar tray (Phase 5) — `meetscribe tray`
 An optional, **separate** menu-bar app (its own process; the daemon is untouched). It reads
