@@ -49,13 +49,17 @@ fn safe_fields(fields: Map<String, Value>) -> Option<Map<String, Value>> {
     let mut invalid_class = false;
     for (key, value) in fields {
         let valid = match key.as_str() {
-            "component" => value.as_str().is_some_and(|value| matches!(value, "recovery" | "cli" | "pipeline" | "daemon" | "asr" | "control" | "retention" | "provision")),
+            "component" => value.as_str().is_some_and(|value| matches!(value, "recovery" | "cli" | "pipeline" | "daemon" | "asr" | "control" | "retention" | "provision" | "live")),
             "event" => value.as_str().is_some_and(|value| matches!(value,
                 "capture_started" | "roll_started" | "checkpoint_committed" | "capture_finalized" | "capture_failed" |
                 "archive_bound" | "attempt_reserved" | "archive_committed" | "session_complete" | "attention_required" |
                 "attempt_failed" | "pending_reconciled" | "committed_inputs_recovered" | "command_failed" | "source_unchanged" |
                 "model_stage_ready" | "model_published" | "runtime_stage_ready" | "runtime_backup_retained" |
-                "runtime_published" | "runtime_restored" | "stop_requested" | "stop_received" | "status_published" | "recovery_scan_failed" | "launch_failure_persist_failed")),
+                "runtime_published" | "runtime_restored" | "stop_requested" | "stop_received" | "status_published" | "recovery_scan_failed" | "launch_failure_persist_failed" |
+                "live_started" | "live_lag" | "live_stopped")),
+            // Live-lane measurements: numbers only, so a transcript can never ride along.
+            "audio_secs" | "decoded_secs" => value.as_f64().is_some_and(|value| value.is_finite() && value >= 0.0),
+            "windows" | "short_windows" | "lag_ms" => value.as_u64().is_some(),
             "session_id" | "instance_id" => value.as_str().is_some_and(|value| value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())),
             "phase" => value.as_str().is_some_and(|value| matches!(value, "Recording" | "Ready" | "Archived" | "Complete" | "NeedsAttention" | "SkippedShort")),
             "attempt" => value.as_u64().is_some_and(|value| value <= 4),
@@ -84,7 +88,7 @@ fn safe_fields(fields: Map<String, Value>) -> Option<Map<String, Value>> {
 fn formatted(record: &log::Record<'_>, run_id: &str) -> Value {
     let component = match record.target().rsplit("::").next().unwrap_or("") {
         "meetscribe" => "cli",
-        value @ ("asr" | "capture" | "daemon" | "db" | "detect" | "diagnostics" | "export" | "maintenance" | "pipeline" | "recovery" | "session" | "speakers" | "status" | "tray") => value,
+        value @ ("asr" | "capture" | "daemon" | "db" | "detect" | "diagnostics" | "export" | "live" | "maintenance" | "pipeline" | "recovery" | "session" | "speakers" | "status" | "tray") => value,
         _ => "dependency",
     };
     let mut output = json!({
@@ -199,6 +203,26 @@ mod tests {
             assert_eq!(output["event"], event); assert_eq!(output["error_class"], class);
             assert_eq!(output["outcome"], "error"); assert!(output["help"].is_string());
             assert!(!output.to_string().contains("SYNTHETIC_PRIVATE_LAUNCH_DETAIL"));
+        }
+    }
+
+    #[test]
+    fn live_measurements_survive_and_text_in_a_number_field_rejects_the_event() {
+        let event = |fields: Value| formatted(&log::Record::builder().target("meetscribe::event")
+            .args(format_args!("{fields}")).build(), "synthetic-run");
+        let kept = event(json!({"component":"live", "event":"live_lag", "session_id":"a6e79ba0314c4cc2b647f4d25b327011",
+            "audio_secs":52.0, "decoded_secs":48.6, "windows":7, "short_windows":2, "lag_ms":3400, "outcome":"ok",
+            "text":"SYNTHETIC_PRIVATE_SENTENCE"}));
+        assert_eq!((kept["component"].as_str(), kept["event"].as_str()), (Some("live"), Some("live_lag")));
+        assert_eq!((kept["audio_secs"].as_f64(), kept["decoded_secs"].as_f64()), (Some(52.0), Some(48.6)));
+        assert_eq!((kept["windows"].as_u64(), kept["short_windows"].as_u64(), kept["lag_ms"].as_u64()), (Some(7), Some(2), Some(3400)));
+        assert!(!kept.to_string().contains("SYNTHETIC_PRIVATE_SENTENCE"));
+        for field in ["audio_secs", "decoded_secs", "windows", "short_windows", "lag_ms"] {
+            let mut fields = json!({"component":"live", "event":"live_lag"});
+            fields[field] = json!("SYNTHETIC_PRIVATE_SENTENCE");
+            let rejected = event(fields);
+            assert_eq!(rejected["event"], "invalid_event", "{field}");
+            assert!(!rejected.to_string().contains("SYNTHETIC_PRIVATE_SENTENCE"), "{field}");
         }
     }
 

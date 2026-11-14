@@ -514,6 +514,24 @@ pub(crate) fn read_committed_samples(path: &Path, rate: u32, frames: u64) -> Res
     Ok(samples)
 }
 
+/// Frames `from..to` of the committed prefix, for a reader that follows a recording while it
+/// grows. `committed` is the checkpointed frame count the range must lie inside; the same RIFF
+/// and format checks as [`read_committed_samples`] apply, and nothing is modified.
+pub(crate) fn read_committed_range(path: &Path, rate: u32, committed: u64, from: u64, to: u64) -> Result<Vec<f32>> {
+    use std::io::{Read, Seek, SeekFrom};
+    if from > to || to > committed { bail!("requested frames lie outside the committed prefix"); }
+    let offset = committed_data_offset(path, rate, committed)?;
+    let count = usize::try_from(to - from).context("requested sample count exceeds platform capacity")?;
+    let start = from.checked_mul(4).and_then(|bytes| offset.checked_add(bytes)).context("range offset overflow")?;
+    let mut source = std::io::BufReader::new(File::open(path)?); source.seek(SeekFrom::Start(start))?;
+    let mut samples = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut bytes = [0u8; 4]; source.read_exact(&mut bytes)?;
+        samples.push(f32::from_le_bytes(bytes));
+    }
+    Ok(samples)
+}
+
 // RIFF chunk boundaries, not a guessed universal WAV header offset. Only our mono
 // float format with a validated metadata checkpoint is eligible for this reader.
 fn committed_data_offset(path: &Path, rate: u32, frames: u64) -> Result<u64> {

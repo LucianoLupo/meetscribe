@@ -8,7 +8,8 @@
 //!   - `speakers …`            = name the far-end voices (cluster → play → label; recalled later);
 //!   - `rerender [--all]`      = re-render stored meetings into their session dirs, preview by
 //!     default — how a new correction reaches past transcripts;
-//!   - `detect [--watch]`      = which allowlisted app (if any) holds the mic (Phase-4 detector).
+//!   - `detect [--watch]`      = which allowlisted app (if any) holds the mic (Phase-4 detector);
+//!   - `live <dir>` / `live tail` = a provisional transcript while a recording grows, and its viewer.
 //!
 //! Capture usage:
 //!   meetscribe [--out <dir>] [--seconds <n>] [--rebuild-after <n>]
@@ -35,6 +36,7 @@ mod diagnostics;
 mod audit_recovery;
 mod pipeline;
 mod daemon;
+mod live;
 mod launchd;
 mod config;
 mod maintenance;
@@ -908,6 +910,7 @@ fn run() -> Result<()> {
         Some("speakers") => return speakers::run_speakers(&argv[2..]),
         Some("detect") => return run_detect(&argv[2..]),
         Some("daemon") => return daemon::run_daemon(&argv[2..]),
+        Some("live") => return live::run(&argv[2..]),
         Some("tray") => return tray::run_tray(&argv[2..]),
         Some("install") => return launchd::run_install(&argv[2..]),
         Some("uninstall") => return launchd::run_uninstall(&argv[2..]),
