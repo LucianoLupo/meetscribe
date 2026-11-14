@@ -8,7 +8,9 @@
 //!   - `speakers …`            = name the far-end voices (cluster → play → label; recalled later);
 //!   - `rerender [--all]`      = re-render stored meetings into their session dirs, preview by
 //!     default — how a new correction reaches past transcripts;
-//!   - `detect [--watch]`      = which allowlisted app (if any) holds the mic (Phase-4 detector).
+//!   - `detect [--watch]`      = which allowlisted app (if any) holds the mic (Phase-4 detector);
+//!   - `live watch` / `live <dir>` / `live tail` = a provisional transcript while a recording grows,
+//!     and its viewer.
 //!
 //! Capture usage:
 //!   meetscribe [--out <dir>] [--seconds <n>] [--rebuild-after <n>]
@@ -35,6 +37,7 @@ mod diagnostics;
 mod audit_recovery;
 mod pipeline;
 mod daemon;
+mod live;
 mod launchd;
 mod config;
 mod maintenance;
@@ -887,11 +890,38 @@ fn run_detect(argv: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn main() -> std::process::ExitCode {
+/// Where the diagnostics went when they were kept off the terminal (see [`init_diagnostics`]).
+static LOG_FILE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// `live watch` prints the transcript in the terminal, so there its diagnostics go to
+/// `<base>/logs/live-watch.log` instead of between the lines. Everything else logs to stderr.
+fn init_diagnostics() {
+    use std::io::IsTerminal;
+    let argv: Vec<String> = std::env::args().collect();
+    let watch = argv.get(1).is_some_and(|arg| arg == "live") && argv.get(2).is_some_and(|arg| arg == "watch");
+    if watch && std::io::stderr().is_terminal() {
+        let base = argv.iter().position(|arg| arg == "--base").and_then(|at| argv.get(at + 1)).map(PathBuf::from).or_else(base_dir);
+        if let Some(log) = base.map(|base| base.join("logs/live-watch.log")) && diagnostics::init_to_file(&log) {
+            eprintln!("log: {}", log.display());
+            let _ = LOG_FILE.set(log);
+            return;
+        }
+    }
     diagnostics::init();
+}
+
+fn main() -> std::process::ExitCode {
+    init_diagnostics();
     match run() {
         Ok(()) => std::process::ExitCode::SUCCESS,
-        Err(error) => { diagnostics::command_failed(&error); std::process::ExitCode::FAILURE }
+        Err(error) => {
+            diagnostics::command_failed(&error);
+            // With the log in a file, a failure must still be visible where the command was typed.
+            if let Some(log) = LOG_FILE.get() {
+                eprintln!("failed ({}); see {}", diagnostics::error_class(&error), log.display());
+            }
+            std::process::ExitCode::FAILURE
+        }
     }
 }
 
@@ -908,6 +938,7 @@ fn run() -> Result<()> {
         Some("speakers") => return speakers::run_speakers(&argv[2..]),
         Some("detect") => return run_detect(&argv[2..]),
         Some("daemon") => return daemon::run_daemon(&argv[2..]),
+        Some("live") => return live::run(&argv[2..]),
         Some("tray") => return tray::run_tray(&argv[2..]),
         Some("install") => return launchd::run_install(&argv[2..]),
         Some("uninstall") => return launchd::run_uninstall(&argv[2..]),

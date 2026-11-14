@@ -64,9 +64,73 @@ pub fn to_16k_mono(input: &[f32], src_rate: u32) -> Result<Vec<f32>> {
     Ok(out)
 }
 
+/// [`to_16k_mono`] for audio that arrives in pieces: the live lane reads a recording while it
+/// grows. Same resampler and chunk size, so a roll fed piece by piece gives the same samples as
+/// the batch path; only the zero-padded tail is produced by [`Streamer::finish`].
+pub struct Streamer {
+    /// `None` when the source is already 16 kHz.
+    resampler: Option<FftFixedIn<f32>>,
+    /// Input samples not yet making a full resampler chunk.
+    pending: Vec<f32>,
+}
+
+impl Streamer {
+    const CHUNK: usize = 1024;
+
+    pub fn new(src_rate: u32) -> Result<Self> {
+        let resampler = if src_rate == TARGET_RATE { None } else {
+            Some(FftFixedIn::<f32>::new(src_rate as usize, TARGET_RATE as usize, Self::CHUNK, 2, 1)
+                .context("build FftFixedIn resampler")?)
+        };
+        Ok(Self { resampler, pending: Vec::new() })
+    }
+
+    /// Feed the next samples; returns the 16 kHz audio that is complete so far.
+    pub fn push(&mut self, input: &[f32]) -> Result<Vec<f32>> {
+        let Some(resampler) = self.resampler.as_mut() else {
+            return Ok(input.iter().copied().map(normalize).collect());
+        };
+        self.pending.extend(input.iter().copied().map(normalize));
+        let full = self.pending.len() - self.pending.len() % Self::CHUNK;
+        let mut out = Vec::new();
+        for frame in self.pending[..full].as_chunks::<{ Self::CHUNK }>().0 {
+            let wave = resampler.process(&[frame.as_slice()], None).context("resample chunk")?;
+            out.extend(wave[0].iter().copied().map(normalize));
+        }
+        self.pending.drain(..full);
+        Ok(out)
+    }
+
+    /// The end of the source: resample what is left, zero-padded to a full chunk.
+    pub fn finish(&mut self) -> Result<Vec<f32>> {
+        let Some(resampler) = self.resampler.as_mut() else { return Ok(Vec::new()); };
+        if self.pending.is_empty() { return Ok(Vec::new()); }
+        self.pending.resize(Self::CHUNK, 0.0);
+        let wave = resampler.process(&[self.pending.as_slice()], None).context("resample final chunk")?;
+        self.pending.clear();
+        Ok(wave[0].iter().copied().map(normalize).collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streamed_pieces_give_the_same_audio_as_one_batch_call() {
+        // 2.3 s of a 440 Hz tone at 48 kHz, fed in uneven pieces (none a multiple of the chunk).
+        let input: Vec<f32> = (0..110_400).map(|i| (i as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.5).collect();
+        let batch = to_16k_mono(&input, 48_000).unwrap();
+        let mut streamer = Streamer::new(48_000).unwrap();
+        let mut streamed = Vec::new();
+        for piece in input.chunks(7_001) { streamed.extend(streamer.push(piece).unwrap()); }
+        streamed.extend(streamer.finish().unwrap());
+        assert_eq!(streamed, batch);
+        // Already 16 kHz: passed through, clamped, nothing held back.
+        let mut same_rate = Streamer::new(16_000).unwrap();
+        assert_eq!(same_rate.push(&[0.25, 1.5, f32::NAN]).unwrap(), vec![0.25, 1.0, 0.0]);
+        assert!(same_rate.finish().unwrap().is_empty());
+    }
 
     #[test]
     fn passthrough_when_already_16k() {

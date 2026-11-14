@@ -184,9 +184,12 @@ Add others with `detector.allowlist_extra`.
 
 Stated plainly, so nothing surprises you later.
 
-- **The transcript appears *after* the call, not during it.** A long meeting takes a while
-  to process. Live transcription was designed and deliberately shelved — it's three new
-  moving parts and risks dropping audio, which is a bad trade for a recorder.
+- **The stored transcript appears *after* the call.** A long meeting takes a while to
+  process. To read along *during* a call, run `meetscribe live watch` in a terminal: it
+  prints a provisional transcript a few seconds behind the speaker. It only reads what the
+  recorder has already saved, so it cannot drop audio. It has no voices or names, it can word
+  a sentence differently from the stored transcript, and the daemon does not start it for
+  you: it runs while that terminal is open.
 - **Transcripts are stored unencrypted** on your disk (readable only by your user account).
   Encryption is planned. If your meetings are sensitive, know this now.
 - **Names come from you, once per voice.** The far end is one mixed track; meetscribe groups
@@ -204,8 +207,9 @@ Stated plainly, so nothing surprises you later.
 ```
 ~/.meetscribe/
 ├── sessions/   your recordings
+├── live/       the text `meetscribe live` wrote during calls (kept until you delete it)
 ├── models/     the speech model (under speaker/ the voice model, under diarizer/ the voice splitter)
-├── logs/       what the daemon is doing
+├── logs/       what the daemon is doing (`live-watch.log`: what `live watch` is doing)
 └── config.toml settings
 ```
 
