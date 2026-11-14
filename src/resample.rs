@@ -93,8 +93,8 @@ impl Streamer {
         self.pending.extend(input.iter().copied().map(normalize));
         let full = self.pending.len() - self.pending.len() % Self::CHUNK;
         let mut out = Vec::new();
-        for frame in self.pending[..full].chunks_exact(Self::CHUNK) {
-            let wave = resampler.process(&[frame], None).context("resample chunk")?;
+        for frame in self.pending[..full].as_chunks::<{ Self::CHUNK }>().0 {
+            let wave = resampler.process(&[frame.as_slice()], None).context("resample chunk")?;
             out.extend(wave[0].iter().copied().map(normalize));
         }
         self.pending.drain(..full);

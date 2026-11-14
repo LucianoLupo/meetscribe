@@ -209,7 +209,7 @@ Stated plainly, so nothing surprises you later.
 ├── sessions/   your recordings
 ├── live/       the text `meetscribe live` wrote during calls (kept until you delete it)
 ├── models/     the speech model (under speaker/ the voice model, under diarizer/ the voice splitter)
-├── logs/       what the daemon is doing
+├── logs/       what the daemon is doing (`live-watch.log`: what `live watch` is doing)
 └── config.toml settings
 ```
 

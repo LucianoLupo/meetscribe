@@ -502,16 +502,7 @@ pub(crate) fn roll_name(channel: &str, index: u32) -> String {
 /// Read the same committed RIFF prefix recovery trusts, including stale declared data lengths.
 /// Capture symlinks and insufficient/mismatched sample bytes fail closed without modifying files.
 pub(crate) fn read_committed_samples(path: &Path, rate: u32, frames: u64) -> Result<Vec<f32>> {
-    use std::io::{Read, Seek, SeekFrom};
-    let offset = committed_data_offset(path, rate, frames)?;
-    let count = usize::try_from(frames).context("committed sample count exceeds platform capacity")?;
-    let mut source = std::io::BufReader::new(File::open(path)?); source.seek(SeekFrom::Start(offset))?;
-    let mut samples = Vec::with_capacity(count);
-    for _ in 0..count {
-        let mut bytes = [0u8; 4]; source.read_exact(&mut bytes)?;
-        samples.push(f32::from_le_bytes(bytes));
-    }
-    Ok(samples)
+    read_committed_range(path, rate, frames, 0, frames)
 }
 
 /// Frames `from..to` of the committed prefix, for a reader that follows a recording while it

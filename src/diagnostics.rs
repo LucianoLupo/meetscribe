@@ -56,10 +56,10 @@ fn safe_fields(fields: Map<String, Value>) -> Option<Map<String, Value>> {
                 "attempt_failed" | "pending_reconciled" | "committed_inputs_recovered" | "command_failed" | "source_unchanged" |
                 "model_stage_ready" | "model_published" | "runtime_stage_ready" | "runtime_backup_retained" |
                 "runtime_published" | "runtime_restored" | "stop_requested" | "stop_received" | "status_published" | "recovery_scan_failed" | "launch_failure_persist_failed" |
-                "live_started" | "live_lag" | "live_stopped")),
+                "live_started" | "live_lag" | "live_stopped" | "live_failed")),
             // Live-lane measurements: numbers only, so a transcript can never ride along.
             "audio_secs" | "decoded_secs" => value.as_f64().is_some_and(|value| value.is_finite() && value >= 0.0),
-            "windows" | "short_windows" | "lag_ms" => value.as_u64().is_some(),
+            "segments" | "short_windows" | "lag_ms" => value.as_u64().is_some(),
             "session_id" | "instance_id" => value.as_str().is_some_and(|value| value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())),
             "phase" => value.as_str().is_some_and(|value| matches!(value, "Recording" | "Ready" | "Archived" | "Complete" | "NeedsAttention" | "SkippedShort")),
             "attempt" => value.as_u64().is_some_and(|value| value <= 4),
@@ -122,16 +122,37 @@ fn formatted(record: &log::Record<'_>, run_id: &str) -> Value {
     output
 }
 
-pub fn init() {
+fn builder() -> env_logger::Builder {
     let run_id = crate::recovery::new_identity();
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format(move |buffer, record| writeln!(buffer, "{}", formatted(record, &run_id)))
-        .init();
+    let mut builder = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+    builder.format(move |buffer, record| writeln!(buffer, "{}", formatted(record, &run_id)));
+    builder
+}
+
+pub fn init() {
+    builder().init();
+}
+
+/// As [`init`], with the lines appended to `path` (owner-only) instead of stderr: for a command
+/// that prints a transcript in the terminal its diagnostics would otherwise land in. Returns
+/// `false`, with nothing initialised, when the file cannot be opened.
+pub fn init_to_file(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::OpenOptionsExt;
+    let Some(parent) = path.parent() else { return false; };
+    if crate::recovery::private_dir(parent).is_err() { return false; }
+    let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(path) else { return false; };
+    builder().target(env_logger::Target::Pipe(Box::new(file))).init();
+    true
+}
+
+/// The approved class of an error, for a caller that reports a failure and carries on.
+pub(crate) fn error_class(error: &anyhow::Error) -> &'static str {
+    classify(&format!("{error:#}"))
 }
 
 /// The CLI's Result-error boundary must not bypass the same content-free policy.
 pub fn command_failed(error: &anyhow::Error) {
-    let class = classify(&format!("{error:#}"));
+    let class = error_class(error);
     log::error!(target: "meetscribe::event", "{}", json!({
         "component": "cli", "event": "command_failed", "outcome": "error", "error_class": class,
     }));
@@ -211,13 +232,16 @@ mod tests {
         let event = |fields: Value| formatted(&log::Record::builder().target("meetscribe::event")
             .args(format_args!("{fields}")).build(), "synthetic-run");
         let kept = event(json!({"component":"live", "event":"live_lag", "session_id":"a6e79ba0314c4cc2b647f4d25b327011",
-            "audio_secs":52.0, "decoded_secs":48.6, "windows":7, "short_windows":2, "lag_ms":3400, "outcome":"ok",
+            "audio_secs":52.0, "decoded_secs":48.6, "segments":7, "short_windows":2, "lag_ms":3400, "outcome":"ok",
             "text":"SYNTHETIC_PRIVATE_SENTENCE"}));
         assert_eq!((kept["component"].as_str(), kept["event"].as_str()), (Some("live"), Some("live_lag")));
         assert_eq!((kept["audio_secs"].as_f64(), kept["decoded_secs"].as_f64()), (Some(52.0), Some(48.6)));
-        assert_eq!((kept["windows"].as_u64(), kept["short_windows"].as_u64(), kept["lag_ms"].as_u64()), (Some(7), Some(2), Some(3400)));
+        assert_eq!((kept["segments"].as_u64(), kept["short_windows"].as_u64(), kept["lag_ms"].as_u64()), (Some(7), Some(2), Some(3400)));
         assert!(!kept.to_string().contains("SYNTHETIC_PRIVATE_SENTENCE"));
-        for field in ["audio_secs", "decoded_secs", "windows", "short_windows", "lag_ms"] {
+        // A recording that could not be followed says why, as a class and never as text.
+        let failed = event(json!({"component":"live", "event":"live_failed", "outcome":"error", "error_class":"model"}));
+        assert_eq!((failed["event"].as_str(), failed["error_class"].as_str()), (Some("live_failed"), Some("model")));
+        for field in ["audio_secs", "decoded_secs", "segments", "short_windows", "lag_ms"] {
             let mut fields = json!({"component":"live", "event":"live_lag"});
             fields[field] = json!("SYNTHETIC_PRIVATE_SENTENCE");
             let rejected = event(fields);

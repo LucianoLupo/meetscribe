@@ -13,6 +13,7 @@
 //! The stream holds meeting text, so it is a private file (directory 0700, file 0600). The log
 //! carries numbers only (`diagnostics.rs` allowlists the events and fields).
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
@@ -74,7 +75,7 @@ pub(crate) struct LiveSummary {
 }
 
 /// The live streams' directory under the daemon's base directory.
-pub(crate) fn default_out_dir(base: &Path) -> PathBuf {
+fn default_out_dir(base: &Path) -> PathBuf {
     base.join("live")
 }
 
@@ -301,7 +302,7 @@ fn read_state(dir: &Path) -> Result<(State, SystemTime)> {
 
 /// Audio seconds the checkpoint covers, on the meeting's timeline: what had been captured when
 /// the state file was written.
-pub(crate) fn committed_secs(state: &State) -> f64 {
+fn committed_secs(state: &State) -> f64 {
     state.rolls.last().zip(state.roll_offsets().last().copied()).map_or(0.0, |(roll, offset)| {
         offset + roll.mic_frames.max(roll.system_frames) as f64 / f64::from(roll.sample_rate)
     })
@@ -372,7 +373,7 @@ pub(crate) fn run_live(
         if last_lag_log.elapsed() >= LAG_LOG {
             log_event("live_lag", &key, json!({
                 "audio_secs": round(audio_secs, 1), "decoded_secs": round(decoded_secs, 1),
-                "windows": segments, "short_windows": short_windows, "lag_ms": last_lag_ms,
+                "segments": segments, "short_windows": short_windows, "lag_ms": last_lag_ms,
             }));
             last_lag_log = Instant::now();
         }
@@ -391,7 +392,8 @@ pub(crate) fn run_live(
     }))?;
     log_event("live_stopped", &key, json!({
         "audio_secs": round(audio_secs, 1), "decoded_secs": round(decoded_secs, 1),
-        "windows": segments, "short_windows": short_windows, "lag_ms": last_lag_ms,
+        "segments": segments, "short_windows": short_windows, "lag_ms": last_lag_ms,
+        "outcome": if reason == "ended" { "ok" } else { "attention" },
     }));
     Ok(LiveSummary { segments, short_windows, audio_secs, reason, stream: stream.path })
 }
@@ -467,26 +469,30 @@ fn run_tail(argv: &[String]) -> Result<()> {
     }
     let out_dir = match out_dir {
         Some(dir) => dir,
-        None => default_out_dir(&crate::home_dir().context("cannot resolve $HOME")?.join(".meetscribe")),
+        None => default_out_dir(&crate::base_dir().context("cannot resolve $HOME")?),
     };
     let pick = || key.as_ref().map(|key| out_dir.join(format!("{key}.jsonl"))).filter(|path| path.exists())
         .or_else(|| if key.is_none() { newest_stream(&out_dir) } else { None });
     let mut stdout = std::io::stdout().lock();
-    let mut current: Option<(PathBuf, u64)> = None;
+    let mut offsets = HashMap::new();
     loop {
         // With --follow the viewer moves to the next meeting's stream when one appears.
-        match (pick(), current.as_mut()) {
-            (Some(path), Some((shown, offset))) if path == *shown => *offset = print_from(&path, *offset, &mut stdout)?,
-            (Some(path), _) => {
-                let offset = print_from(&path, 0, &mut stdout)?;
-                current = Some((path, offset));
-            }
-            (None, _) if !follow => bail!("no live stream in {}", out_dir.display()),
-            (None, _) => {}
+        match pick() {
+            Some(path) => show(&path, &mut offsets, &mut stdout)?,
+            None if !follow => bail!("no live stream in {}", out_dir.display()),
+            None => {}
         }
         if !follow { return Ok(()); }
         std::thread::sleep(Duration::from_millis(300));
     }
+}
+
+/// Print what `path` has gained since it was last shown. Each stream keeps its own position, so
+/// two meetings written at the same time are each shown once however often the newest one changes.
+fn show(path: &Path, offsets: &mut HashMap<PathBuf, u64>, out: &mut impl Write) -> Result<()> {
+    let offset = print_from(path, offsets.get(path).copied().unwrap_or(0), out)?;
+    offsets.insert(path.to_path_buf(), offset);
+    Ok(())
 }
 
 /// `meetscribe live replay <recording dir> <new session dir> [--speed <n>] [--seconds <n>]`:
@@ -568,13 +574,61 @@ fn run_watch(opts: &LiveOpts) -> Result<()> {
             std::thread::sleep(Duration::from_secs(1));
             continue;
         };
-        if let Ok(state) = State::read(&dir) { followed.insert(state.key); }
+        let key = State::read(&dir).ok().map(|state| state.key);
+        if let Some(key) = &key { followed.insert(key.clone()); }
         // One failed meeting must not end the watch: the next call still gets its transcript.
-        if run_live(&dir, opts, |audio, lang| asr.transcribe(audio, lang)).is_err() {
-            log::warn!("component=live event=follow_failed");
+        if let Err(error) = run_live(&dir, opts, |audio, lang| asr.transcribe(audio, lang)) {
+            let mut line = json!({"component": "live", "event": "live_failed", "outcome": "error",
+                "error_class": crate::diagnostics::error_class(&error)});
+            if let Some(key) = &key { line["session_id"] = json!(key); }
+            log::warn!(target: "meetscribe::event", "{line}");
             eprintln!("this recording could not be followed to its end; waiting for the next one");
         }
     }
+}
+
+/// The options of `live <session-dir>` and `live watch`, and the session directory when one was
+/// given. `None` after `--help`.
+fn parse_args(argv: &[String], watch: bool, base: PathBuf) -> Result<Option<(LiveOpts, Option<PathBuf>)>> {
+    let mut base = base;
+    let (mut model, mut lang, mut out_dir) = (None, None, None);
+    let (mut max_window_ms, mut print, mut dir) = (12_000, watch, None);
+    let mut it = argv.iter();
+    while let Some(arg) = it.next() {
+        let mut value = |name: &str| it.next().cloned().with_context(|| format!("{name} needs a value"));
+        match arg.as_str() {
+            "--model" | "-m" => model = Some(PathBuf::from(value("--model")?)),
+            "--lang" | "-l" => lang = Some(value("--lang")?),
+            "--out" => out_dir = Some(PathBuf::from(value("--out")?)),
+            "--base" => base = PathBuf::from(value("--base")?),
+            "--max-window-secs" => {
+                let secs: f64 = value("--max-window-secs")?.parse().context("--max-window-secs")?;
+                anyhow::ensure!(secs >= 2.0, "--max-window-secs must be at least 2");
+                max_window_ms = (secs * 1000.0) as usize;
+            }
+            "--print" => print = true,
+            "-h" | "--help" => {
+                eprintln!("usage: meetscribe live watch [options]            wait for calls and print each transcript\n       \
+                    meetscribe live <session-dir> [options]    follow one recording\n       \
+                    meetscribe live tail [--follow] [--key <k>] [--dir <dir>]\n       \
+                    meetscribe live replay <recording dir> <new session dir> [--speed <n>] [--seconds <n>]\n\
+                    options: [--model <ggml>] [--lang <code>] [--out <dir>] [--base <dir>] [--max-window-secs <n>] [--print]");
+                return Ok(None);
+            }
+            other if !watch && dir.is_none() && !other.starts_with('-') => dir = Some(PathBuf::from(other)),
+            other => bail!("unknown argument {other} (see `meetscribe live --help`)"),
+        }
+    }
+    // What no flag set follows the base directory, and the language follows the daemon's config,
+    // so the live text is decoded like the transcript the daemon will store. `Config::load` only
+    // reads: following a recording must not create a config file.
+    let opts = LiveOpts {
+        model: model.unwrap_or_else(|| base.join("models/ggml-large-v3.bin")),
+        lang: lang.unwrap_or_else(|| crate::config::Config::load(&base).daemon.lang),
+        out_dir: out_dir.unwrap_or_else(|| default_out_dir(&base)),
+        base, max_window_ms, print,
+    };
+    Ok(Some((opts, dir)))
 }
 
 /// `meetscribe live <session-dir> [--model <ggml>] [--lang <code>] [--out <dir>] [--base <dir>]
@@ -586,38 +640,8 @@ pub(crate) fn run(argv: &[String]) -> Result<()> {
         _ => {}
     }
     let watch = argv.first().is_some_and(|arg| arg == "watch");
-    let base = crate::home_dir().context("cannot resolve $HOME")?.join(".meetscribe");
-    let mut opts = LiveOpts {
-        model: base.join("models/ggml-large-v3.bin"), lang: "es".into(),
-        out_dir: default_out_dir(&base), base, max_window_ms: 12_000, print: watch,
-    };
-    let mut dir = None;
-    let mut it = argv[usize::from(watch)..].iter();
-    while let Some(arg) = it.next() {
-        let mut value = |name: &str| it.next().cloned().with_context(|| format!("{name} needs a value"));
-        match arg.as_str() {
-            "--model" | "-m" => opts.model = PathBuf::from(value("--model")?),
-            "--lang" | "-l" => opts.lang = value("--lang")?,
-            "--out" => opts.out_dir = PathBuf::from(value("--out")?),
-            "--base" => opts.base = PathBuf::from(value("--base")?),
-            "--max-window-secs" => {
-                let secs: f64 = value("--max-window-secs")?.parse().context("--max-window-secs")?;
-                anyhow::ensure!(secs >= 2.0, "--max-window-secs must be at least 2");
-                opts.max_window_ms = (secs * 1000.0) as usize;
-            }
-            "--print" => opts.print = true,
-            "-h" | "--help" => {
-                eprintln!("usage: meetscribe live watch [options]            wait for calls and print each transcript\n       \
-                    meetscribe live <session-dir> [options]    follow one recording\n       \
-                    meetscribe live tail [--follow] [--key <k>] [--dir <dir>]\n       \
-                    meetscribe live replay <recording dir> <new session dir> [--speed <n>] [--seconds <n>]\n\
-                    options: [--model <ggml>] [--lang <code>] [--out <dir>] [--base <dir>] [--max-window-secs <n>] [--print]");
-                return Ok(());
-            }
-            other if !watch && dir.is_none() && !other.starts_with('-') => dir = Some(PathBuf::from(other)),
-            other => bail!("unknown argument {other} (see `meetscribe live --help`)"),
-        }
-    }
+    let base = crate::base_dir().context("cannot resolve $HOME")?;
+    let Some((opts, dir)) = parse_args(&argv[usize::from(watch)..], watch, base)? else { return Ok(()); };
     if watch { return run_watch(&opts); }
     let dir = dir.context("usage: meetscribe live <session-dir> (see --help)")?;
     let model = opts.model.to_str().context("model path is not valid UTF-8")?;
@@ -876,6 +900,52 @@ mod tests {
         followed.insert(newer.state.key.clone());
         assert_eq!(picked(&followed).as_deref(), Some("older"), "a recording already followed is skipped");
         drop((finished, abandoned, older));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn args(list: &[&str]) -> Vec<String> { list.iter().map(|arg| (*arg).to_string()).collect() }
+
+    /// `live watch` follows the daemon's recordings, so it decodes in the daemon's language and
+    /// keeps everything under the daemon's base directory unless a flag says otherwise.
+    #[test]
+    fn defaults_follow_the_base_directory_and_the_daemons_language() {
+        let root = temp_root("defaults");
+        let (home, other) = (root.join("home"), root.join("other"));
+        recovery::private_dir(&home).unwrap();
+        std::fs::write(home.join("config.toml"), "version = 1\n[daemon]\nlang = \"en\"\n").unwrap();
+        let (opts, dir) = parse_args(&[], true, home.clone()).unwrap().unwrap();
+        assert_eq!((opts.lang.as_str(), dir, opts.print), ("en", None, true));
+        assert_eq!((opts.out_dir, opts.model), (home.join("live"), home.join("models/ggml-large-v3.bin")));
+        // Another base directory moves the stream, the model and the config with it.
+        let moved = args(&["session", "--base", other.to_str().unwrap()]);
+        let (opts, dir) = parse_args(&moved, false, home.clone()).unwrap().unwrap();
+        assert_eq!((opts.lang.as_str(), dir), ("es", Some(PathBuf::from("session"))));
+        assert_eq!((opts.base.clone(), opts.out_dir, opts.model), (other.clone(), other.join("live"), other.join("models/ggml-large-v3.bin")));
+        assert!(!other.exists(), "a reader must not create a config file or its directory");
+        // Each flag still overrides its own default, whatever the order.
+        let explicit = args(&["--out", "/streams", "--lang", "pt", "--base", other.to_str().unwrap(), "--model", "/m.bin"]);
+        let (opts, _) = parse_args(&explicit, true, home).unwrap().unwrap();
+        assert_eq!((opts.lang.as_str(), opts.out_dir, opts.model), ("pt", PathBuf::from("/streams"), PathBuf::from("/m.bin")));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_viewer_shows_each_line_once_when_two_streams_take_turns() {
+        let root = temp_root("turns");
+        let (first, second) = (root.join("first.jsonl"), root.join("second.jsonl"));
+        let segment = |seq: u64, text: &str| format!("{}\n", json!({"v":1,"seq":seq,"type":"segment","speaker":"you","t_start":1.0,"t_end":2.0,"text":text}));
+        let append = |path: &Path, line: String| OpenOptions::new().create(true).append(true).open(path).unwrap().write_all(line.as_bytes()).unwrap();
+        let (mut offsets, mut shown) = (HashMap::new(), Vec::new());
+        append(&first, segment(0, "uno"));
+        show(&first, &mut offsets, &mut shown).unwrap();
+        append(&second, segment(0, "dos"));
+        show(&second, &mut offsets, &mut shown).unwrap();
+        append(&first, segment(1, "tres"));
+        show(&first, &mut offsets, &mut shown).unwrap();
+        show(&second, &mut offsets, &mut shown).unwrap();
+        let shown = String::from_utf8(shown).unwrap();
+        let texts: Vec<&str> = shown.lines().map(|line| line.rsplit(": ").next().unwrap()).collect();
+        assert_eq!(texts, ["uno", "dos", "tres"]);
         std::fs::remove_dir_all(root).unwrap();
     }
 
