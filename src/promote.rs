@@ -22,59 +22,57 @@ const MAX_STREAM_BYTES: u64 = 64 * 1024 * 1024;
 /// committed audio for the same reason.
 const DURATION_SLACK_SECS: f64 = 0.1;
 
-/// Why a live stream was not stored. The log carries [`Reject::as_str`], so this list is closed:
-/// `diagnostics.rs` drops an event whose reason is not in it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Reject {
+/// The reasons and their names in the log, declared once: the enum, [`Reject::as_str`] and the
+/// list the log allowlist tests against cannot drift apart.
+macro_rules! reject_reasons {
+    ($($(#[$doc:meta])* $variant:ident => $name:literal,)+) => {
+        /// Why a live stream was not stored. The log carries [`Reject::as_str`], so this list is
+        /// closed: `diagnostics.rs` drops an event whose reason is not in it.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub(crate) enum Reject { $($(#[$doc])* $variant,)+ }
+
+        impl Reject {
+            const ALL: &'static [Reject] = &[$(Reject::$variant,)+];
+
+            pub(crate) fn as_str(self) -> &'static str {
+                match self { $(Reject::$variant => $name,)+ }
+            }
+        }
+    };
+}
+
+reject_reasons! {
     /// No stream file for this recording: no reader ran.
-    NoStream,
+    NoStream => "no_stream",
     /// Something is at the stream's path that cannot be read as a regular file.
-    Unreadable,
+    Unreadable => "unreadable",
     /// The stream stopped changing before the reader wrote its last line.
-    ReaderGone,
+    ReaderGone => "reader_gone",
     /// The reader was still writing when the wait ended.
-    Timeout,
+    Timeout => "timeout",
     /// A line that does not parse, a wrong version, a gap in `seq`, or an unfinished last line.
-    Torn,
-    KeyMismatch,
+    Torn => "torn",
+    KeyMismatch => "key_mismatch",
     /// The reader stopped for another reason than the end of the recording.
-    NotEnded,
-    DurationMismatch,
-    CountMismatch,
+    NotEnded => "not_ended",
+    DurationMismatch => "duration_mismatch",
+    CountMismatch => "count_mismatch",
     /// A complete stream with no text. Kept as a rejection on purpose: a live result with nothing
     /// in it is the one case worth a second opinion, and the batch pass on silence is quick.
-    Empty,
-    CapturePartial,
-    InvalidSegment,
+    Empty => "empty",
+    CapturePartial => "capture_partial",
+    InvalidSegment => "invalid_segment",
 }
 
 impl Reject {
-    const ALL: [Reject; 12] = [
-        Reject::NoStream, Reject::Unreadable, Reject::ReaderGone, Reject::Timeout, Reject::Torn, Reject::KeyMismatch,
-        Reject::NotEnded, Reject::DurationMismatch, Reject::CountMismatch, Reject::Empty, Reject::CapturePartial,
-        Reject::InvalidSegment,
-    ];
-
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Reject::NoStream => "no_stream",
-            Reject::Unreadable => "unreadable",
-            Reject::ReaderGone => "reader_gone",
-            Reject::Timeout => "timeout",
-            Reject::Torn => "torn",
-            Reject::KeyMismatch => "key_mismatch",
-            Reject::NotEnded => "not_ended",
-            Reject::DurationMismatch => "duration_mismatch",
-            Reject::CountMismatch => "count_mismatch",
-            Reject::Empty => "empty",
-            Reject::CapturePartial => "capture_partial",
-            Reject::InvalidSegment => "invalid_segment",
-        }
+    /// Every reason's name, in declaration order.
+    pub(crate) fn names() -> impl Iterator<Item = &'static str> {
+        Self::ALL.iter().map(|reject| reject.as_str())
     }
 
     /// Whether `reason` is one of the reasons above (the log allowlist's test).
     pub(crate) fn is_known(reason: &str) -> bool {
-        Self::ALL.iter().any(|reject| reject.as_str() == reason)
+        Self::names().any(|name| name == reason)
     }
 }
 
@@ -113,6 +111,8 @@ impl Wait {
 pub(crate) struct Promotion {
     /// The model that decoded the stream, as the reader recorded it.
     pub model: String,
+    /// The language the reader decoded in. `None` for a stream written before readers recorded it.
+    pub lang: Option<String>,
     /// The transcript: the stream's segments joined by [`coalesce`], in transcript order.
     pub segments: Vec<TranscriptSegment>,
     /// Segment lines in the stream, before joining.
@@ -127,6 +127,7 @@ pub(crate) struct Promotion {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Checked {
     pub model: String,
+    pub lang: Option<String>,
     pub segments: Vec<TranscriptSegment>,
     pub short_windows: u64,
     pub duration_secs: f64,
@@ -134,6 +135,9 @@ pub(crate) struct Checked {
 
 /// Wait for the reader of `state`'s recording to finish `<live_dir>/<key>.jsonl`, then check it.
 pub(crate) fn wait_and_load(live_dir: &Path, state: &State, wait: &Wait) -> Result<Promotion, Reject> {
+    // What the state alone decides is decided before any wait: after a capture that did not end
+    // cleanly a reader can keep its stream alive for the whole cap, and the answer is known now.
+    if state.capture_status != CaptureStatus::Complete { return Err(Reject::CapturePartial); }
     let path = live_dir.join(format!("{}.jsonl", state.key));
     let started = Instant::now();
     let bytes = loop {
@@ -148,6 +152,7 @@ pub(crate) fn wait_and_load(live_dir: &Path, state: &State, wait: &Wait) -> Resu
     let stream_segments = checked.segments.len() as u64;
     Ok(Promotion {
         model: checked.model,
+        lang: checked.lang,
         segments: coalesce(checked.segments, &state.roll_offsets()),
         stream_segments,
         short_windows: checked.short_windows,
@@ -188,8 +193,8 @@ pub(crate) fn check(bytes: &[u8], state: &State) -> Result<Checked, Reject> {
         events.push(line.event);
     }
 
-    let model = match events.first() {
-        Some(StreamEvent::MeetingStarted { key, model, .. }) if key == &state.key => model.clone(),
+    let (model, lang) = match events.first() {
+        Some(StreamEvent::MeetingStarted { key, model, lang, .. }) if key == &state.key => (model.clone(), lang.clone()),
         _ => return Err(Reject::KeyMismatch),
     };
     let (duration, declared, short_windows) = match events.last() {
@@ -198,15 +203,13 @@ pub(crate) fn check(bytes: &[u8], state: &State) -> Result<Checked, Reject> {
         _ => return Err(Reject::NotEnded),
     };
     let committed = live::committed_secs(state);
-    if !duration.is_finite() || (duration - committed).abs() > DURATION_SLACK_SECS { return Err(Reject::DurationMismatch); }
+    if (duration - committed).abs() > DURATION_SLACK_SECS { return Err(Reject::DurationMismatch); }
 
     let mut segments = Vec::new();
     for event in &events[1..events.len() - 1] {
         match event {
-            StreamEvent::Segment { speaker, t_start, t_end, text, confidence, .. } => segments.push((
-                TranscriptSegment { speaker: *speaker, text: text.clone(), t_start: *t_start, t_end: *t_end, confidence: *confidence as f32 },
-                *confidence,
-            )),
+            StreamEvent::Segment { speaker, t_start, t_end, text, confidence, .. } => segments.push(
+                TranscriptSegment { speaker: *speaker, text: text.clone(), t_start: *t_start, t_end: *t_end, confidence: *confidence as f32 }),
             StreamEvent::Heartbeat { .. } => {}
             // A second start or end inside the stream is two runs written into one file.
             StreamEvent::MeetingStarted { .. } | StreamEvent::MeetingEnded { .. } => return Err(Reject::Torn),
@@ -215,14 +218,15 @@ pub(crate) fn check(bytes: &[u8], state: &State) -> Result<Checked, Reject> {
     if segments.len() as u64 != declared { return Err(Reject::CountMismatch); }
     if segments.is_empty() { return Err(Reject::Empty); }
     if state.capture_status != CaptureStatus::Complete { return Err(Reject::CapturePartial); }
-    // Against the exact committed audio, not the stream's rounded duration.
-    let valid = |(segment, confidence): &(TranscriptSegment, f64)| {
-        segment.t_start.is_finite() && segment.t_end.is_finite() && confidence.is_finite()
-            && 0.0 <= segment.t_start && segment.t_start <= segment.t_end
-            && segment.t_end <= committed + DURATION_SLACK_SECS && !segment.text.trim().is_empty()
+    // Against the exact committed audio, not the stream's rounded duration. JSON numbers are
+    // finite; the stored confidence is narrower, and a huge value becomes infinite in the cast.
+    let valid = |segment: &TranscriptSegment| {
+        0.0 <= segment.t_start && segment.t_start <= segment.t_end
+            && segment.t_end <= committed + DURATION_SLACK_SECS
+            && segment.confidence.is_finite() && !segment.text.trim().is_empty()
     };
     if !segments.iter().all(valid) { return Err(Reject::InvalidSegment); }
-    Ok(Checked { model, segments: segments.into_iter().map(|(segment, _)| segment).collect(), short_windows, duration_secs: committed })
+    Ok(Checked { model, lang, segments, short_windows, duration_secs: committed })
 }
 
 /// Join a channel's neighbouring segments the way the batch pass joins speech before decoding
@@ -342,6 +346,10 @@ mod tests {
         let state = state(&[48_000]);
         let checked = check(&stream(&complete()), &state).unwrap();
         assert_eq!((checked.model.as_str(), checked.short_windows, checked.duration_secs), ("ggml-fixture", 4, 3.0));
+        assert_eq!(checked.lang, None, "a stream written before readers recorded their language");
+        let mut with_language = complete();
+        with_language[0]["lang"] = json!("pt");
+        assert_eq!(check(&stream(&with_language), &state).unwrap().lang.as_deref(), Some("pt"));
         assert_eq!(checked.segments, [seg(Speaker::You, 0.2, 1.1, "The release checklist is ready", 0.9),
             seg(Speaker::Others, 1.4, 2.6, "We approved the deployment window", 0.9)]);
     }
@@ -374,6 +382,7 @@ mod tests {
             ("a start before the recording", with(&|events| events[1]["t_start"] = json!(-0.5)), Reject::InvalidSegment),
             ("an end past the recording", with(&|events| events[3]["t_end"] = json!(3.2)), Reject::InvalidSegment),
             ("a segment of spaces", with(&|events| events[3]["text"] = json!("  ")), Reject::InvalidSegment),
+            ("a confidence too large to store", with(&|events| events[3]["confidence"] = json!(1e300)), Reject::InvalidSegment),
         ];
         for (name, bytes, reason) in cases {
             assert_eq!(check(&bytes, &state), Err(reason), "{name}");
@@ -381,8 +390,9 @@ mod tests {
         let mut partial = state.clone();
         partial.capture_status = CaptureStatus::Partial;
         assert_eq!(check(&stream(&complete()), &partial), Err(Reject::CapturePartial), "a capture recovered after a crash");
-        // Every reason has a name the log allowlist accepts, and nothing else does.
-        assert!(Reject::ALL.iter().all(|reject| Reject::is_known(reject.as_str())));
+        // The names are distinct, and nothing else passes for a reason.
+        let names: std::collections::HashSet<&str> = Reject::names().collect();
+        assert_eq!(names.len(), Reject::names().count());
         assert!(!Reject::is_known("SYNTHETIC_PRIVATE_SENTENCE") && !Reject::is_known(""));
     }
 
@@ -466,6 +476,13 @@ mod tests {
         let unfinished = stream(&complete()[..4]);
         std::fs::write(&path, &unfinished).unwrap();
         assert_eq!(wait_and_load(&root, &state, &quick), Err(Reject::Timeout));
+        // After a capture that did not end cleanly nothing is waited for: the state already says no.
+        let mut partial = state.clone();
+        partial.capture_status = CaptureStatus::Partial;
+        let patient = Wait { stale: Duration::from_secs(30), cap: Duration::from_secs(120), poll: Duration::from_millis(10) };
+        let asked = Instant::now();
+        assert_eq!(wait_and_load(&root, &partial, &patient), Err(Reject::CapturePartial));
+        assert!(asked.elapsed() < Duration::from_secs(5), "the child waited for a stream it could never store");
         // The same stream untouched for 31 s has no reader any more.
         std::fs::File::options().write(true).open(&path).unwrap().set_modified(SystemTime::now() - Duration::from_secs(31)).unwrap();
         assert_eq!(wait_and_load(&root, &state, &Wait::default()), Err(Reject::ReaderGone));

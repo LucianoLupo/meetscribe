@@ -188,7 +188,9 @@ fn store_promoted(dir: &Path, managed: &mut crate::recovery::Session, opts: &Pip
         title: managed.state.title.clone(),
         source_dir: dir.display().to_string(),
         model: promotion.model.clone(),
-        lang: opts.lang.clone(),
+        // The language the text was decoded in is the reader's, not this child's option. Only a
+        // stream from before readers recorded it leaves the option as the best answer.
+        lang: promotion.lang.clone().unwrap_or_else(|| opts.lang.clone()),
         started_at: managed.state.started_at,
         duration_secs: promotion.duration_secs,
         created_at: crate::now_epoch(),
@@ -209,9 +211,14 @@ fn store_promoted(dir: &Path, managed: &mut crate::recovery::Session, opts: &Pip
         "segments": promotion.stream_segments, "merged_segments": promotion.segments.len(),
         "short_windows": promotion.short_windows, "audio_secs": promotion.duration_secs, "wait_ms": promotion.wait_ms,
     }));
-    // The same rule as a batch attempt: only a first, automatic attempt may create the root pair.
-    let mode = if opts.resume || managed.state.attempts > 1 { export::Publication::Recovered } else { export::Publication::Initial };
+    let mode = publication_mode(opts, managed);
     render_existing(managed, opts, id, mode)
+}
+
+/// Only a first, automatic attempt may create the root pair; a retry or an explicit resume
+/// publishes beside it and never replaces files that may have been edited since.
+fn publication_mode(opts: &PipelineOpts, session: &crate::recovery::Session) -> export::Publication {
+    if opts.resume || session.state.attempts > 1 { export::Publication::Recovered } else { export::Publication::Initial }
 }
 
 fn render_existing(managed: &mut crate::recovery::Session, opts: &PipelineOpts, id: i64, mode: export::Publication) -> Result<PipelineOutput> {
@@ -557,8 +564,7 @@ fn transcribe_core(dir: &Path, audio_dir: &Path, opts: &PipelineOpts, mut manage
     }
     let (md_path, json_path) = if let Some(key) = &opts.session_key {
         let session = managed.as_ref().context("keyed publication has no session")?;
-        let mode = if opts.resume || session.state.attempts > 1 { export::Publication::Recovered } else { export::Publication::Initial };
-        export::write_managed_exports(&opts.export_dir, key, mode, &row, &rendered)?
+        export::write_managed_exports(&opts.export_dir, key, publication_mode(opts, session), &row, &rendered)?
     } else { export::write_exports(&opts.export_dir, "transcript", &row, &rendered)? };
     if let Some(error) = storage_error {
         return Err(error.context(format!("archive incomplete; exported files preserved at {}", md_path.parent().unwrap_or(&opts.export_dir).display())));

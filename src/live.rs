@@ -244,7 +244,13 @@ impl Stream {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum StreamEvent {
-    MeetingStarted { key: String, app: String, started_at: i64, model: String },
+    MeetingStarted {
+        key: String, app: String, started_at: i64, model: String,
+        /// The language the reader decodes in, so a stream stored as the meeting's transcript
+        /// (`promote.rs`) is labelled with it. Absent in streams written before it was recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lang: Option<String>,
+    },
     Segment { speaker: Speaker, t_start: f64, t_end: f64, text: String, confidence: f64, lag_ms: u64, decode_ms: u64 },
     Heartbeat { audio_secs: f64, decoded_secs: f64 },
     MeetingEnded { duration_secs: f64, reason: String, segments: u64, short_windows: u64 },
@@ -353,7 +359,7 @@ pub(crate) fn run_live(
     let mut stream = StreamWriter::create(&opts.out_dir, &key, opts.print)?;
     stream.event(StreamEvent::MeetingStarted {
         key: key.clone(), app: detect::app_label(&state.app).into(), started_at: state.started_at,
-        model: crate::pipeline::model_name(&opts.model),
+        model: crate::pipeline::model_name(&opts.model), lang: Some(opts.lang.clone()),
     })?;
     log_event("live_started", &key, json!({}));
 
@@ -837,7 +843,7 @@ mod tests {
         let out = root.join("live");
         let key = "a6e79ba0314c4cc2b647f4d25b327011";
         let mut first = StreamWriter::create(&out, key, false).unwrap();
-        first.event(StreamEvent::MeetingStarted { key: key.into(), app: "Chrome".into(), started_at: 1_794_443_305, model: "unused".into() }).unwrap();
+        first.event(StreamEvent::MeetingStarted { key: key.into(), app: "Chrome".into(), started_at: 1_794_443_305, model: "unused".into(), lang: None }).unwrap();
         let before = std::fs::read(&first.path).unwrap();
         assert!(StreamWriter::create(&out, key, false).is_err(), "a second writer was let in");
         assert_eq!(std::fs::read(&first.path).unwrap(), before, "the refused writer emptied the stream");
@@ -1003,7 +1009,8 @@ mod tests {
 
     /// The lines below were written by the build before the events became a type (2ec1d9e) and
     /// are frozen here: a stream already on disk, and every reader of one, depends on these exact
-    /// bytes. They are NOT regenerated from the type they check.
+    /// bytes. They are NOT regenerated from the type they check. One field is new since then,
+    /// on purpose: `meeting_started` now also carries the reader's language (tested below).
     #[test]
     fn the_typed_events_write_the_same_bytes_as_the_untyped_writer_did() {
         const FROZEN: &str = concat!(
@@ -1017,7 +1024,7 @@ mod tests {
         let key = "a6e79ba0314c4cc2b647f4d25b327011";
         let mut stream = StreamWriter::create(&root, key, false).unwrap();
         stream.event(StreamEvent::MeetingStarted { key: key.into(), app: "Chrome".into(), started_at: 1_794_443_305,
-            model: crate::pipeline::model_name(Path::new("/m/ggml-large-v3.bin")) }).unwrap();
+            model: crate::pipeline::model_name(Path::new("/m/ggml-large-v3.bin")), lang: None }).unwrap();
         let offset = 0.25 + 95_900.0 / 48_000.0;
         let window = Pending { speaker: Speaker::Others, t_start: offset + 1_232.0 / 1000.0, t_end: offset + 4_567.0 / 1000.0, audio: Vec::new() };
         stream.event(segment_fields(&window, " Hola, ¿se \"escucha\"? ", 0.9137, 3_400, 1_500)).unwrap();
@@ -1032,6 +1039,10 @@ mod tests {
         assert_eq!(read[1].event, StreamEvent::Segment { speaker: Speaker::Others, t_start: offset + 1_232.0 / 1000.0,
             t_end: offset + 4_567.0 / 1000.0, text: " Hola, ¿se \"escucha\"? ".into(), confidence: 0.914, lag_ms: 3_400, decode_ms: 1_500 });
         assert_eq!(read[4].event, StreamEvent::MeetingEnded { duration_secs: 3731.0, reason: "ended".into(), segments: 2, short_windows: 5 });
+        // The one addition: a reader that knows its language writes it, as one more key.
+        let with_language = serde_json::to_value(StreamLine { v: 1, seq: 0, event: StreamEvent::MeetingStarted { key: key.into(),
+            app: "Chrome".into(), started_at: 1_794_443_305, model: "ggml-large-v3".into(), lang: Some("es".into()) } }).unwrap().to_string();
+        assert_eq!(with_language, r#"{"app":"Chrome","key":"a6e79ba0314c4cc2b647f4d25b327011","lang":"es","model":"ggml-large-v3","seq":0,"started_at":1794443305,"type":"meeting_started","v":1}"#);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

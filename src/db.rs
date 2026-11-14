@@ -48,7 +48,8 @@ pub struct MeetingMeta {
 }
 
 /// Which pass produced the stored transcript. `Live` is the live lane's text stored at hangup:
-/// it has no far-end voices and is provisional until the batch pass replaces it.
+/// it has no far-end voices and can be replaced by the batch pass while the recording exists.
+/// Retention treats it like any stored meeting: once the audio is pruned it is the final text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranscriptOrigin {
     Batch,
@@ -387,8 +388,10 @@ impl Db {
             tx.commit().await?;
             return Ok(id);
         }
-        // A bound archive can still be at schema v3 here (`open_existing` never migrates). A batch
-        // meeting is stored there exactly as before; a live one needs the column that marks it.
+        // No writer in this binary reaches a v3 file: `open` and `Session::archive` both climb the
+        // ladder first. `open_existing` alone does not, so the rule is kept here, where it cannot be
+        // skipped: on a v3 file a batch meeting is stored as before, and a live one, which could
+        // not be marked, is refused.
         let has_origin = has_origin_column(&mut tx).await?;
         anyhow::ensure!(has_origin || meta.origin == TranscriptOrigin::Batch,
             "a live transcript needs schema v4; this database was not upgraded");

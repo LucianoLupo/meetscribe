@@ -267,8 +267,12 @@ mod tests {
             (Some(1332), Some(676), Some(318), Some(4200)));
         assert_eq!(promoted["audio_secs"].as_f64(), Some(6522.4));
         assert!(!promoted.to_string().contains("SYNTHETIC_PRIVATE_SENTENCE"));
-        for reason in ["no_stream", "unreadable", "reader_gone", "timeout", "torn", "key_mismatch", "not_ended",
-            "duration_mismatch", "count_mismatch", "empty", "capture_partial", "invalid_segment"] {
+        // Written out, and compared with the module's own list: a reason added there has to be
+        // added here and in `docs/DAEMON.md` too.
+        let reasons = ["no_stream", "unreadable", "reader_gone", "timeout", "torn", "key_mismatch", "not_ended",
+            "duration_mismatch", "count_mismatch", "empty", "capture_partial", "invalid_segment"];
+        assert_eq!(crate::promote::Reject::names().collect::<Vec<_>>(), reasons);
+        for reason in reasons {
             let rejected = event(json!({"component":"pipeline", "event":"live_promotion_rejected", "session_id":session, "reason":reason}));
             assert_eq!((rejected["event"].as_str(), rejected["reason"].as_str()), (Some("live_promotion_rejected"), Some(reason)));
         }

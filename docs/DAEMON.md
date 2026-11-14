@@ -128,7 +128,13 @@ run it by hand.
 wrote for that recording. If the stream is provably the whole meeting, it is stored as the meeting
 and whisper does not run. The stored meeting is marked `live` (`meetscribe list` shows it in the
 `ORIGIN` column, and its Markdown carries a "Transcript: live, provisional" line). It has no
-far-end voices or names. The stream itself is left as it is.
+far-end voices or names. Its model and language are the ones the reader recorded in the stream
+(a stream from a reader that did not record its language takes this command's `--lang`). The
+stream itself is left as it is.
+
+Retention treats a live-stored meeting like any other: with `[retention] sessions_days` above 0
+its audio is pruned on schedule, and after that the live text is the final transcript. Keep
+`sessions_days = 0`, or re-transcribe before the audio goes, if you want the full pass later.
 
 Anything else falls back to the normal transcription **in the same attempt**. The log names why,
 without any meeting text:
@@ -141,7 +147,7 @@ without any meeting text:
 | `key_mismatch`, `not_ended` | belongs to another recording, or its reader stopped early |
 | `duration_mismatch`, `count_mismatch` | does not cover the recorded audio, or lost a segment |
 | `empty` | is complete but has no text (the full pass gets a second look at silence) |
-| `capture_partial`, `invalid_segment` | belongs to a capture recovered after a crash, or has a time outside the recording |
+| `capture_partial`, `invalid_segment` | belongs to a capture that did not end cleanly (decided before any wait), or has a time outside the recording |
 
 ```
 grep 'live_promot' ~/.meetscribe/logs/meetscribe.err.log   # live_promoted / live_promotion_rejected

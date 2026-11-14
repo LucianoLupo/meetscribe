@@ -31,9 +31,10 @@ impl pipeline::SpeechEngine for SyntheticEngine {
 }
 fn backend(_model: &str, opts: &pipeline::PipelineOpts) -> Result<Box<dyn pipeline::SpeechEngine>> {
     let root = PathBuf::from(std::env::var_os("MEETSCRIBE_PIPELINE_FIXTURE_ROOT").context("fixture root absent")?);
+    // Written before the refusal below, so a test can tell "never asked for" from "asked and refused".
+    fs::write(root.join("engine-ran"), b"an inference backend was requested\n")?;
     anyhow::ensure!(!root.join("forbid-inference").exists(), "inference must not run after a committed ingest");
     cutpoint("engine_loaded");
-    fs::write(root.join("engine-ran"), b"inference backend was created\n")?;
     Ok(Box::new(SyntheticEngine { root, db: opts.db_path.clone(), no_store: opts.no_store }))
 }
 fn cutpoint(point: &str) {
@@ -852,7 +853,9 @@ fn stream_events(fixture: &Fixture) -> Vec<serde_json::Value> {
     let segment = |speaker: &str, t_start: f64, t_end: f64, text: &str| serde_json::json!({"type": "segment", "speaker": speaker,
         "t_start": t_start, "t_end": t_end, "text": text, "confidence": 0.9, "lag_ms": 3_400, "decode_ms": 900});
     vec![
-        serde_json::json!({"type": "meeting_started", "key": fixture.state().key, "app": "Chrome", "started_at": START, "model": "ggml-live-fixture"}),
+        // "pt" on purpose: the child is started with "en" (`Fixture::new`), and the stored meeting
+        // must say what the reader decoded in.
+        serde_json::json!({"type": "meeting_started", "key": fixture.state().key, "app": "Chrome", "started_at": START, "model": "ggml-live-fixture", "lang": "pt"}),
         segment("you", 0.2, 1.1, "The live release checklist is ready"),
         serde_json::json!({"type": "heartbeat", "audio_secs": 2.0, "decoded_secs": 1.1}),
         segment("others", 1.4, 2.6, "We approved the live deployment window"),
@@ -891,6 +894,7 @@ fn a_complete_live_stream_is_stored_without_inference_and_only_once() {
         assert!(!fixture.root.join("engine-ran").exists(), "an accepted stream must not load the engine");
         let rows = fixture.meetings(); assert_eq!(rows.len(), 1); let id = rows[0].id;
         assert_eq!((rows[0].origin, rows[0].model.as_str(), rows[0].segment_count), (db::TranscriptOrigin::Live, "ggml-live-fixture", 2));
+        assert_eq!(rows[0].lang, "pt", "the language is the reader's, not this child's --lang");
         assert_eq!((rows[0].duration_secs, rows[0].capture_status.as_str()), (3.0, "complete"));
         let state = fixture.state();
         assert_eq!((state.phase, state.attempts, state.meeting_id), (recovery::Phase::Complete, 1, Some(id)));
@@ -954,7 +958,7 @@ fn a_stream_that_cannot_be_promoted_runs_the_batch_pass_in_the_same_attempt() {
         assert!(!stderr.contains("\"event\":\"live_promoted\""), "{reason}");
         assert!(fixture.root.join("engine-ran").is_file(), "{reason}: the batch pass did not run");
         let rows = fixture.meetings(); assert_eq!(rows.len(), 1, "{reason}");
-        assert_eq!((rows[0].origin, rows[0].model.as_str()), (db::TranscriptOrigin::Batch, "synthetic-model"), "{reason}");
+        assert_eq!((rows[0].origin, rows[0].model.as_str(), rows[0].lang.as_str()), (db::TranscriptOrigin::Batch, "synthetic-model", "en"), "{reason}");
         let state = fixture.state();
         assert_eq!((state.phase, state.attempts), (recovery::Phase::Complete, 1), "{reason}: exactly one attempt is reserved");
         assert_eq!(state.publication.as_deref(), Some(fixture.dir.as_path()), "{reason}");
