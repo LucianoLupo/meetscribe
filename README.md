@@ -175,6 +175,11 @@ min_secs = 20.0    # ignore anything shorter than 20 seconds
 
 [retention]
 sessions_days = 0  # keep recordings forever; it never deletes unless you ask
+
+[live]
+enabled = false    # true: a transcript you can read during the call
+promote = false    # true (with enabled): that transcript is the stored one at hangup
+retain_days = 0    # keep the live text forever; N deletes it after N days
 ```
 
 It recognizes Zoom, Chrome, Teams, Slack, Safari, Arc, Firefox and Brave out of the box.
@@ -185,15 +190,18 @@ Add others with `detector.allowlist_extra`.
 Stated plainly, so nothing surprises you later.
 
 - **The stored transcript appears *after* the call.** A long meeting takes a while to
-  process. To read along *during* a call, run `meetscribe live watch` in a terminal: it
-  prints a provisional transcript a few seconds behind the speaker. It only reads what the
-  recorder has already saved, so it cannot drop audio. It has no voices or names, it can word
-  a sentence differently from the stored transcript, and the daemon does not start it for
-  you: it runs while that terminal is open.
-- **A transcript stored from the live stream can be upgraded later.** Storing the live
-  transcript at hangup is not switched on by the daemon yet; it exists as a command
-  (`transcribe --promote-live`, see [`docs/DAEMON.md`](docs/DAEMON.md)). A meeting stored that
-  way has the words and no voices, and `meetscribe list` marks it `live`.
+  process. To read along *during* a call, set `[live] enabled = true` and run
+  `meetscribe live tail --follow` in a terminal: the daemon starts a reader for every call,
+  and the viewer prints a provisional transcript a few seconds behind the speaker. The reader
+  only reads what the recorder has already saved, so it cannot drop audio. The live text has
+  no voices or names and can word a sentence differently from the stored transcript. It is
+  off by default.
+- **A transcript stored from the live stream can be upgraded later.** With
+  `[live] promote = true` as well, a live transcript that covers the whole recording is
+  stored as the meeting once the call has ended and its reader has finished (seconds, when
+  no earlier meeting is still being transcribed), and the long pass does not run (anything
+  less gets the long pass as before; see [`docs/DAEMON.md`](docs/DAEMON.md)). A meeting stored
+  that way has the words and no voices, and `meetscribe list` marks it `live`.
   `meetscribe finalize <id>` runs the full pass over its recording and replaces it under the
   same id. It takes as long as the pass after a call, changes nothing until that pass has
   finished, and replaces only transcript files meetscribe itself wrote.
@@ -214,7 +222,7 @@ Stated plainly, so nothing surprises you later.
 ```
 ~/.meetscribe/
 ├── sessions/   your recordings
-├── live/       the text `meetscribe live` wrote during calls (kept until you delete it)
+├── live/       the text `meetscribe live` wrote during calls (kept until you delete it, or `[live] retain_days`)
 ├── models/     the speech model (under speaker/ the voice model, under diarizer/ the voice splitter)
 ├── logs/       what the daemon is doing (`live-watch.log`: what `live watch` is doing)
 └── config.toml settings

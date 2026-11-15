@@ -10,6 +10,10 @@
 //! started meanwhile went unrecorded until whisper finished. Capture stays on the main thread (Core
 //! Audio handles are `!Send`); the worker owns nothing but paths and the pipeline it runs.
 //!
+//! With `[live] enabled`, each call also gets a live reader (`meetscribe live`, a child of this
+//! process, see [`LiveReader`]). It only reads what capture has checkpointed; nothing about a
+//! recording waits for it or depends on it.
+//!
 //! Absolute paths only: under a launchd LaunchAgent `cwd=/` and `~` is not expanded, so the model,
 //! DB, and session dirs are all resolved from an absolute `$HOME` (Batch 0 confirmed launchd sets
 //! HOME for gui agents; `install` also pins it). A missing home is a loud startup error, never a
@@ -45,6 +49,9 @@ const DETECT_POLL_DURING_CAPTURE: Duration = Duration::from_millis(1000);
 /// How often the idle loop runs disk/log hygiene (session prune + log rotation). Also runs once at
 /// startup. A long-lived daemon rarely restarts, so the loop must handle rotation itself.
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How long after hangup a live reader may go on finishing its last windows before it is killed.
+const READER_GRACE: Duration = Duration::from_secs(300);
 
 /// Set by the SIGTERM/SIGINT handler; polled by the idle loop and folded into the capture stop
 /// predicate so shutdown reuses the one clean finalize path.
@@ -106,6 +113,8 @@ struct DaemonConfig {
     sessions_days: u64,
     /// Rotate the daemon logs over this many MB (0 = never).
     log_max_mb: u64,
+    /// `[live]` as it is in force (`config::LiveSettings::effective`).
+    live: config::LiveEffective,
 }
 
 /// `meetscribe daemon [--min-secs <n>] [--lang <code>] [--model <path>] [--once]`.
@@ -178,6 +187,7 @@ pub(crate) fn run_daemon(argv: &[String]) -> Result<()> {
         allowlist,
         sessions_days: file_cfg.retention.sessions_days,
         log_max_mb: file_cfg.retention.log_max_mb,
+        live: file_cfg.live.effective(),
         base: base.clone(),
         once,
     };
@@ -235,6 +245,12 @@ pub(crate) fn run_daemon(argv: &[String]) -> Result<()> {
         log::info!("far-end split: off ([speakers] split = false in {})", config::config_path(&base).display());
     }
     log::info!(
+        "live reader: {}; storing the live transcript at hangup: {}; live streams kept {}",
+        if cfg.live.enabled { "on" } else { "off" },
+        if cfg.live.promote { "on" } else { "off" },
+        if cfg.live.retain_days == 0 { "for ever".to_string() } else { format!("{} day(s)", cfg.live.retain_days) }
+    );
+    log::info!(
         "meetscribe daemon up — watching for {} meeting apps (poll {}s, end-debounce {}s, \
          min {}s). db={} sessions={}",
         cfg.allowlist.len(),
@@ -259,6 +275,18 @@ pub(crate) fn run_daemon(argv: &[String]) -> Result<()> {
     board.refresh_counts(&cfg.sessions_dir);
     // Transcription runs in a child process of this very binary (`meetscribe transcribe`).
     let exe = std::env::current_exe().context("daemon: cannot resolve its own executable")?;
+    // The live reader is this binary too: installed, signed, and not replaced by a `cargo build`.
+    let mut reader = LiveReader::new(cfg.live.enabled.then(|| {
+        let (exe, cfg) = (exe.clone(), cfg.clone());
+        Box::new(move |dir: &Path| {
+            let mut command = std::process::Command::new(&exe);
+            // stderr is inherited: the reader's log lines join the daemon's, as the transcription
+            // child's do. Its stdout would be the transcript.
+            command.arg("live").args(reader_args(dir, &cfg, std::process::id()))
+                .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null());
+            command
+        }) as ReaderCommand
+    }));
     let child_base = cfg.base.clone();
     let recovery_cfg = cfg.clone();
     let finished_board = Arc::clone(&board);
@@ -279,6 +307,9 @@ pub(crate) fn run_daemon(argv: &[String]) -> Result<()> {
     // and backs off, so a persistently-denied grant doesn't spin+spam at the poll rate.
     let mut capture_fail_streak = 0u32;
     while !board.stopping() {
+        // First thing on every turn, so that no way round the loop skips it: the paused branch
+        // and the back-off after a capture that could not start both `continue` from below.
+        log_reader(&reader.tick(Instant::now()));
         if last_maintenance.elapsed() >= MAINTENANCE_INTERVAL {
             run_maintenance(&cfg);
             last_maintenance = Instant::now();
@@ -306,7 +337,8 @@ pub(crate) fn run_daemon(argv: &[String]) -> Result<()> {
         match detector.active_app() {
             Ok(Some(app)) => {
                 board.update(|a| a.recording = Some(detect::app_label(&app).to_string()));
-                let recorded = record_and_queue(&cfg, &app, &jobs, &board);
+                let recorded = record_and_queue(&cfg, &app, &jobs, &board, &mut reader,
+                    |dir, stop, managed| session::run_capture(dir, stop, None, managed));
                 board.update(|a| a.recording = None);
                 match recorded {
                     Ok(()) => {
@@ -335,6 +367,9 @@ pub(crate) fn run_daemon(argv: &[String]) -> Result<()> {
         sleep_interruptible(POLL_INTERVAL, &board);
     }
 
+    // Before the join, which can last as long as a transcription: no reader outlives the loop,
+    // whether it ended by a signal, while paused, during a back-off or after `--once`.
+    log_reader(&reader.stop());
     // Closing the queue lets the worker finish the job in hand (it skips queued ones on shutdown —
     // their WAVs stay on disk) and exit. Joining keeps `--once` meaning "recorded AND transcribed".
     drop(jobs);
@@ -468,6 +503,9 @@ struct TranscribeJob {
     /// Friendly app label, shown by the tray while this job runs.
     label: String,
     opts: pipeline::PipelineOpts,
+    /// The directory of live streams (`--promote-live`), when the child may store this session's
+    /// live transcript instead of running whisper. Beside `opts`, as the pipeline takes it.
+    promote_live: Option<PathBuf>,
 }
 
 /// Start the worker that runs `run` on each queued job, one at a time, in arrival order. It marks
@@ -564,7 +602,16 @@ fn job_for(cfg: &DaemonConfig, dir: PathBuf, label: String, title: String) -> Tr
         diarizer_model: cfg.diarizer_model.clone(),
         diarizer_rttm: None,
     };
-    TranscribeJob { dir, label, opts }
+    // Only a session with a key has a stream to find and a recorded length to check it against,
+    // and the child refuses the flag without one. `live.promote` is already false without
+    // `live.enabled`.
+    let promote_live = (cfg.live.promote && opts.session_key.is_some()).then(|| live_dir(&cfg.base));
+    TranscribeJob { dir, label, opts, promote_live }
+}
+
+/// Where the live readers write their streams, and where the transcription child looks for one.
+fn live_dir(base: &Path) -> PathBuf {
+    base.join("live")
 }
 
 /// Mark the session dir pending (best-effort: without the marker the job still runs now, it just
@@ -649,8 +696,10 @@ fn marker_after(_outcome: ChildOutcome, archive_proven: bool) -> Marker {
 /// field is passed, because the CLI's defaults (`es`, split on, repo-relative models) are wrong for
 /// the daemon and unknown flags are ignored, not rejected. Pinned by a round-trip test against
 /// `parse_transcribe_args`. `--yield-to-calls` makes the child drop to background priority while a
-/// call is being recorded (see `status::spawn_call_yield`).
-fn child_args(dir: &Path, opts: &pipeline::PipelineOpts, base: &Path) -> Vec<String> {
+/// call is being recorded (see `status::spawn_call_yield`). `promote_live` becomes `--promote-live`
+/// only for a session with a key: the parser refuses the flag without one, and a child that
+/// cannot start transcribes nothing.
+fn child_args(dir: &Path, opts: &pipeline::PipelineOpts, base: &Path, promote_live: Option<&Path>) -> Vec<String> {
     let path = |p: &Path| p.display().to_string();
     let mut a = vec![
         path(dir),
@@ -686,6 +735,9 @@ fn child_args(dir: &Path, opts: &pipeline::PipelineOpts, base: &Path) -> Vec<Str
     }
     if let Some(key) = &opts.session_key { a.extend(["--session-key".into(), key.clone()]); }
     if opts.resume { a.push("--resume".into()); }
+    if let Some(live) = promote_live.filter(|_| opts.session_key.is_some()) {
+        a.extend(["--promote-live".into(), path(live)]);
+    }
     a
 }
 
@@ -700,7 +752,7 @@ fn run_transcribe_job_at(job: &TranscribeJob, exe: &Path, base: &Path, now: impl
     log::info!("transcribing {} …", job.dir.display());
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("transcribe")
-        .args(child_args(&job.dir, &job.opts, base))
+        .args(child_args(&job.dir, &job.opts, base, job.promote_live.as_deref()))
         .current_dir(&job.dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null());
@@ -778,15 +830,183 @@ fn run_child(mut cmd: std::process::Command) -> ChildOutcome {
     }
 }
 
+/// Builds the live reader's command for a session directory.
+type ReaderCommand = Box<dyn Fn(&Path) -> std::process::Command>;
+
+/// Why the daemon ended a live reader itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Killed {
+    /// The next call started: one whisper context at a time.
+    Replaced,
+    /// Still running [`READER_GRACE`] after hangup.
+    Deadline,
+    /// The capture it followed failed, or the daemon is leaving its loop.
+    Stopped,
+    /// Its status could not be read.
+    TrackingLost,
+}
+
+/// What happened to a live reader in one call of a [`LiveReader`] method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReaderChange {
+    Started,
+    /// The OS did not start it. The recording goes on without a live transcript.
+    SpawnFailed,
+    /// It ended by itself: with this exit code, or by a signal (`None`).
+    Exited(Option<i32>),
+    Killed(Killed),
+}
+
+/// A [`ReaderChange`] and the session whose reader it happened to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReaderReport {
+    key: String,
+    change: ReaderChange,
+}
+
+struct RunningReader {
+    key: String,
+    child: std::process::Child,
+    /// When to kill it; set at hangup.
+    deadline: Option<Instant>,
+}
+
+/// The one owner of the daemon's live reader: at most one child at any time.
+///
+/// A reader outlives its call so it can finish its last windows; it is ended by its own exit, by
+/// the deadline set at hangup, by the next call, or when the daemon leaves its loop. Nothing here
+/// runs during a capture: [`tick`](Self::tick) is called from the idle loop only.
+///
+/// Every method returns what happened to a child, once; [`log_reader`] writes that down. A
+/// daemon that is killed outright runs none of this: the reader notices by itself
+/// (`live --owner-pid`).
+struct LiveReader {
+    /// `None` when `[live] enabled` is false: nothing is ever started.
+    command: Option<ReaderCommand>,
+    running: Option<RunningReader>,
+}
+
+impl LiveReader {
+    fn new(command: Option<ReaderCommand>) -> Self {
+        Self { command, running: None }
+    }
+
+    /// End the reader still held, if any, and start one for the recording in `dir`. A reader
+    /// that cannot be started is reported and leaves nothing behind.
+    fn start(&mut self, dir: &Path, key: &str) -> Vec<ReaderReport> {
+        let mut reports = self.end(Killed::Replaced);
+        let Some(command) = &self.command else { return reports; };
+        let change = match command(dir).spawn() {
+            Ok(child) => {
+                self.running = Some(RunningReader { key: key.to_string(), child, deadline: None });
+                ReaderChange::Started
+            }
+            Err(_) => ReaderChange::SpawnFailed,
+        };
+        reports.push(ReaderReport { key: key.to_string(), change });
+        reports
+    }
+
+    /// The call ended: the reader has [`READER_GRACE`] from `now` to finish.
+    fn hangup(&mut self, now: Instant) {
+        if let Some(running) = &mut self.running { running.deadline = Some(now + READER_GRACE); }
+    }
+
+    /// Look at the reader without waiting: report its exit, and kill it past its deadline.
+    fn tick(&mut self, now: Instant) -> Vec<ReaderReport> {
+        let Some(running) = &mut self.running else { return Vec::new(); };
+        match running.child.try_wait() {
+            Ok(None) if running.deadline.is_some_and(|deadline| now >= deadline) => self.end(Killed::Deadline),
+            Ok(None) => Vec::new(),
+            Ok(Some(_)) | Err(_) => self.end(Killed::TrackingLost),
+        }
+    }
+
+    /// End the reader now, whatever it is doing.
+    fn stop(&mut self) -> Vec<ReaderReport> {
+        self.end(Killed::Stopped)
+    }
+
+    /// Let go of the child held, if any: report the exit of one that has ended by itself,
+    /// otherwise kill and reap it and report `why`.
+    fn end(&mut self, why: Killed) -> Vec<ReaderReport> {
+        let Some(mut running) = self.running.take() else { return Vec::new(); };
+        let change = match running.child.try_wait() {
+            Ok(Some(status)) => ReaderChange::Exited(status.code()),
+            Ok(None) => { let _ = running.child.kill(); let _ = running.child.wait(); ReaderChange::Killed(why) }
+            Err(_) => { let _ = running.child.kill(); let _ = running.child.wait(); ReaderChange::Killed(Killed::TrackingLost) }
+        };
+        vec![ReaderReport { key: running.key, change }]
+    }
+}
+
+impl Drop for LiveReader {
+    /// A panic that unwinds must not leave a reader running, like `diar::Running`.
+    fn drop(&mut self) {
+        log_reader(&self.stop());
+    }
+}
+
+/// The `meetscribe live` argv (after the subcommand) for the daemon's reader of `dir`. Every
+/// option is passed, as for the transcription child: the reader's own defaults follow a base
+/// directory and a config file it must not have to find again. Pinned by a round-trip test
+/// against `live::parse_args`.
+fn reader_args(dir: &Path, cfg: &DaemonConfig, owner_pid: u32) -> Vec<String> {
+    let path = |p: &Path| p.display().to_string();
+    vec![
+        path(dir),
+        "--model".into(),
+        path(&cfg.model),
+        "--lang".into(),
+        cfg.lang.clone(),
+        "--out".into(),
+        path(&live_dir(&cfg.base)),
+        "--base".into(),
+        path(&cfg.base),
+        "--max-window-secs".into(),
+        cfg.live.max_window_secs.to_string(),
+        "--owner-pid".into(),
+        owner_pid.to_string(),
+    ]
+}
+
+/// The log line of one [`ReaderReport`]: an event name, the session, an outcome and, for a
+/// reader that exited with one, its exit code. Nothing else about the process.
+fn reader_event(report: &ReaderReport) -> serde_json::Value {
+    let (event, outcome) = match report.change {
+        ReaderChange::Started => ("live_child_started", "ok"),
+        ReaderChange::SpawnFailed => ("live_child_started", "error"),
+        ReaderChange::Exited(Some(0)) => ("live_child_exited", "ok"),
+        ReaderChange::Exited(_) => ("live_child_exited", "error"),
+        ReaderChange::Killed(_) => ("live_child_killed", "attention"),
+    };
+    let mut line = serde_json::json!({"component": "daemon", "event": event, "session_id": report.key, "outcome": outcome});
+    if report.change == ReaderChange::SpawnFailed { line["error_class"] = serde_json::json!("child_launch"); }
+    if let ReaderChange::Exited(Some(code)) = report.change { line["exit_code"] = serde_json::json!(code); }
+    line
+}
+
+fn log_reader(reports: &[ReaderReport]) {
+    for report in reports {
+        log::info!(target: "meetscribe::event", "{}", reader_event(report));
+    }
+}
+
 /// Record one meeting (`app` holds the mic), then gate it and queue it for transcription. Returns
 /// as soon as capture ends, so the caller is back to watching for the next call while whisper
 /// works. Returns `Err` ONLY if capture failed to start/run — the caller throttles + backs off, so
 /// a persistently-denied grant (common on first run) doesn't spin+spam at the poll rate.
+///
+/// `capture` is `session::run_capture` (without its debug hook); a test passes its own. `reader`
+/// follows the recording when `[live] enabled`: started here before capture, stopped at once
+/// when the capture fails, and given its deadline when the call ends.
 fn record_and_queue(
     cfg: &DaemonConfig,
     app: &str,
     jobs: &mpsc::Sender<TranscribeJob>,
     board: &StatusBoard,
+    reader: &mut LiveReader,
+    capture: impl FnOnce(&Path, Box<dyn FnMut() -> bool + '_>, Option<&mut crate::recovery::Session>) -> Result<session::CaptureSummary>,
 ) -> Result<()> {
     let started = crate::now_epoch();
     let suffix = crate::recovery::new_identity();
@@ -795,6 +1015,9 @@ fn record_and_queue(
     let title = format!("{label} — {}", export::fmt_utc(started));
     let mut managed = crate::recovery::Session::begin(&dir, &cfg.db_path, &dir, app, &title, started)?;
     log::info!("meeting detected — {label} ({app}) took the mic → recording to {}", dir.display());
+    // Before capture starts, and never a reason to fail it. Ending a reader left from a call
+    // less than READER_GRACE ago costs one kill and one wait here.
+    log_reader(&reader.start(&dir, &managed.state.key));
 
     // Stop predicate: the app released the mic for MEETING_END_DEBOUNCE, or we were signalled.
     // The detector is polled at most every DETECT_POLL_DURING_CAPTURE (the capture loop ticks far
@@ -821,12 +1044,16 @@ fn record_and_queue(
         released_since.is_some_and(|s| s.elapsed() >= MEETING_END_DEBOUNCE)
     };
 
-    let summary = match session::run_capture(&dir, stop, None, Some(&mut managed)) {
+    let summary = match capture(&dir, Box::new(stop), Some(&mut managed)) {
         Ok(summary) => {
-            managed.finish_capture(summary.duration_secs, cfg.min_secs)?;
+            if let Err(error) = managed.finish_capture(summary.duration_secs, cfg.min_secs) {
+                log_reader(&reader.stop());
+                return Err(error);
+            }
             summary
         }
         Err(error) => {
+            log_reader(&reader.stop());
             if let Err(state_error) = managed.capture_failed() {
                 log::error!("component=recovery event=capture_state_write_failed error={state_error:#}");
             }
@@ -834,6 +1061,8 @@ fn record_and_queue(
         }
     };
     drop(managed); // Release capture ownership before the processing child may acquire it.
+    // The reader still has its last windows to decode. Set before either return below.
+    reader.hangup(Instant::now());
     log::info!(
         "meeting ended — {label}: captured {:.1}s ({} segment file(s), {} dropped)",
         summary.duration_secs,
@@ -856,8 +1085,9 @@ fn record_and_queue(
     Ok(())
 }
 
-/// Disk/log hygiene: prune old session dirs + rotate the daemon logs (both config-driven, both
-/// best-effort — a failure is logged, never fatal). Runs at startup and once per day.
+/// Disk/log hygiene: prune old session dirs and old live streams + rotate the daemon logs (all
+/// config-driven, all best-effort — a failure is logged, never fatal). Runs at startup and once
+/// per day, never during this daemon's own capture.
 fn run_maintenance(cfg: &DaemonConfig) {
     match crate::maintenance::prune_sessions(&cfg.sessions_dir, cfg.sessions_days, crate::now_epoch())
     {
@@ -867,8 +1097,17 @@ fn run_maintenance(cfg: &DaemonConfig) {
         Ok(_) => {}
         Err(e) => log::warn!("retention: session prune failed: {e}"),
     }
+    // Independent of `live.enabled`: a stream written by a hand-started reader is pruned too.
+    match crate::maintenance::prune_live(&live_dir(&cfg.base), cfg.live.retain_days, crate::now_epoch()) {
+        Ok(r) if r.removed > 0 => log::info!("retention: pruned {} old live stream(s) (kept {})", r.removed, r.kept),
+        Ok(_) => {}
+        Err(e) => log::warn!("retention: live stream prune failed: {e}"),
+    }
     let max_bytes = cfg.log_max_mb.saturating_mul(1024 * 1024);
-    for name in ["meetscribe.err.log", "meetscribe.out.log"] {
+    // `live-watch.log` belongs to a hand-started `live watch`. It is rotated only with the
+    // daemon's reader on, so that a daemon with `[live]` left alone touches nothing new.
+    let live_log = cfg.live.enabled.then_some("live-watch.log");
+    for name in ["meetscribe.err.log", "meetscribe.out.log"].into_iter().chain(live_log) {
         let p = cfg.logs_dir.join(name);
         if let Err(e) = crate::maintenance::rotate_log(&p, max_bytes) {
             log::warn!("retention: log rotate failed for {}: {e}", p.display());
@@ -884,6 +1123,20 @@ fn sleep_interruptible(total: Duration, board: &StatusBoard) {
         let s = step.min(left);
         std::thread::sleep(s);
         left = left.saturating_sub(s);
+    }
+}
+
+/// A daemon configuration under `base`, with the values `run_daemon` gives a file that sets
+/// nothing but `[live]`.
+#[cfg(test)]
+fn test_config(base: &Path, live: config::LiveEffective) -> DaemonConfig {
+    let file = Config::default();
+    DaemonConfig {
+        base: base.to_path_buf(), sessions_dir: base.join("sessions"), logs_dir: base.join("logs"), db_path: base.join("meetscribe.db"),
+        model: base.join("models/ggml-large-v3.bin"), speaker_model: base.join(crate::SPEAKER_MODEL_REL), split: file.speakers.split,
+        diarizer_bin: base.join(crate::DIARIZER_BIN_REL), diarizer_model: base.join(crate::DIARIZER_MODEL_REL), lang: file.daemon.lang.clone(),
+        min_secs: file.daemon.min_secs, once: false, allowlist: file.effective_allowlist(),
+        sessions_days: file.retention.sessions_days, log_max_mb: file.retention.log_max_mb, live,
     }
 }
 
@@ -922,6 +1175,7 @@ mod tests {
                 diarizer_model: dir.join("diarizer.onnx"),
                 diarizer_rttm: None,
             },
+            promote_live: None,
         }
     }
 
@@ -1048,18 +1302,415 @@ mod tests {
     fn child_args_round_trip_through_the_cli_parser() {
         let base = PathBuf::from("/Users/someone/.meetscribe");
         let dir = base.join("sessions/20261001-190352");
-        for split in [true, false] {
+        let live = base.join("live");
+        // A session with a key (what the daemon records) and one without (a legacy directory),
+        // each with and without the live transcript on offer.
+        for (split, key, promote) in [(true, None, None), (false, None, None), (true, Some(KEY), None),
+            (false, Some(KEY), Some(live.as_path())), (true, Some(KEY), Some(live.as_path())), (true, None, Some(live.as_path()))] {
             let mut j = job(&dir, "Chrome");
             j.opts.lang = "en".to_string();
             j.opts.split = split;
             j.opts.no_store = false;
+            j.opts.session_key = key.map(String::from);
             j.opts.title = Some("Chrome — 2026-10-01 19:03 UTC".to_string());
             j.opts.speaker_model = Some(base.join("models/speaker/campplus.onnx"));
-            let argv = child_args(&dir, &j.opts, &base);
+            let argv = child_args(&dir, &j.opts, &base, promote);
             let parsed = crate::parse_transcribe_args(&argv).unwrap().expect("not --help");
             assert_eq!(parsed.dir, dir);
             assert_eq!(parsed.opts, j.opts, "split = {split}");
             assert_eq!(parsed.yield_to_calls, Some(base.clone()));
+            // Without a key the parser refuses the flag, so it is never written for such a job.
+            assert_eq!(parsed.promote_live.as_deref(), promote.filter(|_| key.is_some()), "key = {key:?}");
+            assert_eq!(argv.iter().any(|arg| arg == "--promote-live"), promote.is_some() && key.is_some());
+        }
+    }
+
+    const KEY: &str = "a6e79ba0314c4cc2b647f4d25b327011";
+    const OTHER_KEY: &str = "b6e79ba0314c4cc2b647f4d25b327011";
+
+    fn live(text: &str) -> config::LiveEffective {
+        toml::from_str::<Config>(text).unwrap().live.effective()
+    }
+    const LIVE_ON: &str = "[live]\nenabled = true\npromote = true\n";
+
+    /// A finished recording of `secs` under `dir`, as the capture loop leaves it.
+    fn recorded_session(dir: &Path, db: &Path, secs: f64) -> String {
+        let mut session = crate::recovery::Session::begin(dir, db, dir, "com.google.Chrome", "Flag fixture", 1_762_880_000).unwrap();
+        session.start_roll(0, 16_000, 0.0).unwrap();
+        session.checkpoint(0, 16_000, 16_000).unwrap();
+        session.finish_capture(secs, 20.0).unwrap();
+        session.state.key.clone()
+    }
+
+    /// `promote` needs `enabled`, and a session needs a key: the two rules of `job_for`, from
+    /// the config text to the child's parsed arguments.
+    #[test]
+    fn the_promotion_flag_needs_promotion_in_effect_and_a_session_key() {
+        let base = temp_base("promote-flag");
+        let sessions = base.join("sessions");
+        let keyed = sessions.join("keyed");
+        let key = recorded_session(&keyed, &base.join("meetscribe.db"), 30.0);
+        for (text, promoted) in [(LIVE_ON, true), ("[live]\npromote = true\n", false), ("[live]\nenabled = true\n", false), ("", false)] {
+            let cfg = test_config(&base, live(text));
+            let job = job_for(&cfg, keyed.clone(), "Chrome".into(), "a title the stored state overrides".into());
+            assert_eq!(job.opts.session_key.as_deref(), Some(key.as_str()));
+            assert_eq!(job.promote_live, promoted.then(|| base.join("live")), "config: {text:?}");
+            let argv = child_args(&job.dir, &job.opts, &base, job.promote_live.as_deref());
+            let parsed = crate::parse_transcribe_args(&argv).unwrap().expect("not --help");
+            assert_eq!((parsed.opts, parsed.promote_live), (job.opts, job.promote_live), "config: {text:?}");
+        }
+        // A directory with no readable state has no key: no flag, whatever the config says.
+        let legacy = sessions.join("legacy");
+        std::fs::create_dir_all(&legacy).unwrap();
+        let job = job_for(&test_config(&base, live(LIVE_ON)), legacy, "Chrome".into(), "Legacy".into());
+        assert_eq!((job.opts.session_key, job.promote_live), (None, None));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// The recovery scan builds its jobs through `job_for` too, and a session keeps the database
+    /// it was bound to: such a job carries the flag and that database, not the daemon's.
+    #[test]
+    fn a_recovered_session_bound_to_another_database_carries_the_flag_and_its_database() {
+        let base = temp_base("promote-recovered");
+        let sessions = base.join("sessions");
+        let other_db = base.join("elsewhere/archive.db");
+        let key = recorded_session(&sessions.join("bound"), &other_db, 30.0);
+        let cfg = test_config(&base, live(LIVE_ON));
+        let jobs: Vec<TranscribeJob> = pending_sessions_at(&sessions, crate::now_epoch()).into_iter()
+            .map(|(dir, label, title)| job_for(&cfg, dir, label, title)).collect();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].opts.session_key.as_deref(), Some(key.as_str()));
+        assert_eq!((jobs[0].opts.db_path.clone(), jobs[0].promote_live.clone()), (other_db, Some(base.join("live"))));
+        assert_ne!(jobs[0].opts.db_path, cfg.db_path);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    // ---- The live reader's owner. The child is `/bin/sleep` or `/bin/sh`, never `meetscribe live`.
+
+    fn reader_running(program: &'static str, args: &'static [&'static str]) -> LiveReader {
+        LiveReader::new(Some(Box::new(move |_: &Path| {
+            let mut command = std::process::Command::new(program);
+            command.args(args);
+            command
+        })))
+    }
+    fn sleeper() -> LiveReader { reader_running("/bin/sleep", &["60"]) }
+
+    /// A reader that writes its process id into `pid_file` and then sleeps, for a test that must
+    /// look at the process after the owner has let go of it.
+    fn announcing_sleeper(pid_file: PathBuf) -> LiveReader {
+        LiveReader::new(Some(Box::new(move |_: &Path| {
+            let mut command = std::process::Command::new("/bin/sh");
+            command.args(["-c", "echo $$ > \"$0\"; exec sleep 60"]).arg(&pid_file);
+            command
+        })))
+    }
+
+    fn announced_pid(pid_file: &Path) -> u32 {
+        let waiting = Instant::now();
+        loop {
+            if let Some(pid) = std::fs::read_to_string(pid_file).ok().and_then(|text| text.trim().parse().ok()) { return pid; }
+            assert!(waiting.elapsed() < Duration::from_secs(20), "the reader never announced itself");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    fn unspawnable() -> LiveReader { reader_running("/nonexistent-meetscribe-reader-xyz", &[]) }
+
+    fn pid_of(reader: &LiveReader) -> u32 { reader.running.as_ref().expect("a reader is held").child.id() }
+
+    /// Whether a process still exists. A child that was killed AND reaped does not; one that was
+    /// only killed would still be there, as a zombie.
+    fn exists(pid: u32) -> bool {
+        // SAFETY: signal 0 checks for the process and sends nothing.
+        (unsafe { libc::kill(pid as libc::pid_t, 0) }) == 0
+    }
+
+    fn report(key: &str, change: ReaderChange) -> ReaderReport { ReaderReport { key: key.to_string(), change } }
+
+    #[test]
+    fn the_reader_owner_holds_one_child_and_reports_each_end_once() {
+        use ReaderChange::{Killed as Ended, Started};
+        let dir = Path::new("/nonexistent-meetscribe-session-xyz");
+        let now = Instant::now();
+        let mut reader = sleeper();
+        assert!(reader.tick(now).is_empty() && reader.stop().is_empty(), "nothing is held yet");
+        reader.hangup(now);
+
+        assert_eq!(reader.start(dir, KEY), [report(KEY, Started)]);
+        let first = pid_of(&reader);
+        assert!(exists(first));
+        // The next call: the reader of the previous one is ended first, and reported once.
+        assert_eq!(reader.start(dir, OTHER_KEY), [report(KEY, Ended(Killed::Replaced)), report(OTHER_KEY, Started)]);
+        assert!(!exists(first), "two readers at once");
+        let second = pid_of(&reader);
+
+        // During the call there is no deadline; after hangup it is 300 s away.
+        assert!(reader.tick(now + 10 * READER_GRACE).is_empty(), "a reader was ended during its call");
+        reader.hangup(now);
+        assert!(reader.tick(now + READER_GRACE - Duration::from_millis(1)).is_empty());
+        assert!(exists(second));
+        assert_eq!(reader.tick(now + READER_GRACE), [report(OTHER_KEY, Ended(Killed::Deadline))]);
+        assert!(!exists(second));
+        assert!(reader.tick(now + 2 * READER_GRACE).is_empty() && reader.stop().is_empty(), "an end was reported twice");
+
+        assert_eq!(reader.start(dir, KEY), [report(KEY, Started)]);
+        let third = pid_of(&reader);
+        assert_eq!(reader.stop(), [report(KEY, Ended(Killed::Stopped))]);
+        assert!(!exists(third));
+        assert!(reader.stop().is_empty());
+
+        // A panic that unwinds drops the owner: no reader is left.
+        assert_eq!(reader.start(dir, KEY), [report(KEY, Started)]);
+        let fourth = pid_of(&reader);
+        drop(reader);
+        assert!(!exists(fourth));
+    }
+
+    #[test]
+    fn a_reader_that_ends_by_itself_is_reported_once_with_how_it_ended() {
+        let dir = Path::new("/nonexistent-meetscribe-session-xyz");
+        let script: [(&'static [&'static str], ReaderChange); 3] = [(&["-c", "exit 0"], ReaderChange::Exited(Some(0))),
+            (&["-c", "exit 3"], ReaderChange::Exited(Some(3))), (&["-c", "kill -TERM $$"], ReaderChange::Exited(None))];
+        for (args, change) in script {
+            let mut reader = reader_running("/bin/sh", args);
+            assert_eq!(reader.start(dir, KEY), [report(KEY, ReaderChange::Started)]);
+            let pid = pid_of(&reader);
+            let waiting = Instant::now();
+            let reports = loop {
+                let reports = reader.tick(Instant::now());
+                if !reports.is_empty() { break reports; }
+                assert!(waiting.elapsed() < Duration::from_secs(10), "the reader's exit was never noticed");
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert_eq!(reports, [report(KEY, change)]);
+            assert!(!exists(pid), "the reader was not reaped");
+            assert!(reader.tick(Instant::now()).is_empty() && reader.stop().is_empty(), "an exit was reported twice");
+        }
+    }
+
+    #[test]
+    fn a_reader_that_cannot_be_started_is_reported_and_leaves_nothing() {
+        let dir = Path::new("/nonexistent-meetscribe-session-xyz");
+        let mut reader = unspawnable();
+        assert_eq!(reader.start(dir, KEY), [report(KEY, ReaderChange::SpawnFailed)]);
+        assert!(reader.running.is_none());
+        reader.hangup(Instant::now());
+        assert!(reader.tick(Instant::now() + READER_GRACE).is_empty() && reader.stop().is_empty());
+        // With `[live] enabled = false` there is no command at all: every method does nothing.
+        let mut off = LiveReader::new(None);
+        assert!(off.start(dir, KEY).is_empty() && off.running.is_none());
+        off.hangup(Instant::now());
+        assert!(off.tick(Instant::now() + READER_GRACE).is_empty() && off.stop().is_empty());
+    }
+
+    /// The reader's argv must parse back into what the daemon holds: the reader's own defaults
+    /// (a base directory, a config file, 12 s) are not the daemon's values.
+    #[test]
+    fn reader_args_round_trip_through_the_readers_parser() {
+        let base = PathBuf::from("/Users/someone/.meetscribe");
+        let dir = base.join("sessions/20261001-190352");
+        let mut cfg = test_config(&base, live("[live]\nenabled = true\nmax_window_secs = 20\n"));
+        cfg.lang = "pt".to_string();
+        cfg.model = PathBuf::from("/models/other.bin");
+        let argv = reader_args(&dir, &cfg, 4242);
+        // Parsed against another base directory, so that nothing can come from a default.
+        let (opts, session) = crate::live::parse_args(&argv, false, PathBuf::from("/nonexistent-meetscribe-base-xyz")).unwrap().expect("not --help");
+        assert_eq!(session, Some(dir));
+        assert_eq!((opts.model, opts.lang.as_str(), opts.out_dir, opts.base), (cfg.model.clone(), "pt", base.join("live"), base.clone()));
+        assert_eq!((opts.max_window_ms, opts.owner_pid, opts.print), (20_000, Some(4242), false));
+        // A window the reader would refuse never reaches it.
+        let short = test_config(&base, live("[live]\nenabled = true\nmax_window_secs = 1\n"));
+        assert!(crate::live::parse_args(&reader_args(&base, &short, 1), false, base.clone()).is_ok());
+    }
+
+    /// Each thing that can happen to a reader, as the log carries it: through the real formatter,
+    /// which withholds an event with a name or a value it does not know.
+    #[test]
+    fn every_reader_report_is_a_log_line_the_formatter_accepts() {
+        use ReaderChange::{Exited, SpawnFailed, Started};
+        for (change, event, outcome, exit_code, error_class) in [
+            (Started, "live_child_started", "ok", None, None),
+            (SpawnFailed, "live_child_started", "error", None, Some("child_launch")),
+            (Exited(Some(0)), "live_child_exited", "ok", Some(0), None),
+            (Exited(Some(3)), "live_child_exited", "error", Some(3), None),
+            (Exited(Some(255)), "live_child_exited", "error", Some(255), None),
+            (Exited(None), "live_child_exited", "error", None, None),
+            (ReaderChange::Killed(Killed::Replaced), "live_child_killed", "attention", None, None),
+            (ReaderChange::Killed(Killed::Deadline), "live_child_killed", "attention", None, None),
+            (ReaderChange::Killed(Killed::Stopped), "live_child_killed", "attention", None, None),
+            (ReaderChange::Killed(Killed::TrackingLost), "live_child_killed", "attention", None, None),
+        ] {
+            let line = crate::diagnostics::formatted_event(&reader_event(&report(KEY, change)));
+            assert_eq!((line["component"].as_str(), line["event"].as_str(), line["session_id"].as_str(), line["outcome"].as_str()),
+                (Some("daemon"), Some(event), Some(KEY), Some(outcome)), "{change:?}");
+            assert_eq!((line["exit_code"].as_u64(), line["error_class"].as_str()), (exit_code, error_class), "{change:?}");
+        }
+    }
+
+    // ---- `record_and_queue` with a capture of the test's own.
+
+    struct Call { base: PathBuf, cfg: DaemonConfig, board: StatusBoard, jobs: mpsc::Sender<TranscribeJob>, queued: mpsc::Receiver<TranscribeJob> }
+
+    fn call(tag: &str, live_text: &str) -> Call {
+        let base = temp_base(tag);
+        let (jobs, queued) = mpsc::channel();
+        Call { cfg: test_config(&base, live(live_text)), board: StatusBoard::new(base.clone()), base, jobs, queued }
+    }
+
+    /// What capture leaves for a call that recorded `secs`: one roll, one checkpoint, a summary.
+    fn captured(managed: Option<&mut crate::recovery::Session>, secs: f64) -> Result<session::CaptureSummary> {
+        let session = managed.expect("the daemon captures into a managed session");
+        session.start_roll(0, 16_000, 0.0)?;
+        session.checkpoint(0, 16_000, 16_000)?;
+        Ok(session::CaptureSummary { duration_secs: secs, segments: 1, rebuilds: 0, dropped: 0, num_buffers: 2 })
+    }
+
+    /// The one session directory a call made.
+    fn session_of(call: &Call) -> PathBuf {
+        let mut dirs: Vec<PathBuf> = std::fs::read_dir(&call.cfg.sessions_dir).unwrap().map(|entry| entry.unwrap().path())
+            .filter(|path| !path.file_name().unwrap().to_string_lossy().starts_with('.')).collect();
+        assert_eq!(dirs.len(), 1, "{dirs:?}");
+        dirs.remove(0)
+    }
+
+    /// A reader that cannot start is never a reason to lose a recording.
+    #[test]
+    fn a_reader_that_cannot_start_does_not_fail_the_recording() {
+        let call = call("rq-spawn", LIVE_ON);
+        let mut reader = unspawnable();
+        record_and_queue(&call.cfg, "com.google.Chrome", &call.jobs, &call.board, &mut reader, |_, _, managed| captured(managed, 30.0)).unwrap();
+        let job = call.queued.try_recv().expect("the recording was not queued");
+        let state = crate::recovery::State::read(&job.dir).unwrap();
+        assert_eq!((state.phase, state.capture_status), (crate::recovery::Phase::Ready, crate::recovery::CaptureStatus::Complete));
+        assert_eq!(job.opts.session_key, Some(state.key));
+        assert_eq!(job.promote_live, Some(call.base.join("live")));
+        assert!(reader.running.is_none());
+        std::fs::remove_dir_all(&call.base).unwrap();
+    }
+
+    /// The reader is started before capture, for the session capture writes; it is left running
+    /// when the call ends well, with its deadline, and the session's lock is free for the child.
+    #[test]
+    fn a_good_capture_leaves_the_reader_running_with_a_deadline() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let call = call("rq-good", LIVE_ON);
+        let started_for = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
+        let seen = Rc::clone(&started_for);
+        let mut reader = LiveReader::new(Some(Box::new(move |dir: &Path| {
+            seen.borrow_mut().push(dir.to_path_buf());
+            let mut command = std::process::Command::new("/bin/sleep");
+            command.arg("60");
+            command
+        })));
+        let at_capture = Rc::clone(&started_for);
+        record_and_queue(&call.cfg, "com.google.Chrome", &call.jobs, &call.board, &mut reader, |dir, _, managed| {
+            assert_eq!(*at_capture.borrow(), [dir.to_path_buf()], "the reader was not started before capture, for this session");
+            captured(managed, 30.0)
+        }).unwrap();
+        let job = call.queued.try_recv().expect("the recording was not queued");
+        assert_eq!(started_for.borrow().as_slice(), std::slice::from_ref(&job.dir));
+        assert!(crate::recovery::Session::open(&job.dir).unwrap().is_some(), "the session is still locked after the call");
+        let pid = pid_of(&reader);
+        assert!(exists(pid), "the reader must outlive the call to finish its last windows");
+        let now = Instant::now();
+        assert!(reader.tick(now).is_empty());
+        assert_eq!(reader.tick(now + READER_GRACE), [report(&crate::recovery::State::read(&job.dir).unwrap().key, ReaderChange::Killed(Killed::Deadline))]);
+        assert!(!exists(pid));
+        std::fs::remove_dir_all(&call.base).unwrap();
+    }
+
+    /// A call too short to transcribe returns early; its reader must have a deadline all the same.
+    #[test]
+    fn a_short_capture_leaves_the_reader_a_deadline_too() {
+        let call = call("rq-short", LIVE_ON);
+        let mut reader = sleeper();
+        record_and_queue(&call.cfg, "com.google.Chrome", &call.jobs, &call.board, &mut reader, |_, _, managed| captured(managed, 5.0)).unwrap();
+        assert!(call.queued.try_recv().is_err(), "a call under min_secs was queued");
+        let state = crate::recovery::State::read(&session_of(&call)).unwrap();
+        assert_eq!(state.phase, crate::recovery::Phase::SkippedShort);
+        let pid = pid_of(&reader);
+        assert_eq!(reader.tick(Instant::now() + READER_GRACE), [report(&state.key, ReaderChange::Killed(Killed::Deadline))],
+            "the reader of a short call was left with no deadline");
+        assert!(!exists(pid));
+        std::fs::remove_dir_all(&call.base).unwrap();
+    }
+
+    /// Capture has two ways to fail: `run_capture` itself, and saving the end of the recording.
+    /// Either way the reader is stopped at once: nothing more will be recorded for it to follow.
+    #[test]
+    fn a_failed_capture_stops_the_reader_on_both_error_paths() {
+        let failing = call("rq-fail", LIVE_ON);
+        let pid_file = failing.base.join("reader.pid");
+        let mut reader = announcing_sleeper(pid_file.clone());
+        let error = record_and_queue(&failing.cfg, "com.google.Chrome", &failing.jobs, &failing.board, &mut reader, |_, _, _| {
+            announced_pid(&pid_file); // the reader is running when capture fails
+            anyhow::bail!("synthetic capture failure")
+        }).unwrap_err();
+        assert!(format!("{error:#}").contains("synthetic capture failure"));
+        assert!(reader.running.is_none(), "the reader of a failed capture is still held");
+        assert!(!exists(announced_pid(&pid_file)), "the reader of a failed capture was left running");
+        assert!(failing.queued.try_recv().is_err());
+        assert_eq!(crate::recovery::State::read(&session_of(&failing)).unwrap().phase, crate::recovery::Phase::NeedsAttention);
+        std::fs::remove_dir_all(&failing.base).unwrap();
+
+        // The capture ran, and the state that says so cannot be saved (the directory is gone).
+        let unsaved = call("rq-unsaved", LIVE_ON);
+        let pid_file = unsaved.base.join("reader.pid");
+        let mut reader = announcing_sleeper(pid_file.clone());
+        let outcome = record_and_queue(&unsaved.cfg, "com.google.Chrome", &unsaved.jobs, &unsaved.board, &mut reader, |dir, _, managed| {
+            announced_pid(&pid_file);
+            let summary = captured(managed, 30.0)?;
+            std::fs::remove_dir_all(dir)?;
+            Ok(summary)
+        });
+        assert!(outcome.is_err(), "the end of the capture was saved into a directory that is gone");
+        assert!(reader.running.is_none(), "the reader is still held after the capture's end could not be saved");
+        assert!(!exists(announced_pid(&pid_file)), "the reader was left running after the capture's end could not be saved");
+        assert!(unsaved.queued.try_recv().is_err());
+        std::fs::remove_dir_all(&unsaved.base).unwrap();
+    }
+
+    /// With `[live]` left alone the daemon starts nothing and offers no live transcript.
+    #[test]
+    fn with_live_off_a_call_starts_no_reader_and_passes_no_flag() {
+        for text in ["", "[live]\npromote = true\n"] {
+            let call = call("rq-off", text);
+            let mut reader = LiveReader::new(call.cfg.live.enabled.then(|| -> ReaderCommand { Box::new(|_: &Path| std::process::Command::new("/bin/sleep")) }));
+            record_and_queue(&call.cfg, "com.google.Chrome", &call.jobs, &call.board, &mut reader, |_, _, managed| captured(managed, 30.0)).unwrap();
+            let job = call.queued.try_recv().expect("the recording was not queued");
+            assert!(reader.running.is_none() && job.promote_live.is_none(), "config: {text:?}");
+            let argv = child_args(&job.dir, &job.opts, &call.base, job.promote_live.as_deref());
+            assert!(!argv.iter().any(|arg| arg == "--promote-live"));
+            std::fs::remove_dir_all(&call.base).unwrap();
+        }
+    }
+
+    /// `live-watch.log` belongs to a hand-started `live watch`; a daemon with `[live]` left alone
+    /// must not start truncating it. Old live streams go with `retain_days`, on or off.
+    #[test]
+    fn maintenance_rotates_the_watch_log_only_with_the_reader_on_and_prunes_streams_by_retain_days() {
+        for (text, rotated, pruned) in [("", false, false), ("[live]\nenabled = true\n", true, false), ("[live]\nretain_days = 7\n", false, true)] {
+            let base = temp_base("maintenance-live");
+            let mut cfg = test_config(&base, live(text));
+            cfg.log_max_mb = 1;
+            std::fs::create_dir_all(&cfg.logs_dir).unwrap();
+            let big = vec![b'x'; 1024 * 1024 + 1];
+            for name in ["meetscribe.err.log", "live-watch.log"] { std::fs::write(cfg.logs_dir.join(name), &big).unwrap(); }
+            let stream = base.join("live").join(format!("{KEY}.jsonl"));
+            std::fs::create_dir_all(stream.parent().unwrap()).unwrap();
+            std::fs::write(&stream, format!("{}\n", serde_json::json!({"v": 1, "seq": 0, "type": "meeting_started", "key": KEY,
+                "app": "Chrome", "started_at": 1_794_443_305, "model": "ggml-fixture"}))).unwrap();
+            std::fs::File::options().write(true).open(&stream).unwrap()
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(30 * 86_400)).unwrap();
+
+            run_maintenance(&cfg);
+            let len = |name: &str| std::fs::metadata(cfg.logs_dir.join(name)).unwrap().len();
+            assert_eq!(len("meetscribe.err.log"), 0, "the daemon's own log is rotated as before");
+            assert_eq!(len("live-watch.log") == 0, rotated, "config: {text:?}");
+            assert_eq!(cfg.logs_dir.join("live-watch.log.1").exists(), rotated, "config: {text:?}");
+            assert_eq!(!stream.exists(), pruned, "config: {text:?}");
+            std::fs::remove_dir_all(&base).unwrap();
         }
     }
 

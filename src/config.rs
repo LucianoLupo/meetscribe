@@ -63,6 +63,21 @@ log_max_mb = 10
 # false = the pre-split pipeline. Needs the diarizer installed: `bash models/provision.sh`,
 # `bash models/build-diarizer.sh`, then `meetscribe install`. Missing diarizer = no split.
 split = true
+
+[live]
+# The daemon starts a live reader for every call: `meetscribe live tail --follow` in a terminal
+# shows the transcript a few seconds behind the speaker. false = nothing new runs.
+enabled = false
+# At hangup, store the live transcript as the meeting when it provably covers the whole
+# recording (no voices or names; `meetscribe finalize <id>` adds them later). Anything else
+# gets the normal transcription. Takes effect only with enabled = true.
+promote = false
+# A speaker who does not pause is cut into windows of this many seconds (at least 2).
+max_window_secs = 12
+# Delete a meeting's live stream (its text, under ~/.meetscribe/live) after this many days.
+# 0 = keep. A stream that is gone cannot be stored any more: that meeting gets the normal
+# transcription.
+retain_days = 0
 "#;
 
 /// Top-level config. `#[serde(default)]` fills any missing field from `Config::default()`.
@@ -74,6 +89,7 @@ pub struct Config {
     pub daemon: DaemonSettings,
     pub retention: RetentionConfig,
     pub speakers: SpeakerSettings,
+    pub live: LiveSettings,
     /// Unknown top-level keys — captured so we can WARN instead of silently ignoring them.
     #[serde(flatten)]
     pub extra: BTreeMap<String, toml::Value>,
@@ -87,6 +103,7 @@ impl Default for Config {
             daemon: DaemonSettings::default(),
             retention: RetentionConfig::default(),
             speakers: SpeakerSettings::default(),
+            live: LiveSettings::default(),
             extra: BTreeMap::new(),
         }
     }
@@ -174,6 +191,57 @@ impl Default for SpeakerSettings {
     }
 }
 
+/// `[live]` as the file has it. The daemon acts on [`LiveSettings::effective`], not on these
+/// fields: serde fills a key that is missing, it does not correct a value that is there.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LiveSettings {
+    /// The daemon starts a live reader (`meetscribe live`) for every call.
+    pub enabled: bool,
+    /// At hangup, store the live transcript when it passes the gate (`promote.rs`).
+    pub promote: bool,
+    /// A speaker who does not pause is cut into windows of this many seconds.
+    pub max_window_secs: u64,
+    /// Delete a meeting's live stream after this many days. 0 = keep.
+    pub retain_days: u64,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, toml::Value>,
+}
+
+impl Default for LiveSettings {
+    fn default() -> Self {
+        Self { enabled: false, promote: false, max_window_secs: DEFAULT_MAX_WINDOW_SECS, retain_days: 0, extra: BTreeMap::new() }
+    }
+}
+
+const DEFAULT_MAX_WINDOW_SECS: u64 = 12;
+/// The live reader refuses a shorter window (`live::parse_args`).
+const MIN_MAX_WINDOW_SECS: u64 = 2;
+
+/// What the daemon does about the live lane: `[live]` with its two rules applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveEffective {
+    pub enabled: bool,
+    /// Never true without `enabled`: with the reader off, nothing new runs at hangup either.
+    pub promote: bool,
+    pub max_window_secs: u64,
+    pub retain_days: u64,
+}
+
+impl LiveSettings {
+    /// The values in force. `promote` needs `enabled`; a window the reader would refuse becomes
+    /// the built-in one. [`Config::collect_warnings`] says so for both.
+    #[must_use]
+    pub fn effective(&self) -> LiveEffective {
+        LiveEffective {
+            enabled: self.enabled,
+            promote: self.enabled && self.promote,
+            max_window_secs: if self.max_window_secs < MIN_MAX_WINDOW_SECS { DEFAULT_MAX_WINDOW_SECS } else { self.max_window_secs },
+            retain_days: self.retain_days,
+        }
+    }
+}
+
 impl Config {
     /// The effective meeting-app allowlist: built-ins (unless disabled) ∪ user extras, de-duped,
     /// order-preserving (built-ins first).
@@ -193,7 +261,8 @@ impl Config {
         v
     }
 
-    /// Human-readable warnings (unknown keys + a too-new version). Pure — the daemon logs these.
+    /// Human-readable warnings (unknown keys, a too-new version, a `[live]` value that is not
+    /// used as written). Pure — [`Config::load`] logs these, for every command that reads the file.
     #[must_use]
     pub fn collect_warnings(&self) -> Vec<String> {
         let mut w = Vec::new();
@@ -214,6 +283,13 @@ impl Config {
         push_unknown(&mut w, "daemon.", &self.daemon.extra);
         push_unknown(&mut w, "retention.", &self.retention.extra);
         push_unknown(&mut w, "speakers.", &self.speakers.extra);
+        push_unknown(&mut w, "live.", &self.live.extra);
+        if self.live.promote && !self.live.enabled {
+            w.push("live.promote = true has no effect while live.enabled = false: the live transcript is not stored".to_string());
+        }
+        if self.live.max_window_secs < MIN_MAX_WINDOW_SECS {
+            w.push(format!("live.max_window_secs = {} is below {MIN_MAX_WINDOW_SECS}; {DEFAULT_MAX_WINDOW_SECS} is used", self.live.max_window_secs));
+        }
         w
     }
 
@@ -333,6 +409,46 @@ lang = "en"
         let warnings = cfg.collect_warnings();
         assert!(warnings.iter().any(|w| w.contains("nonsense_top")));
         assert!(warnings.iter().any(|w| w.contains("detector.typo_here")));
+    }
+
+    /// `[live]` is off unless the file turns it on, and the daemon acts on `effective`, the same
+    /// call `run_daemon` makes: a value serde accepted is not yet a value in force.
+    #[test]
+    fn live_is_off_by_default_and_promote_needs_enabled() {
+        let off = LiveEffective { enabled: false, promote: false, max_window_secs: 12, retain_days: 0 };
+        assert_eq!(Config::default().live.effective(), off);
+        // An existing file has no [live] section.
+        let cfg: Config = toml::from_str("version = 1\n[daemon]\nlang = \"es\"\n").expect("parses");
+        assert_eq!(cfg.live.effective(), off);
+        assert!(cfg.collect_warnings().is_empty());
+        // A partial section fills the rest.
+        let cfg: Config = toml::from_str("[live]\nenabled = true\nretain_days = 7\n").expect("parses");
+        assert_eq!(cfg.live.effective(), LiveEffective { enabled: true, promote: false, max_window_secs: 12, retain_days: 7 });
+        assert!(cfg.collect_warnings().is_empty());
+        let cfg: Config = toml::from_str("[live]\nenabled = true\npromote = true\nmax_window_secs = 20\n").expect("parses");
+        assert_eq!(cfg.live.effective(), LiveEffective { enabled: true, promote: true, max_window_secs: 20, retain_days: 0 });
+        assert!(cfg.collect_warnings().is_empty());
+        // `promote` alone stores nothing, and says so. Pruning does not depend on `enabled`.
+        let cfg: Config = toml::from_str("[live]\npromote = true\nretain_days = 3\n").expect("parses");
+        assert_eq!(cfg.live.effective(), LiveEffective { enabled: false, promote: false, max_window_secs: 12, retain_days: 3 });
+        let warnings = cfg.collect_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("live.promote") && warnings[0].contains("live.enabled"));
+        // A window the reader would refuse is replaced, not passed on.
+        for short in [0, 1] {
+            let cfg: Config = toml::from_str(&format!("[live]\nenabled = true\nmax_window_secs = {short}\n")).expect("parses");
+            assert_eq!(cfg.live.effective().max_window_secs, 12);
+            let warnings = cfg.collect_warnings();
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert!(warnings[0].contains("live.max_window_secs"));
+        }
+        let cfg: Config = toml::from_str("[live]\nmax_window_secs = 2\n").expect("parses");
+        assert_eq!(cfg.live.effective().max_window_secs, 2);
+        assert!(cfg.collect_warnings().is_empty());
+        // An unknown key under [live] is warned, like under every other section.
+        let cfg: Config = toml::from_str("[live]\nenabled = true\nenabeld = true\n").expect("parses");
+        assert!(cfg.live.extra.contains_key("enabeld"));
+        assert!(cfg.collect_warnings().iter().any(|w| w.contains("live.enabeld")));
     }
 
     #[test]

@@ -1,9 +1,12 @@
 //! Disk + log hygiene for the background daemon.
 //!
-//! Two bounded, config-driven jobs run at daemon startup and once per day:
+//! Three bounded, config-driven jobs run at daemon startup and once per day:
 //!   - **prune session dirs** older than `retention.sessions_days` (0 = keep forever — the safe
 //!     default; we never delete recordings unless the user opts in). The meeting + transcript stay
 //!     in the DB regardless, so `meetscribe export <id>` still works after a session dir is pruned.
+//!   - **prune live streams** older than `live.retain_days` (0 = keep). A stream is a meeting's
+//!     text outside its session directory; see [`prune_live`] for what may be deleted and how a
+//!     reader that starts the same stream at that instant is kept safe.
 //!   - **rotate the daemon log** over `retention.log_max_mb` via COPYTRUNCATE (copy → `<log>.1`,
 //!     then truncate the original in place). Rename is WRONG here: launchd holds the log fd open
 //!     (StandardErrorPath), so a rename would leave it appending to the rotated file. Truncating the
@@ -86,6 +89,109 @@ pub fn prune_sessions(sessions_dir: &Path, days: u64, now_epoch: i64) -> Result<
         } else {
             report.kept += 1;
         }
+    }
+    Ok(report)
+}
+
+/// The session key in a live stream's file name (`<32 hex digits>.jsonl`, as `live.rs` names
+/// it); `None` for any other name.
+fn stream_key(name: &std::ffi::OsStr) -> Option<&str> {
+    let key = name.to_str()?.strip_suffix(".jsonl")?;
+    (key.len() == 32 && key.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(key)
+}
+
+/// Whether a file named `<key>.jsonl` that the pruner holds locked may be deleted: a regular
+/// file, last written more than `days` ago, whose first line says it is the live stream of
+/// `key`. Everything that cannot be established keeps the file: a modification time that
+/// cannot be read (`modified` is `None`), and a `days` too large to count in seconds.
+/// A finished stream is not required: a reader that crashed leaves none, and its text would
+/// otherwise stay for ever.
+#[must_use]
+fn stream_expired(regular: bool, modified: Option<i64>, first_line: Option<&str>, key: &str, now_epoch: i64, days: u64) -> bool {
+    use crate::live::{StreamEvent, StreamLine};
+    let Some(limit) = i64::try_from(days).ok().and_then(|days| days.checked_mul(SECS_PER_DAY)) else { return false; };
+    let Some(age) = modified.and_then(|modified| now_epoch.checked_sub(modified)) else { return false; };
+    let ours = first_line.and_then(|line| serde_json::from_str::<StreamLine>(line).ok())
+        .is_some_and(|line| matches!(line.event, StreamEvent::MeetingStarted { key: written, .. } if written == key));
+    regular && days > 0 && age > limit && ours
+}
+
+/// Longest first line read from a stream: a `meeting_started` event is a few hundred bytes.
+const FIRST_LINE_LIMIT: u64 = 64 * 1024;
+
+/// The complete first line of an open file, without its newline.
+fn first_line(file: &fs::File) -> Option<String> {
+    use std::io::{BufRead, Read};
+    let mut line = String::new();
+    std::io::BufReader::new(file.take(FIRST_LINE_LIMIT)).read_line(&mut line).ok()?;
+    line.strip_suffix('\n').map(str::to_owned)
+}
+
+/// A point inside [`prune_stream`] at which a test may change the file system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PruneStep {
+    /// The entry was listed and is a regular file; it is not opened yet.
+    Listed,
+    /// The file is locked and was judged old; the path has not been compared with it yet.
+    Locked,
+}
+
+/// Delete one stream if it is old, in the order that makes it safe against a writer
+/// (`live.rs`, `StreamWriter::create_with`) starting the same stream at this instant:
+///
+/// 1. the listed entry is a regular file;
+/// 2. open it read-only without following a link, and take its lock without waiting (a writer
+///    holds that lock for as long as it writes: its stream is kept);
+/// 3. judge the LOCKED file: kind, age and first line. A writer reuses and truncates the same
+///    file, so an age read before the lock could condemn a stream written a second ago;
+/// 4. the path still names the file that is locked;
+/// 5. unlink while holding the lock. A writer that opened the file before this finds, once it
+///    has the lock, that its file is not at the path any more, and opens the stream again.
+///
+/// This is safe against a writer that takes the lock, which every reader of this tool does. It
+/// does not exclude something that swaps the file at the path without the lock in the instant
+/// between 4 and 5.
+///
+/// `at` is told when 1 and when 3 are done; tests rewrite or replace the stream there.
+fn prune_stream(path: &Path, key: &str, days: u64, now_epoch: i64, at: &mut impl FnMut(PruneStep, &Path)) -> bool {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    if !fs::symlink_metadata(path).is_ok_and(|listed| listed.file_type().is_file()) { return false; }
+    at(PruneStep::Listed, path);
+    // O_NONBLOCK: should the entry have become a FIFO since step 1, the open must not hang the daemon.
+    let Ok(file) = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path) else { return false; };
+    // SAFETY: `file` owns the valid descriptor; flock does not access Rust memory.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 { return false; }
+    let Ok(held) = file.metadata() else { return false; };
+    let modified = held.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok()).map(|age| age.as_secs() as i64);
+    if !stream_expired(held.file_type().is_file(), modified, first_line(&file).as_deref(), key, now_epoch, days) { return false; }
+    at(PruneStep::Locked, path);
+    if !fs::symlink_metadata(path).is_ok_and(|at| at.dev() == held.dev() && at.ino() == held.ino()) { return false; }
+    // `file` is dropped, and the lock released, only after the unlink.
+    fs::remove_file(path).is_ok()
+}
+
+/// Delete the live streams in `live_dir` last written more than `days` ago (`days == 0` is a
+/// no-op: keep). Only an entry directly in the directory, named like a stream and provably one
+/// (see [`stream_expired`]), is ever removed; a stream a reader is writing is kept. The
+/// recording, the stored transcript and the database are not touched. `now_epoch` is injected
+/// for testability.
+pub fn prune_live(live_dir: &Path, days: u64, now_epoch: i64) -> Result<PruneReport> {
+    prune_live_with(live_dir, days, now_epoch, |_, _| {})
+}
+
+/// [`prune_live`], with `at` called for each stream at every [`PruneStep`].
+pub(crate) fn prune_live_with(live_dir: &Path, days: u64, now_epoch: i64, mut at: impl FnMut(PruneStep, &Path)) -> Result<PruneReport> {
+    let mut report = PruneReport::default();
+    if days == 0 || !live_dir.exists() {
+        return Ok(report);
+    }
+    let entries = fs::read_dir(live_dir).with_context(|| format!("read live dir {}", live_dir.display()))?;
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name();
+        let Some(key) = stream_key(&name) else { continue };
+        if prune_stream(&entry.path(), key, days, now_epoch, &mut at) { report.removed += 1; } else { report.kept += 1; }
     }
     Ok(report)
 }
@@ -190,6 +296,143 @@ mod tests {
         assert!(sessions.join("owed").exists());
         assert!(sessions.join("done").exists(), "absence of pending is not archive proof");
 
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    const KEY: &str = "a6e79ba0314c4cc2b647f4d25b327011";
+
+    fn started(key: &str) -> String {
+        serde_json::json!({"v": 1, "seq": 0, "type": "meeting_started", "key": key, "app": "Chrome",
+            "started_at": 1_794_443_305, "model": "ggml-fixture", "lang": "es"}).to_string()
+    }
+
+    /// The decision on a locked file, apart from the file system: what cannot be established
+    /// keeps the stream.
+    #[test]
+    fn a_stream_is_expired_only_when_everything_about_it_is_established() {
+        let now = 1_800_000_000i64;
+        let old = Some(now - 8 * SECS_PER_DAY);
+        let line = started(KEY);
+        assert!(stream_expired(true, old, Some(&line), KEY, now, 7));
+        // Exactly at the limit is not old, and neither is anything younger.
+        assert!(!stream_expired(true, Some(now - 7 * SECS_PER_DAY), Some(&line), KEY, now, 7));
+        assert!(!stream_expired(true, Some(now), Some(&line), KEY, now, 7));
+        assert!(!stream_expired(true, old, Some(&line), KEY, now, 0), "0 days keeps everything");
+        assert!(!stream_expired(false, old, Some(&line), KEY, now, 7), "not a regular file");
+        // A time that could not be read is not "very old".
+        assert!(!stream_expired(true, None, Some(&line), KEY, now, 7));
+        // A number of days that cannot be counted in seconds keeps every file, whatever its age.
+        for days in [u64::MAX, i64::MAX as u64, i64::MAX as u64 / SECS_PER_DAY as u64 + 1] {
+            assert!(!stream_expired(true, Some(0), Some(&line), KEY, now, days), "{days} days");
+            assert!(!stream_expired(true, Some(i64::MIN), Some(&line), KEY, now, days), "{days} days");
+        }
+        assert!(!stream_expired(true, Some(i64::MIN), Some(&line), KEY, now, 7), "an age that cannot be computed");
+        // Not provably a stream of this key.
+        let other = started("b6e79ba0314c4cc2b647f4d25b327011");
+        let heartbeat = serde_json::json!({"v": 1, "seq": 0, "type": "heartbeat", "audio_secs": 2.0, "decoded_secs": 0.0}).to_string();
+        for first in [None, Some(""), Some("not json"), Some(other.as_str()), Some(heartbeat.as_str())] {
+            assert!(!stream_expired(true, old, first, KEY, now, 7), "{first:?}");
+        }
+    }
+
+    #[test]
+    fn prune_live_removes_only_old_streams_of_this_tool() {
+        use std::os::unix::fs::symlink;
+        let tmp = std::env::temp_dir().join(format!("meetscribe-prune-live-{}", crate::recovery::new_identity()));
+        let live = tmp.join("live");
+        fs::create_dir_all(&live).unwrap();
+        // The fresh stream below is as old as this test, so "now" is the real one.
+        let now = crate::now_epoch();
+        let aged = |path: &Path, days: i64| {
+            let modified = UNIX_EPOCH + std::time::Duration::from_secs((now - days * SECS_PER_DAY) as u64);
+            fs::File::options().write(true).open(path).unwrap().set_modified(modified).unwrap();
+        };
+        let keys = ["a0000000000000000000000000000001", "a0000000000000000000000000000002", "a0000000000000000000000000000003",
+            "a0000000000000000000000000000004", "a0000000000000000000000000000005", "a0000000000000000000000000000006"];
+        let stream = |key: &str| live.join(format!("{key}.jsonl"));
+        // Old and finished; old and never finished (its reader crashed): both go.
+        let ended = serde_json::json!({"v": 1, "seq": 1, "type": "meeting_ended", "duration_secs": 3.0, "reason": "ended", "segments": 0, "short_windows": 0});
+        fs::write(stream(keys[0]), format!("{}\n{ended}\n", started(keys[0]))).unwrap();
+        fs::write(stream(keys[1]), format!("{}\n", started(keys[1]))).unwrap();
+        // Fresh: kept.
+        fs::write(stream(keys[2]), format!("{}\n", started(keys[2]))).unwrap();
+        // Old, named like a stream, but its first line names another meeting, or is no event.
+        fs::write(stream(keys[3]), format!("{}\n", started(keys[0]))).unwrap();
+        fs::write(stream(keys[4]), "my own notes\n").unwrap();
+        for key in [keys[0], keys[1], keys[3], keys[4]] { aged(&stream(key), 30); }
+        // A link named like a stream, to an old real stream kept elsewhere.
+        let elsewhere = tmp.join("elsewhere.jsonl");
+        fs::write(&elsewhere, format!("{}\n", started(keys[5]))).unwrap();
+        aged(&elsewhere, 30);
+        symlink(&elsewhere, stream(keys[5])).unwrap();
+        // Other old things in the directory: a wrong name, a directory named like a stream, a note.
+        fs::write(live.join("notes.jsonl"), format!("{}\n", started(keys[0]))).unwrap();
+        aged(&live.join("notes.jsonl"), 30);
+        let directory = live.join("b0000000000000000000000000000001.jsonl");
+        fs::create_dir(&directory).unwrap();
+        fs::write(live.join("README.txt"), "kept").unwrap();
+        aged(&live.join("README.txt"), 30);
+        let names = || { let mut names: Vec<String> = fs::read_dir(&live).unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).collect(); names.sort(); names };
+        let everything = names();
+
+        // 0 days keeps everything, however old.
+        assert_eq!(prune_live(&live, 0, now + 1000 * SECS_PER_DAY).unwrap(), PruneReport { removed: 0, kept: 0 });
+        assert_eq!(names(), everything);
+        // A directory that does not exist is nothing to do, not an error.
+        assert_eq!(prune_live(&tmp.join("absent"), 7, now).unwrap(), PruneReport::default());
+
+        assert_eq!(prune_live(&live, 7, now).unwrap(), PruneReport { removed: 2, kept: 5 });
+        let left: Vec<String> = everything.iter().filter(|name| !name.starts_with(keys[0]) && !name.starts_with(keys[1])).cloned().collect();
+        assert_eq!(names(), left);
+        assert!(elsewhere.exists(), "the file a link pointed at was removed");
+        assert!(fs::symlink_metadata(stream(keys[5])).unwrap().file_type().is_symlink());
+        // Again: nothing more to remove.
+        assert_eq!(prune_live(&live, 7, now).unwrap(), PruneReport { removed: 0, kept: 5 });
+        // The fresh one goes once it is old too.
+        aged(&stream(keys[2]), 30);
+        assert_eq!(prune_live(&live, 7, now).unwrap(), PruneReport { removed: 1, kept: 4 });
+        assert!(!stream(keys[2]).exists());
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The path can come to name another file while the pruner holds the one it judged: a file
+    /// moved into place by something that takes no lock. What is at the path is then left alone.
+    #[test]
+    fn prune_live_leaves_a_file_that_replaced_the_one_it_locked() {
+        let tmp = std::env::temp_dir().join(format!("meetscribe-prune-replaced-{}", crate::recovery::new_identity()));
+        let live = tmp.join("live");
+        fs::create_dir_all(&live).unwrap();
+        let now = crate::now_epoch();
+        let path = live.join(format!("{KEY}.jsonl"));
+        fs::write(&path, format!("{}\n", started(KEY))).unwrap();
+        fs::File::options().write(true).open(&path).unwrap()
+            .set_modified(UNIX_EPOCH + std::time::Duration::from_secs((now - 30 * SECS_PER_DAY) as u64)).unwrap();
+        let newcomer = tmp.join("newcomer");
+        let report = prune_live_with(&live, 7, now, |step, path| if step == PruneStep::Locked {
+            fs::write(&newcomer, "moved into place\n").unwrap();
+            fs::rename(&newcomer, path).unwrap();
+        }).unwrap();
+        assert_eq!(report, PruneReport { removed: 0, kept: 1 });
+        assert_eq!(fs::read_to_string(&path).unwrap(), "moved into place\n", "the pruner removed a file it had not judged");
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// `live watch` keeps `live-watch.log` open for days, in append mode. After a rotation it
+    /// must go on writing at the new end of the file, not at its old offset.
+    #[test]
+    fn a_log_held_open_in_append_mode_is_written_at_the_new_end_after_rotation() {
+        use std::io::Write;
+        let tmp = std::env::temp_dir().join(format!("meetscribe-rotate-append-{}", crate::recovery::new_identity()));
+        fs::create_dir_all(&tmp).unwrap();
+        let log = tmp.join("live-watch.log");
+        let mut held = fs::OpenOptions::new().create(true).append(true).open(&log).unwrap();
+        held.write_all(b"0123456789ABCDEF").unwrap();
+        assert!(rotate_log(&log, 8).unwrap());
+        held.write_all(b"next").unwrap();
+        assert_eq!(fs::read(&log).unwrap(), b"next", "the holder wrote past a hole left by the rotation");
+        assert_eq!(fs::read(backup_path(&log)).unwrap(), b"0123456789ABCDEF");
         fs::remove_dir_all(&tmp).ok();
     }
 
