@@ -12,7 +12,7 @@ impl pipeline::SpeechEngine for SyntheticEngine {
     fn windows(&mut self, audio: &[f32]) -> Result<Vec<vad::SpeechWindow>> {
         Ok(if audio.is_empty() { Vec::new() } else { vec![vad::SpeechWindow { start_ms: 0, end_ms: audio.len() / 16 }] })
     }
-    fn transcribe(&mut self, audio: &[f32], _lang: &str, _words: bool) -> Result<(String, f32, Vec<asr::Word>)> {
+    fn transcribe(&mut self, audio: &[f32], _lang: &str, words: bool) -> Result<(String, f32, Vec<asr::Word>)> {
         if !self.no_store && self.root.join("storage-fault").exists() {
             crate::new_runtime()?.block_on(async {
                 let mut connection = sqlx::SqliteConnection::connect_with(&sqlx::sqlite::SqliteConnectOptions::new()
@@ -25,9 +25,18 @@ impl pipeline::SpeechEngine for SyntheticEngine {
         let text = if audio.first().is_some_and(|value| *value < 0.0) {
             "We approved the synthetic deployment window"
         } else { "The synthetic release checklist is ready" };
-        Ok((text.into(), 0.94, Vec::new()))
+        // A run that splits far-end chunks asks for word timings: one word in each half of the window.
+        let half = audio.len() as f64 / 32_000.0;
+        let timed = if words { vec![asr::Word { text: "approved".into(), t_start: 0.2, t_end: half - 0.2 },
+            asr::Word { text: "deployed".into(), t_start: half + 0.2, t_end: 2.0 * half - 0.2 }] } else { Vec::new() };
+        Ok((text.into(), 0.94, timed))
     }
-    fn embed(&mut self, _audio: &[f32]) -> Result<Option<Vec<f32>>> { Ok(Some(vec![1.0 / 192.0f32.sqrt(); 192])) }
+    /// One voice for every fixture, and a second one, orthogonal to it, for audio below -0.7.
+    fn embed(&mut self, audio: &[f32]) -> Result<Option<Vec<f32>>> {
+        let second = audio.first().is_some_and(|value| *value < -0.7);
+        let sign = |axis: usize| if second && axis % 2 == 1 { -1.0f32 } else { 1.0 };
+        Ok(Some((0..192).map(|axis| sign(axis) / 192.0f32.sqrt()).collect()))
+    }
 }
 fn backend(_model: &str, opts: &pipeline::PipelineOpts) -> Result<Box<dyn pipeline::SpeechEngine>> {
     let root = PathBuf::from(std::env::var_os("MEETSCRIBE_PIPELINE_FIXTURE_ROOT").context("fixture root absent")?);
@@ -842,6 +851,79 @@ fn ordinary_no_store_child_succeeds_without_a_database() {
     }
     println!(r#"{{"event":"audit_case_complete","case":"f3_unmanaged_no_store_child","iterations":5}}"#);
 }
+
+/// Segments and voice clusters of a stored meeting, as the database has them.
+fn stored_voices(fixture: &Fixture, id: i64) -> (Vec<db::StoredSegment>, Vec<db::ClusterRow>) {
+    crate::new_runtime().unwrap().block_on(async {
+        let mut db = db::Db::open_existing(&fixture.opts.db_path, fixture.state().archive_id.as_deref().unwrap()).await.unwrap();
+        let stored = (db.load_segments(id).await.unwrap(), db.list_clusters(id).await.unwrap());
+        db.close().await.unwrap(); stored
+    })
+}
+
+/// The far end of the fixture becomes two voices: 1.5 s of one, then 1.5 s of another, with the
+/// diarizer's turns replayed from a file. Returns the fixture set up to split at that change.
+fn two_voice_fixture() -> Fixture {
+    let (mut fixture, owner) = Fixture::new(); drop(owner);
+    let mut wav = hound::WavWriter::create(fixture.dir.join("system.wav"), hound::WavSpec {
+        channels: 1, sample_rate: 16_000, bits_per_sample: 32, sample_format: hound::SampleFormat::Float }).unwrap();
+    for frame in 0..48_000 { wav.write_sample(if frame < 24_000 { -0.5f32 } else { -0.9f32 }).unwrap(); } wav.finalize().unwrap();
+    let turns = fixture.root.join("turns.rttm");
+    fs::write(&turns, "SPEAKER far 1 0.000 1.500 <NA> <NA> speaker_0 <NA> <NA>\nSPEAKER far 1 1.500 1.500 <NA> <NA> speaker_1 <NA> <NA>\n").unwrap();
+    fixture.opts.split = true; fixture.opts.diarizer_rttm = Some(turns);
+    fixture
+}
+
+/// The batch pass with the far-end split on, which is what the daemon runs by default. The
+/// expected values are frozen from the build before `transcribe_core` was divided in two (f138d42),
+/// not regenerated from this code: they pin what that pass stores and writes.
+#[test]
+fn the_batch_pass_with_the_far_end_split_stores_what_it_did_before_it_was_divided() {
+    let fixture = two_voice_fixture();
+    let output = child_output(&fixture, spawn_cli(&fixture, &transcribe_argv(&fixture, &fixture.job())));
+    assert!(output.status.success(), "split transcription failed: {output:?}");
+    let rows = fixture.meetings(); assert_eq!(rows.len(), 1);
+    let (segments, clusters) = stored_voices(&fixture, rows[0].id);
+    let facts = format!("{}\n{}\n{}",
+        segments.iter().map(|s| format!("{:?} {:.3}-{:.3} {:?} {}", s.seg.speaker, s.seg.t_start, s.seg.t_end, s.voice_cluster, s.seg.text)).collect::<Vec<_>>().join("\n"),
+        clusters.iter().map(|c| format!("{} windows={} secs={:.3} speaker={:?}", c.cluster, c.n_windows, c.speech_secs, c.speaker_id)).collect::<Vec<_>>().join("\n"),
+        fs::read_to_string(fixture.dir.join("transcript.json")).unwrap());
+    assert_eq!(facts, SPLIT_FACTS);
+    assert_eq!((rows[0].segment_count, rows[0].origin), (segments.len() as i64, db::TranscriptOrigin::Batch));
+    assert_eq!(proofs(&fixture), (true, true));
+    assert!(session_snapshot(&fixture.dir).keys().all(|path| !path.file_name().unwrap().to_str().unwrap().starts_with(".diar-")));
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+const SPLIT_FACTS: &str = r#"You 0.000-3.000 None The synthetic release checklist is ready
+Others 0.000-1.500 Some("A") approved
+Others 1.500-3.000 Some("B") deployed
+A windows=1 secs=1.500 speaker=None
+B windows=1 secs=1.500 speaker=None
+[
+  {
+    "speaker": "you",
+    "text": "The synthetic release checklist is ready",
+    "t_start": 0.0,
+    "t_end": 3.0,
+    "confidence": 0.94
+  },
+  {
+    "speaker": "others",
+    "text": "approved",
+    "t_start": 0.0,
+    "t_end": 1.5,
+    "confidence": 0.94,
+    "voice_cluster": "A"
+  },
+  {
+    "speaker": "others",
+    "text": "deployed",
+    "t_start": 1.5,
+    "t_end": 3.0,
+    "confidence": 0.94,
+    "voice_cluster": "B"
+  }
+]"#;
 
 // ---- Promotion: the live stream becomes the stored transcript (`promote.rs`). The stream is
 // fictional and written by hand in the reader's format; the child is the real argv, parser and
