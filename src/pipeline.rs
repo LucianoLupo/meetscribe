@@ -249,7 +249,32 @@ fn render_existing(managed: &mut crate::recovery::Session, opts: &PipelineOpts, 
     })
 }
 
-fn transcribe_core(dir: &Path, audio_dir: &Path, opts: &PipelineOpts, mut managed: Option<&mut crate::recovery::Session>) -> Result<PipelineOutput> {
+/// What the batch pass has in hand once the audio is decoded and before any database is opened:
+/// the merged transcript, the far-end voice assemblies (not yet matched against enrolled voices)
+/// and the meeting row to store. Storing and publishing it is `transcribe_core`'s second half.
+struct Decoded {
+    meta: db::MeetingMeta,
+    merged: Vec<transcript::TranscriptSegment>,
+    embeddings: Vec<Option<Vec<f32>>>,
+    pieces: Vec<split::Piece>,
+    piece_embs: Vec<Option<Vec<f32>>>,
+    assembly: voices::Assembly,
+    /// Path B, the same identity pipeline over the pieces; `None` without a diarizer.
+    assembly_b: Option<voices::Assembly>,
+    split_reason: String,
+    rolls_split: usize,
+    rolls_far: usize,
+    /// Kept for the provenance log line written once the meeting is stored.
+    diarizer: Option<diar::Diarizer>,
+    meeting_secs: f64,
+    wall: f64,
+    rtf: f64,
+}
+
+/// Decode every channel under `audio_dir` and assemble the far-end voices. Opens no database and
+/// saves no session state; the only files it writes are the diarizer's temporary ones, into
+/// `work_dir`. `state` is the managed session's metadata, when there is one.
+fn decode(dir: &Path, audio_dir: &Path, work_dir: &Path, opts: &PipelineOpts, state: Option<&crate::recovery::State>) -> Result<Decoded> {
     let title = opts.title.clone().unwrap_or_else(|| {
         dir.file_name()
             .and_then(|s| s.to_str())
@@ -257,8 +282,8 @@ fn transcribe_core(dir: &Path, audio_dir: &Path, opts: &PipelineOpts, mut manage
             .to_string()
     });
 
-    let inputs = |channel: &str| match managed.as_ref() {
-        Some(session) => session.state.rolls.iter()
+    let inputs = |channel: &str| match state {
+        Some(state) => state.rolls.iter()
             .map(|roll| audio_dir.join(crate::recovery::roll_name(channel, roll.index))).collect(),
         None => discover_channel(audio_dir, channel),
     };
@@ -285,10 +310,10 @@ fn transcribe_core(dir: &Path, audio_dir: &Path, opts: &PipelineOpts, mut manage
     let mut engine = load_engine(model_str, opts)?;
     let split_on = diarizer.is_some();
     // Managed metadata is authoritative for manual runs too: new captures need no legacy manifest.
-    anyhow::ensure!(opts.session_key.is_none() || managed.is_some(), "keyed inference has no session");
-    let offsets = managed.as_ref().map(|session| session.state.roll_offsets());
-    let gaps = if let Some(session) = managed.as_ref() {
-        session.state.rolls.iter().map(|roll| (roll.index, roll.gap_seconds)).collect()
+    anyhow::ensure!(opts.session_key.is_none() || state.is_some(), "keyed inference has no session");
+    let offsets = state.map(|state| state.roll_offsets());
+    let gaps = if let Some(state) = state {
+        state.rolls.iter().map(|roll| (roll.index, roll.gap_seconds)).collect()
     } else { read_segment_gaps(audio_dir)? };
 
     let t0 = Instant::now();
@@ -334,7 +359,7 @@ fn transcribe_core(dir: &Path, audio_dir: &Path, opts: &PipelineOpts, mut manage
             let pending = match diarizer.as_mut() {
                 Some(d) if far => {
                     rolls_far += 1;
-                    match d.start(&audio16, dir) {
+                    match d.start(&audio16, work_dir) {
                         Ok(p) => Some(p),
                         Err(e) => {
                             log::warn!("far-end split: roll {i} falls back to whole chunks ({e:#})");
@@ -424,9 +449,9 @@ fn transcribe_core(dir: &Path, audio_dir: &Path, opts: &PipelineOpts, mut manage
         .filter(|(_, (s, _))| s.speaker == transcript::Speaker::Others)
         .map(|(i, (s, e))| voices::Window { key: i as i64, t_start: s.t_start, t_end: s.t_end, embedding: e.clone() })
         .collect();
-    let mut assembly = voices::assemble(&windows, spk::CLUSTER_CUT);
+    let assembly = voices::assemble(&windows, spk::CLUSTER_CUT);
     // Path B: the same identity pipeline over the pieces (keys = piece index).
-    let mut assembly_b = split_on.then(|| {
+    let assembly_b = split_on.then(|| {
         let w: Vec<voices::Window> = pieces
             .iter()
             .zip(&piece_embs)
@@ -452,13 +477,45 @@ fn transcribe_core(dir: &Path, audio_dir: &Path, opts: &PipelineOpts, mut manage
         source_dir: dir.display().to_string(),
         model: model_name(&opts.model),
         lang: opts.lang.clone(),
-        started_at: managed.as_ref().map(|session| session.state.started_at)
+        started_at: state.map(|state| state.started_at)
             .unwrap_or_else(|| earliest_capture_start(&mic_files, &sys_files)),
         duration_secs: meeting_secs,
         created_at: crate::now_epoch(),
-        capture_status: managed.as_ref().map(|session| session.state.capture_status.as_str().to_owned()),
+        capture_status: state.map(|state| state.capture_status.as_str().to_owned()),
         origin: db::TranscriptOrigin::Batch,
     };
+    Ok(Decoded {
+        meta, merged, embeddings, pieces, piece_embs, assembly, assembly_b, split_reason,
+        rolls_split, rolls_far, diarizer, meeting_secs, wall, rtf,
+    })
+}
+
+/// How many clusters were recognised, and the segments and clusters to store when the diarizer
+/// split the chunks (`None` without one: the merged segments and path A are stored as they are).
+type Named = (usize, Option<(Vec<transcript::TranscriptSegment>, voices::Assembly)>);
+
+/// The naming step: match the far-end voices against the enrolled voiceprints and, when the
+/// diarizer split the chunks, turn the named pieces back into the segments and clusters to store.
+fn name_voices(decoded: &mut Decoded, enrolled: &[spk::Enrolled]) -> Result<Named> {
+    let mut matched = voices::apply_matches(&mut decoded.assembly, enrolled);
+    // Split-then-name: match path B, apply rule C against path A, then turn the
+    // named pieces back into stored segments. Without a diarizer: today's insert.
+    let finalized = match decoded.assembly_b.as_mut() {
+        Some(b) => {
+            matched = voices::apply_matches(b, enrolled);
+            let parent: Vec<i64> = decoded.pieces.iter().map(|p| p.chunk as i64).collect();
+            let embedded: Vec<bool> = decoded.piece_embs.iter().map(Option::is_some).collect();
+            voices::rule_c(&decoded.assembly, b, &parent, &embedded);
+            Some(split::finalize(&decoded.merged, &decoded.embeddings, &decoded.pieces, b)?)
+        }
+        None => None,
+    };
+    Ok((matched, finalized))
+}
+
+fn transcribe_core(dir: &Path, audio_dir: &Path, opts: &PipelineOpts, mut managed: Option<&mut crate::recovery::Session>) -> Result<PipelineOutput> {
+    // The diarizer works in the session directory, as it always has.
+    let mut decoded = decode(dir, audio_dir, dir, opts, managed.as_ref().map(|session| &session.state))?;
 
     // Persist to the DB, then export. A storage failure must NOT discard the transcript: on error
     // we log and fall back to a synthetic row so the Markdown/JSON still get written.
@@ -485,27 +542,17 @@ fn transcribe_core(dir: &Path, audio_dir: &Path, opts: &PipelineOpts, mut manage
                 managed.as_deref_mut().context("keyed storage has no session")?.archive().await?
             } else { db::Db::open(&opts.db_path).await? };
             let enrolled = voices::decode_enrolled(&database.load_enrolled().await?)?;
-            let mut matched = voices::apply_matches(&mut assembly, &enrolled);
-            // Split-then-name: match path B, apply rule C against path A, then turn the
-            // named pieces back into stored segments. Without a diarizer: today's insert.
-            let finalized = match assembly_b.as_mut() {
-                Some(b) => {
-                    matched = voices::apply_matches(b, &enrolled);
-                    let parent: Vec<i64> = pieces.iter().map(|p| p.chunk as i64).collect();
-                    let embedded: Vec<bool> = piece_embs.iter().map(Option::is_some).collect();
-                    voices::rule_c(&assembly, b, &parent, &embedded);
-                    Some(split::finalize(&merged, &embeddings, &pieces, b)?)
-                }
-                None => None,
-            };
+            // Inside this block on purpose: a naming failure is a storage failure, and the
+            // transcript is still exported unstored below.
+            let (matched, finalized) = name_voices(&mut decoded, &enrolled)?;
             let (final_segs, final_asm): (&[transcript::TranscriptSegment], &voices::Assembly) = match &finalized {
                 Some((segs, asm)) => (segs, asm),
-                None => (&merged, &assembly),
+                None => (&decoded.merged, &decoded.assembly),
             };
             let id = if let Some(key) = &opts.session_key {
-                database.insert_keyed_meeting_with_voices(&meta, final_segs, &final_asm.clusters, &final_asm.voices, key).await?
+                database.insert_keyed_meeting_with_voices(&decoded.meta, final_segs, &final_asm.clusters, &final_asm.voices, key).await?
             } else {
-                database.insert_meeting_with_voices(&meta, final_segs, &final_asm.clusters, &final_asm.voices).await?
+                database.insert_meeting_with_voices(&decoded.meta, final_segs, &final_asm.clusters, &final_asm.voices).await?
             };
             #[cfg(test)]
             cutpoint("database_committed");
@@ -529,9 +576,12 @@ fn transcribe_core(dir: &Path, audio_dir: &Path, opts: &PipelineOpts, mut manage
                     );
                 }
                 log::info!(
-                    "far-end split: {split_reason} — {} meeting {id}, rolls split {rolls_split}/{rolls_far}{}",
+                    "far-end split: {} — {} meeting {id}, rolls split {}/{}{}",
+                    decoded.split_reason,
                     dir.display(),
-                    diarizer.as_ref().map(|d| format!(", {}", d.provenance())).unwrap_or_default()
+                    decoded.rolls_split,
+                    decoded.rolls_far,
+                    decoded.diarizer.as_ref().map(|d| format!(", {}", d.provenance())).unwrap_or_default()
                 );
                 Some((row, id, vocab, segments, speakers))
             }
@@ -553,9 +603,9 @@ fn transcribe_core(dir: &Path, audio_dir: &Path, opts: &PipelineOpts, mut manage
             (row, Some(id), render::render(&segments, &ids, &vocab))
         }
         None => (
-            synth_row(&meta, merged.len()),
+            synth_row(&decoded.meta, decoded.merged.len()),
             None,
-            render::render_fresh(&merged, &render::IdentityMap::empty(), &render::Vocab::empty()),
+            render::render_fresh(&decoded.merged, &render::IdentityMap::empty(), &render::Vocab::empty()),
         ),
     };
     if let Some(session) = managed.as_deref_mut()
@@ -574,9 +624,9 @@ fn transcribe_core(dir: &Path, audio_dir: &Path, opts: &PipelineOpts, mut manage
         stored_id,
         md_path,
         json_path,
-        meeting_secs,
-        wall_secs: wall,
-        rtf,
+        meeting_secs: decoded.meeting_secs,
+        wall_secs: decoded.wall,
+        rtf: decoded.rtf,
         capture_status: row.capture_status,
     })
 }
