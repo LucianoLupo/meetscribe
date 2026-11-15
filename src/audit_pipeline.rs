@@ -2101,3 +2101,26 @@ fn finalize_runs_the_pass_with_the_options_the_daemon_would_use() {
     assert_eq!((flagged.lang.as_str(), flagged.split, flagged.model.as_path()), ("en", false, Path::new("/synthetic/other.bin")));
     fs::remove_dir_all(fixture.root).unwrap();
 }
+
+/// The pass takes about half an hour, and the files were checked before it began. They are
+/// looked at again when it ends, before the transaction: a file edited meanwhile stops the
+/// replacement while the database still holds the live transcript.
+#[test]
+fn a_file_edited_during_the_pass_stops_the_replacement_before_it_starts() {
+    let (fixture, id) = promoted();
+    fs::write(fixture.root.join("holdpoint"), "decoding\n").unwrap();
+    let child = spawn_cli(&fixture, &finalize_argv(&fixture, id, &[]));
+    wait_for_owner(&fixture, "decoding");
+    let markdown = fixture.dir.join("transcript.md");
+    let edited = format!("{}\nmy own note\n", fs::read_to_string(&markdown).unwrap());
+    fs::write(&markdown, &edited).unwrap();
+    let before = untouched(&fixture);
+    fs::write(fixture.root.join("release-owner"), b"release\n").unwrap();
+    let output = child_output(&fixture, child);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(stderr_of(&output).contains("was changed since meetscribe wrote it"), "{}", stderr_of(&output));
+    assert_eq!(origin(&fixture), db::TranscriptOrigin::Live, "the rows were replaced although a file had been edited");
+    assert_eq!(untouched(&fixture), before);
+    assert_eq!(fs::read_to_string(&markdown).unwrap(), edited);
+    fs::remove_dir_all(fixture.root).unwrap();
+}
