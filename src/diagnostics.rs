@@ -289,6 +289,28 @@ mod tests {
     }
 
     #[test]
+    fn finalize_events_keep_their_numbers_and_never_carry_text() {
+        let event = |fields: Value| formatted(&log::Record::builder().target("meetscribe::event")
+            .args(format_args!("{fields}")).build(), "synthetic-run");
+        let session = "a6e79ba0314c4cc2b647f4d25b327011";
+        for name in ["finalize_started", "finalize_committed", "finalize_published"] {
+            let kept = event(json!({"component":"pipeline", "event":name, "session_id":session, "outcome":"ok",
+                "segments":682, "clusters":19, "text":"SYNTHETIC_PRIVATE_SENTENCE"}));
+            assert_eq!((kept["component"].as_str(), kept["event"].as_str(), kept["session_id"].as_str()), (Some("pipeline"), Some(name), Some(session)));
+            assert_eq!((kept["segments"].as_u64(), kept["clusters"].as_u64()), (Some(682), Some(19)), "{name}");
+            assert!(!kept.to_string().contains("SYNTHETIC_PRIVATE_SENTENCE"), "{name}");
+        }
+        // A failure is a class, with the guidance for that class, and may have no session yet.
+        let failed = event(json!({"component":"pipeline", "event":"finalize_failed", "outcome":"error", "error_class":"speaker_conflict"}));
+        assert_eq!((failed["event"].as_str(), failed["error_class"].as_str()), (Some("finalize_failed"), Some("speaker_conflict")));
+        assert!(failed["help"].is_string() && failed["session_id"].is_null());
+        // Text where the count of voices belongs withholds the whole event.
+        let withheld = event(json!({"component":"pipeline", "event":"finalize_committed", "session_id":session, "clusters":"SYNTHETIC_PRIVATE_SENTENCE"}));
+        assert_eq!(withheld["event"], "invalid_event");
+        assert!(!withheld.to_string().contains("SYNTHETIC_PRIVATE_SENTENCE"));
+    }
+
+    #[test]
     fn valid_fields_and_native_counts_survive_content_filtering() {
         let payload = json!({"component":"recovery", "event":"attempt_reserved",
             "session_id":"a6e79ba0314c4cc2b647f4d25b327011", "phase":"Ready", "attempt":2,

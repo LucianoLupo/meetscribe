@@ -506,3 +506,31 @@ fn a_publication_record_only_grows_and_stops_at_its_limit() {
     assert_eq!(record, full, "a refused append changes nothing, in either list");
     assert_eq!(record.markdown[0], hash(0), "the first hash is still there");
 }
+
+/// On a schema-v3 file every row reads as `batch` only because nothing marks it. That must never
+/// be taken for "a finalize committed here": `transcribe --resume` asks before it reserves, and
+/// `finalize` itself must leave such a database exactly as it found it.
+#[test]
+fn an_archive_that_marks_nothing_is_never_taken_for_an_unfinished_finalize() {
+    let (base, mut session) = stored_in_a_v3_archive();
+    let id = session.state.meeting_id.unwrap();
+    assert_eq!(crate::finalize::unfinished(&session.state), None, "without a record nothing is even asked");
+    let hash = "ab".repeat(32);
+    session.published_provisional(&recovery::Provisional::new(&session.dir, Some(hash.clone()), Some(hash))).unwrap();
+    assert_eq!(crate::finalize::unfinished(&session.state), None, "a v3 row is unmarked, not replaced");
+    assert_eq!(schema_version(&session.state), 3);
+
+    // `finalize <id>` on that database: the meeting is a batch transcript, so there is nothing
+    // to do, and the file is still v3 afterwards. The lookup never migrates.
+    let (database, state_file) = (session.state.db_path.clone(), session.dir.join(recovery::STATE_FILE));
+    let dir = session.dir.clone();
+    drop(session);
+    let before = (std::fs::read(&database).unwrap(), std::fs::read(&state_file).unwrap());
+    let argv: Vec<String> = [id.to_string(), "--db".into(), database.display().to_string(), "--base".into(), base.join("control").display().to_string()].into();
+    crate::finalize::run(&argv).expect("a batch meeting is already final");
+    assert_eq!((std::fs::read(&database).unwrap(), std::fs::read(&state_file).unwrap()), before);
+    let session = recovery::Session::open(&dir).unwrap().unwrap();
+    assert_eq!(schema_version(&session.state), 3, "finalize migrated a database it had nothing to do in");
+    drop(session);
+    std::fs::remove_dir_all(base).unwrap();
+}

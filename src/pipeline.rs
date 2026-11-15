@@ -532,6 +532,8 @@ pub(crate) type Named = (usize, Option<(Vec<transcript::TranscriptSegment>, voic
 /// The naming step: match the far-end voices against the enrolled voiceprints and, when the
 /// diarizer split the chunks, turn the named pieces back into the segments and clusters to store.
 pub(crate) fn name_voices(decoded: &mut Decoded, enrolled: &[spk::Enrolled]) -> Result<Named> {
+    #[cfg(test)]
+    anyhow::ensure!(!fault("naming_fails"), "synthetic naming failure");
     let mut matched = voices::apply_matches(&mut decoded.assembly, enrolled);
     // Split-then-name: match path B, apply rule C against path A, then turn the
     // named pieces back into stored segments. Without a diarizer: today's insert.

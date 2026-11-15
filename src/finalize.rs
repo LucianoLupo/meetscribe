@@ -34,6 +34,24 @@ use crate::{db, export, pipeline, recovery, render, status, voices};
 /// SQLite does the waiting; there is no retry loop here.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(60);
 
+#[cfg(test)]
+std::thread_local! { static TEST_BUSY_TIMEOUT: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) }; }
+/// A test shortens the wait so that "held past the timeout" does not take a minute.
+#[cfg(test)]
+pub(crate) fn test_busy_timeout(wait: Duration) { TEST_BUSY_TIMEOUT.set(Some(wait)); }
+
+fn busy_timeout() -> Duration {
+    #[cfg(test)]
+    if let Some(wait) = TEST_BUSY_TIMEOUT.get() { return wait; }
+    BUSY_TIMEOUT
+}
+
+/// The pass options a command line gives for a session: for the test that pins them to the daemon's.
+#[cfg(test)]
+pub(crate) fn options(argv: &[String], state: &recovery::State) -> Result<pipeline::PipelineOpts> {
+    Ok(pass_options(&parse(argv)?.context("no arguments parsed")?, state))
+}
+
 const USAGE: &str = "usage: meetscribe finalize <id>… | --all-live [--db <path>] [--base <dir>] [--session <dir>]\n\
     \x20                          [--drop-names] [--overwrite] [--lang <code>] [--model <ggml.bin>]\n\
     \x20                          [--speaker-model <onnx>] [--diarizer-model <gguf>] [--diarizer-bin <exe>] [--no-split]\n\
@@ -474,7 +492,7 @@ fn adopt(session: &mut Session, id: i64) -> Result<Provisional> {
 fn replace(session: &Session, id: i64, decoded: &mut pipeline::Decoded, drop_names: bool) -> Result<()> {
     let archive = session.state.archive_id.as_deref().context("the session is bound to no archive")?;
     let attempt: Result<()> = crate::new_runtime()?.block_on(async {
-        let mut database = db::Db::open_existing_patient(&session.state.db_path, archive, BUSY_TIMEOUT).await?;
+        let mut database = db::Db::open_existing_patient(&session.state.db_path, archive, busy_timeout()).await?;
         let stored = store(&mut database, id, decoded, drop_names).await;
         let closed = database.close().await;
         stored.and(closed)
