@@ -134,7 +134,8 @@ stream itself is left as it is.
 
 Retention treats a live-stored meeting like any other: with `[retention] sessions_days` above 0
 its audio is pruned on schedule, and after that the live text is the final transcript. Keep
-`sessions_days = 0`, or re-transcribe before the audio goes, if you want the full pass later.
+`sessions_days = 0`, or run `meetscribe finalize` before the audio goes, if you want the full
+pass later.
 
 Anything else falls back to the normal transcription **in the same attempt**. The log names why,
 without any meeting text:
@@ -156,8 +157,102 @@ grep 'live_promot' ~/.meetscribe/logs/meetscribe.err.log   # live_promoted / liv
 `live_promoted` carries `segments` (lines in the stream), `merged_segments` (stored, after joining
 neighbours the way the full pass does), `short_windows`, `audio_secs` and `wait_ms`.
 
-The Markdown line names `meetscribe finalize <id>`, the command that will replace a live
-transcript with the full one. It does not exist in this build and exits with an error.
+The Markdown line names `meetscribe finalize <id>`, the command that replaces a live transcript
+with the full one (next section).
+
+## Replacing a live transcript with the full one (`meetscribe finalize`)
+
+```
+meetscribe finalize <id>…        # one or more live-stored meetings
+meetscribe finalize --all-live   # every live-stored meeting, oldest first
+```
+
+Runs the full pass over the meeting's recording (whisper, the far-end voices, the names you have
+enrolled) and replaces the stored transcript under **the same meeting id**. `list` then shows the
+meeting as `batch`, and its Markdown loses the "provisional" line. Run it by hand, in the
+foreground, with no call in progress: it takes about as long as the pass after a call, and it
+refuses to start while `status.json` says a call is being recorded. It prints one line per
+meeting and never the transcript. For a schedule, one line of your own is enough:
+`meetscribe finalize --all-live 2>>~/.meetscribe/logs/finalize.log`.
+
+It reads its options where the daemon reads them (`[daemon] lang`, `[speakers] split`, the models
+installed under `~/.meetscribe`), so the result is what the daemon's own pass would have stored.
+`--lang`, `--model`, `--speaker-model`, `--diarizer-model`, `--diarizer-bin` and `--no-split`
+override them; `--db` and `--base` name another database and another `~/.meetscribe`.
+
+**Nothing is changed before the pass has finished.** `finalize` holds the session's lock, leaves
+the session complete, and keeps its temporary audio under `<base>/scratch/`, not in the session.
+If it is refused, fails, or is killed during the pass, the session directory and the database are
+exactly as they were, and the daemon has nothing to recover. (A killed run leaves its scratch
+directory, with a 16 kHz copy of the far-end audio, until the next `finalize` of that meeting.)
+
+**It replaces only transcript files it wrote.** When a live transcript is stored, the session
+state records the sha256 of the two published files. A vocabulary rule or `speakers cluster`
+after the call changes nothing about that. A file you edited is yours: `finalize` refuses, before
+the pass, and names it.
+
+| Flag | When |
+|---|---|
+| `--overwrite` | Replace the published files as they are now: you edited them, or the meeting was stored by a build that kept no record. The files found are recorded first, then the run is the normal one. |
+| `--drop-names` | A voice of the meeting was named by hand (`speakers label`, a manual `merge`). Replacing the transcript deletes those clusters **and their voiceprints**; without this flag `finalize` refuses. Names matched automatically are simply matched again. |
+| `--session <dir>` | The meeting was stored from a relative path, so its session directory has to be named. One meeting id only. |
+
+If it stops **after** the database was replaced, the database is right and the files are not yet:
+`export <id>` gives the full text, while the published Markdown still says "provisional". Nothing
+else finishes that for you. Run the same command again:
+
+| It stopped | What is on disk | Finished by |
+|---|---|---|
+| before the replacement (refused, failed, killed during the pass) | everything as before | `meetscribe finalize <id>`: the whole pass again |
+| after the replacement, before or between the two files | the meeting is `batch`; one or both files are still the live ones | `meetscribe finalize <id>`: it only publishes, and reads no audio |
+| after both files | everything is in place; one note in the session state is left | `meetscribe finalize <id>`: it only clears the note |
+
+While a meeting is in the middle state, `transcribe --resume` on its session is refused (it would
+publish a second copy under `.recovered/`), and retention keeps the session however old it is.
+A file that was edited in that state is left alone and named; `--overwrite` replaces it.
+
+A recording that retention already pruned cannot be transcribed again: `finalize <id>` says so
+and fails, and `--all-live` skips that meeting. A meeting that is already a full transcript is
+left as it is, with exit 0.
+
+Three older commands changed, each only for a live-stored meeting, so that none of them can write
+across a `finalize`:
+
+- `speakers label`, `unlabel`, `skip`, `merge`, `split`, `cluster` and `match` take the meeting's
+  session lock. While `finalize` runs on that meeting they are refused and change nothing; with
+  `--all`, the meeting is skipped and named and the rest are done. A live-stored meeting whose
+  stored path is relative needs `--session <dir>` for these too. `speakers rename` and every
+  meeting that is not live-stored are untouched.
+- `rerender --write` locks such a meeting before it compares and reads its rows again.
+- `transcribe --resume` refuses the middle state above, before it changes anything.
+
+`finalize` logs to stderr, like `transcribe` run by hand: `finalize_started`,
+`finalize_committed` (with `segments` and `clusters`), `finalize_published`, and
+`finalize_failed` with an `error_class`. The reason of a failure is said in words beside it and
+is not part of the JSON line. With stderr redirected as in the schedule line above:
+
+```
+grep '"finalize_' ~/.meetscribe/logs/finalize.log
+```
+
+Known limits:
+
+- Between reading a transcript file and replacing it, an editor that saves in that instant loses
+  its edit. Every meetscribe command that writes these files takes the session lock; an editor
+  does not.
+- A kill in the instant between writing a temporary file and renaming it leaves one
+  `.export-<hex>.tmp` or `.state-<hex>.tmp` in the directory, as on every path that publishes.
+  The files and the database are still right; that session is not pruned by retention until the
+  leftover is deleted by hand.
+- A session whose files were once rewritten by `rerender --write` is never pruned by retention,
+  before or after `finalize`.
+- When the first attempt to store a live transcript was interrupted, its files are published
+  under `.recovered/` and that copy is the one replaced. An older pair at the session root is left
+  with its provisional text and named; `rerender <id> --write` rewrites it.
+- A `finalize` started while the daemon transcribes another meeting runs two whisper passes at
+  once. Only a call being recorded is refused.
+- If a command was killed in the middle of writing the database, `finalize` reports that it
+  cannot read the file without writing to it. One `meetscribe list --db <path>` repairs it.
 
 ## Menu-bar tray (Phase 5) — `meetscribe tray`
 An optional, **separate** menu-bar app (its own process; the daemon is untouched). It reads

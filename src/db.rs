@@ -48,8 +48,10 @@ pub struct MeetingMeta {
 }
 
 /// Which pass produced the stored transcript. `Live` is the live lane's text stored at hangup:
-/// it has no far-end voices and can be replaced by the batch pass while the recording exists.
-/// Retention treats it like any stored meeting: once the audio is pruned it is the final text.
+/// it has no far-end voices, and `meetscribe finalize <id>` replaces it with the batch pass's,
+/// under the same meeting id, while the recording exists. A row goes from `Live` to `Batch` and
+/// never back. Retention treats a live meeting like any stored one: once the audio is pruned it
+/// is the final text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranscriptOrigin {
     Batch,
