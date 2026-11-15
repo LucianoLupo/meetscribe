@@ -148,6 +148,10 @@ pub(crate) enum PruneStep {
 /// 5. unlink while holding the lock. A writer that opened the file before this finds, once it
 ///    has the lock, that its file is not at the path any more, and opens the stream again.
 ///
+/// This is safe against a writer that takes the lock, which every reader of this tool does. It
+/// does not exclude something that swaps the file at the path without the lock in the instant
+/// between 4 and 5.
+///
 /// `at` is told when 1 and when 3 are done; tests rewrite or replace the stream there.
 fn prune_stream(path: &Path, key: &str, days: u64, now_epoch: i64, at: &mut impl FnMut(PruneStep, &Path)) -> bool {
     use std::os::fd::AsRawFd;

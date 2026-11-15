@@ -384,12 +384,17 @@ fn lag_ms(state: &State, written: SystemTime, t_end: f64, now: SystemTime) -> u6
         .map_or(0, |lag| lag.as_millis() as u64)
 }
 
-/// Whether the process that started this reader is no longer its parent. A child is given a
-/// new parent the moment its own dies, so the answer changes exactly then, and a later process
-/// that reuses the pid never becomes this one's parent. `None` (no `--owner-pid`) is never gone.
-fn owner_gone(owner_pid: Option<u32>) -> bool {
+/// This process's parent, as the kernel has it now.
+fn parent_pid() -> u32 {
     // SAFETY: getppid takes no argument, cannot fail and touches no memory.
-    owner_pid.is_some_and(|owner| i64::from(unsafe { libc::getppid() }) != i64::from(owner))
+    u32::try_from(unsafe { libc::getppid() }).unwrap_or(0)
+}
+
+/// Whether the process that started this reader (`--owner-pid`) is no longer its parent. A child
+/// is given a new parent the moment its own dies, so the answer changes exactly then, and a later
+/// process that reuses the pid never becomes this one's parent. `None` (no flag) is never gone.
+fn owner_gone(owner_pid: Option<u32>, parent: u32) -> bool {
+    owner_pid.is_some_and(|owner| owner != parent)
 }
 
 /// Follow the recording in `dir` until it ends. `decode` turns one 16 kHz window into
@@ -397,10 +402,24 @@ fn owner_gone(owner_pid: Option<u32>) -> bool {
 pub(crate) fn run_live(
     dir: &Path,
     opts: &LiveOpts,
+    decode: impl FnMut(&[f32], &str) -> Result<(String, f32)>,
+) -> Result<LiveSummary> {
+    run_live_under(dir, opts, decode, parent_pid)
+}
+
+/// [`run_live`], asking `parent` who this process's parent is. Tests change the answer mid-run:
+/// a daemon that dies during a call.
+fn run_live_under(
+    dir: &Path,
+    opts: &LiveOpts,
     mut decode: impl FnMut(&[f32], &str) -> Result<(String, f32)>,
+    parent: impl Fn() -> u32,
 ) -> Result<LiveSummary> {
     let (mut state, mut written) = read_state(dir).context("the session has no readable state yet")?;
     let key = state.key.clone();
+    // Before the stream is opened, because opening it empties it: a reader that lost its daemon
+    // while its model loaded must not wipe a stream another reader of this meeting completed.
+    anyhow::ensure!(!owner_gone(opts.owner_pid, parent()), "the daemon that started this reader is gone; the stream was left as it is");
     let mut stream = StreamWriter::create(&opts.out_dir, &key, opts.print)?;
     stream.event(StreamEvent::MeetingStarted {
         key: key.clone(), app: detect::app_label(&state.app).into(), started_at: state.started_at,
@@ -417,7 +436,7 @@ pub(crate) fn run_live(
         // reading or decoding what is left. Nothing corrects `status.json` after a daemon is
         // killed, so the stalled rule below can wait for ever; and a recording whose daemon died
         // is cut short, so its stream could not be stored anyway (`promote.rs`: `capture_partial`).
-        if owner_gone(opts.owner_pid) { break "stalled"; }
+        if owner_gone(opts.owner_pid, parent()) { break "stalled"; }
         // A state file is replaced atomically, so a failed read is a transient race at worst.
         if let Ok((fresh, fresh_written)) = read_state(dir) {
             if fresh.key != key { bail!("the session directory now belongs to another recording"); }
@@ -1011,11 +1030,6 @@ mod tests {
         pid
     }
 
-    fn own_parent() -> u32 {
-        // SAFETY: getppid takes no argument and cannot fail.
-        (unsafe { libc::getppid() }) as u32
-    }
-
     /// Run a reader on its own thread, so a test can tell "still following" from "ended".
     fn follow(dir: &Path, opts: LiveOpts) -> std::sync::mpsc::Receiver<Result<LiveSummary>> {
         let (done, ended) = std::sync::mpsc::channel();
@@ -1024,15 +1038,74 @@ mod tests {
         ended
     }
 
+    /// As [`follow`], with `parent` answering for this process's parent.
+    fn follow_under(dir: &Path, opts: LiveOpts, parent: impl Fn() -> u32 + Send + 'static) -> std::sync::mpsc::Receiver<Result<LiveSummary>> {
+        let (done, ended) = std::sync::mpsc::channel();
+        let dir = dir.to_path_buf();
+        std::thread::spawn(move || done.send(run_live_under(&dir, &opts, |_, _| Ok((String::new(), 0.0)), parent)));
+        ended
+    }
+
+    /// Wait until a reader has started its stream: from then on it is in its loop.
+    fn following(opts: &LiveOpts, key: &str) {
+        let stream = opts.out_dir.join(format!("{key}.jsonl"));
+        let waiting = Instant::now();
+        while !std::fs::metadata(&stream).is_ok_and(|file| file.len() > 0) {
+            assert!(waiting.elapsed() < Duration::from_secs(20), "the reader never started its stream");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// A daemon killed during a call leaves `status.json` at `recording` for ever, so the
     /// stalled rule alone never stops its reader. The reader started with `--owner-pid` stops
-    /// on its next turn: with the checkpoint fresh, and without reading the audio that is left.
+    /// at the top of the turn after its daemon died: with the checkpoint fresh, and without
+    /// reading the audio that is left.
     #[test]
-    fn a_reader_whose_daemon_is_gone_stops_at_once_whatever_the_status_file_says() {
+    fn a_reader_whose_daemon_dies_stops_on_its_next_turn_whatever_the_status_file_says() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         let root = temp_root("owner");
         let dir = root.join("recording");
         let mut session = recovery::Session::begin(&dir, &root.join("archive.db"), &dir,
             "com.google.Chrome", "Owner fixture", 1_762_880_000).unwrap();
+        session.start_roll(0, 16_000, 0.0).unwrap();
+        let dir = session.dir.clone();
+        // 65 s committed: a reader takes at most 30 s per turn, so the turns can be counted.
+        let (mut mic, mut system) = (wav(&dir.join("mic.wav"), 16_000), wav(&dir.join("system.wav"), 16_000));
+        for _ in 0..65 * 16_000 { mic.write_sample(0.0f32).unwrap(); system.write_sample(0.0f32).unwrap(); }
+        mic.flush().unwrap(); system.flush().unwrap();
+        session.checkpoint(0, 65 * 16_000, 65 * 16_000).unwrap();
+        recording_status(&root.join("base"));
+
+        // The daemon (pid 4242 here) is the parent when the reader starts and for its first turn,
+        // and is gone when the second turn begins.
+        let mut owned = opts(&root);
+        owned.owner_pid = Some(4242);
+        let asked = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&asked);
+        let ended = follow_under(&dir, owned, move || if counter.fetch_add(1, Ordering::SeqCst) < 2 { 4242 } else { 1 });
+        let summary = ended.recv_timeout(Duration::from_secs(60))
+            .expect("a reader whose daemon died went on following the recording").unwrap();
+        assert_eq!(summary.reason, "stalled");
+        assert!((summary.audio_secs - 30.0).abs() < 1e-6, "one turn of 30 s was read before the daemon died, got {}", summary.audio_secs);
+        assert_eq!(asked.load(Ordering::SeqCst), 3, "asked before the stream, and at the top of each of two turns");
+        let lines = events(&summary.stream);
+        assert_eq!((lines.first().unwrap()["type"].as_str(), lines.last().unwrap()["type"].as_str()), (Some("meeting_started"), Some("meeting_ended")));
+        assert_eq!(lines.last().unwrap()["reason"], "stalled");
+        drop((mic, system));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A reader can lose its daemon while its model loads, before it has opened anything.
+    /// Opening a stream empties it, so such a reader stops before that: a stream another reader
+    /// of the same meeting completed meanwhile stays as it is. With its daemon alive (this
+    /// test's own parent stands in, through the real `getppid`) the same reader waits, and
+    /// follows the recording to its end.
+    #[test]
+    fn a_reader_that_starts_without_its_daemon_touches_no_stream() {
+        let root = temp_root("orphan");
+        let dir = root.join("recording");
+        let mut session = recovery::Session::begin(&dir, &root.join("archive.db"), &dir,
+            "com.google.Chrome", "Orphan fixture", 1_762_880_000).unwrap();
         session.start_roll(0, 16_000, 0.0).unwrap();
         let dir = session.dir.clone();
         let (mut mic, mut system) = (wav(&dir.join("mic.wav"), 16_000), wav(&dir.join("system.wav"), 16_000));
@@ -1043,22 +1116,20 @@ mod tests {
 
         let mut orphan = opts(&root);
         orphan.owner_pid = Some(gone_pid());
-        let summary = follow(&dir, orphan).recv_timeout(Duration::from_secs(5))
-            .expect("a reader whose daemon is gone went on following the recording").unwrap();
-        assert_eq!(summary.reason, "stalled");
-        assert_eq!(summary.audio_secs, 0.0, "it read committed audio after its daemon was gone");
-        let lines = events(&summary.stream);
-        assert_eq!(lines.iter().map(|line| line["type"].as_str().unwrap()).collect::<Vec<_>>(), ["meeting_started", "meeting_ended"]);
-        assert_eq!(lines[1]["reason"], "stalled");
+        let stream = orphan.out_dir.join(format!("{}.jsonl", session.state.key));
+        recovery::private_dir(&orphan.out_dir).unwrap();
+        std::fs::write(&stream, "a stream another reader completed\n").unwrap();
+        assert!(run_live(&dir, &orphan, |_, _| Ok((String::new(), 0.0))).is_err(), "a reader with no daemon followed the recording");
+        assert_eq!(std::fs::read_to_string(&stream).unwrap(), "a stream another reader completed\n");
 
-        // With its daemon alive (this test's own parent stands in) the same reader waits, and
-        // follows the recording to its end.
         let mut owned = opts(&root);
-        owned.owner_pid = Some(own_parent());
-        let ended = follow(&dir, owned);
+        owned.out_dir = root.join("live-owned");
+        owned.owner_pid = Some(parent_pid());
+        let ended = follow(&dir, owned.clone());
+        following(&owned, &session.state.key);
         assert!(ended.recv_timeout(Duration::from_millis(1200)).is_err(), "a reader whose daemon is alive stopped during the call");
         session.finish_capture(0.5, 0.1).unwrap();
-        let summary = ended.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+        let summary = ended.recv_timeout(Duration::from_secs(20)).unwrap().unwrap();
         assert_eq!(summary.reason, "ended");
         assert!((summary.audio_secs - 0.5).abs() < 1e-6);
         drop((mic, system));
@@ -1077,8 +1148,9 @@ mod tests {
         let dir = session.dir.clone();
         recording_status(&root.join("base"));
         let mut owned = opts(&root);
-        owned.owner_pid = Some(own_parent());
-        let ended = follow(&dir, owned);
+        owned.owner_pid = Some(parent_pid());
+        let ended = follow(&dir, owned.clone());
+        following(&owned, &session.state.key);
         assert!(ended.recv_timeout(Duration::from_millis(1200)).is_err(), "a recording with no roll yet was taken as ended");
         // Capture starts, writes and ends.
         session.start_roll(0, 16_000, 0.0).unwrap();
@@ -1087,7 +1159,7 @@ mod tests {
         mic.flush().unwrap(); system.flush().unwrap();
         session.checkpoint(0, 8_000, 8_000).unwrap();
         session.finish_capture(0.5, 0.1).unwrap();
-        let summary = ended.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+        let summary = ended.recv_timeout(Duration::from_secs(20)).unwrap().unwrap();
         assert_eq!(summary.reason, "ended");
         assert!((summary.audio_secs - 0.5).abs() < 1e-6);
         drop((mic, system));

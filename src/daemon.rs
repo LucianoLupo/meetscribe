@@ -1395,6 +1395,25 @@ mod tests {
         })))
     }
     fn sleeper() -> LiveReader { reader_running("/bin/sleep", &["60"]) }
+
+    /// A reader that writes its process id into `pid_file` and then sleeps, for a test that must
+    /// look at the process after the owner has let go of it.
+    fn announcing_sleeper(pid_file: PathBuf) -> LiveReader {
+        LiveReader::new(Some(Box::new(move |_: &Path| {
+            let mut command = std::process::Command::new("/bin/sh");
+            command.args(["-c", "echo $$ > \"$0\"; exec sleep 60"]).arg(&pid_file);
+            command
+        })))
+    }
+
+    fn announced_pid(pid_file: &Path) -> u32 {
+        let waiting = Instant::now();
+        loop {
+            if let Some(pid) = std::fs::read_to_string(pid_file).ok().and_then(|text| text.trim().parse().ok()) { return pid; }
+            assert!(waiting.elapsed() < Duration::from_secs(20), "the reader never announced itself");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
     fn unspawnable() -> LiveReader { reader_running("/nonexistent-meetscribe-reader-xyz", &[]) }
 
     fn pid_of(reader: &LiveReader) -> u32 { reader.running.as_ref().expect("a reader is held").child.id() }
@@ -1622,25 +1641,32 @@ mod tests {
     #[test]
     fn a_failed_capture_stops_the_reader_on_both_error_paths() {
         let failing = call("rq-fail", LIVE_ON);
-        let mut reader = sleeper();
-        let error = record_and_queue(&failing.cfg, "com.google.Chrome", &failing.jobs, &failing.board, &mut reader,
-            |_, _, _| anyhow::bail!("synthetic capture failure")).unwrap_err();
+        let pid_file = failing.base.join("reader.pid");
+        let mut reader = announcing_sleeper(pid_file.clone());
+        let error = record_and_queue(&failing.cfg, "com.google.Chrome", &failing.jobs, &failing.board, &mut reader, |_, _, _| {
+            announced_pid(&pid_file); // the reader is running when capture fails
+            anyhow::bail!("synthetic capture failure")
+        }).unwrap_err();
         assert!(format!("{error:#}").contains("synthetic capture failure"));
-        assert!(reader.running.is_none(), "the reader of a failed capture was left running");
+        assert!(reader.running.is_none(), "the reader of a failed capture is still held");
+        assert!(!exists(announced_pid(&pid_file)), "the reader of a failed capture was left running");
         assert!(failing.queued.try_recv().is_err());
         assert_eq!(crate::recovery::State::read(&session_of(&failing)).unwrap().phase, crate::recovery::Phase::NeedsAttention);
         std::fs::remove_dir_all(&failing.base).unwrap();
 
         // The capture ran, and the state that says so cannot be saved (the directory is gone).
         let unsaved = call("rq-unsaved", LIVE_ON);
-        let mut reader = sleeper();
+        let pid_file = unsaved.base.join("reader.pid");
+        let mut reader = announcing_sleeper(pid_file.clone());
         let outcome = record_and_queue(&unsaved.cfg, "com.google.Chrome", &unsaved.jobs, &unsaved.board, &mut reader, |dir, _, managed| {
+            announced_pid(&pid_file);
             let summary = captured(managed, 30.0)?;
             std::fs::remove_dir_all(dir)?;
             Ok(summary)
         });
         assert!(outcome.is_err(), "the end of the capture was saved into a directory that is gone");
-        assert!(reader.running.is_none(), "the reader was left running after the capture's end could not be saved");
+        assert!(reader.running.is_none(), "the reader is still held after the capture's end could not be saved");
+        assert!(!exists(announced_pid(&pid_file)), "the reader was left running after the capture's end could not be saved");
         assert!(unsaved.queued.try_recv().is_err());
         std::fs::remove_dir_all(&unsaved.base).unwrap();
     }

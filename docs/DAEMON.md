@@ -135,22 +135,25 @@ reader writes the meeting's text to `~/.meetscribe/live/<session key>.jsonl`; re
 meetscribe live tail --follow      # moves to the next call's stream by itself
 ```
 
-The reader only reads what capture has already checkpointed. It is a separate process, a failure
-to start it is logged and the recording goes on, and nothing about a recording waits for it.
+The reader only reads what capture has already checkpointed. It is a separate process, and a
+failure to start it is logged and the recording goes on. A recording never waits for its own
+reader; the one wait is for the previous call's reader to end (below).
 
 - **One reader at a time.** It outlives the call to finish its last windows. It is ended by its
   own exit, 300 s after hangup (checked at each idle poll: 1.5 s, or up to 30 s while a capture
   keeps failing to start), by the next call, or when the daemon stops. When two calls are less
-  than 300 s apart, ending the first reader costs one kill before the second call's capture
+  than 300 s apart, the first reader is killed and waited for before the second call's capture
   starts.
 - **A reader whose daemon was killed stops by itself** (`--owner-pid`): on its next turn, without
-  decoding what is left. That recording was cut short, so its stream is never stored.
+  decoding what is left, or before it opens its stream if the daemon was already gone. That
+  recording was cut short, so its stream is never stored.
 - **A hand-started `meetscribe live watch` is not needed any more**, and the two do not mix:
-  whichever reader takes a meeting's stream first writes it and the other one fails for that
-  meeting. Stop the hand-started one. A reader started by hand has no `--owner-pid`: after a
-  daemon is killed during a call it can wait for ever, and needs a restart.
-- **`daemon --once`** stops its reader as soon as the call ends, so that one meeting is never
-  stored from its live stream: it gets the normal transcription.
+  while one reader writes a meeting's stream the other is refused for that meeting, and a
+  reader that starts after the first has finished starts the stream again from nothing. Stop
+  the hand-started one. A reader started by hand has no `--owner-pid`: after a daemon is killed
+  during a call it can wait for ever, and needs a restart.
+- **`daemon --once`** stops its reader as soon as the call ends. That meeting gets the normal
+  transcription, unless its reader had already finished the stream by then.
 - A capture that cannot start (a missing permission, a route that dropped) starts a reader and
   stops it at once, on every retry.
 

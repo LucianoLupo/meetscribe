@@ -198,7 +198,8 @@ Stated plainly, so nothing surprises you later.
   off by default.
 - **A transcript stored from the live stream can be upgraded later.** With
   `[live] promote = true` as well, a live transcript that covers the whole recording is
-  stored as the meeting the moment the call ends, and the long pass does not run (anything
+  stored as the meeting once the call has ended and its reader has finished (seconds, when
+  no earlier meeting is still being transcribed), and the long pass does not run (anything
   less gets the long pass as before; see [`docs/DAEMON.md`](docs/DAEMON.md)). A meeting stored
   that way has the words and no voices, and `meetscribe list` marks it `live`.
   `meetscribe finalize <id>` runs the full pass over its recording and replaces it under the
