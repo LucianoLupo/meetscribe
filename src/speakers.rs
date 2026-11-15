@@ -525,7 +525,6 @@ fn cluster_meetings(rt: &tokio::runtime::Runtime, db_path: &Path, session: Optio
         } else {
             ids
         };
-        let enrolled = voices::decode_enrolled(&db.load_enrolled().await?)?;
         let (mut done, mut skipped) = (0usize, Vec::<String>::new());
         for mid in wanted {
             // Held for this meeting's reads, its minutes of embedding and its write. With --all a
@@ -539,6 +538,9 @@ fn cluster_meetings(rt: &tokio::runtime::Runtime, db_path: &Path, session: Optio
                 }
                 Err(error) => return Err(error),
             };
+            // Read per meeting, after the lock: `finalize --drop-names` deletes voiceprints, and a
+            // list read before it would name the new clusters from prints that are gone.
+            let enrolled = voices::decode_enrolled(&db.load_enrolled().await?)?;
             let Some(row) = db.get_meeting(mid).await? else {
                 skipped.push(format!("{mid}: no such meeting"));
                 continue;
@@ -620,7 +622,6 @@ fn match_meetings(rt: &tokio::runtime::Runtime, db_path: &Path, session: Option<
         } else {
             ids
         };
-        let enrolled = voices::decode_enrolled(&db.load_enrolled().await?)?;
         let (mut assigned, mut cleared, mut kept) = (0usize, 0usize, 0usize);
         for mid in wanted {
             let _lock = match live_lock(&mut db, db_path, mid, session).await {
@@ -631,6 +632,7 @@ fn match_meetings(rt: &tokio::runtime::Runtime, db_path: &Path, session: Option<
                 }
                 Err(error) => return Err(error),
             };
+            let enrolled = voices::decode_enrolled(&db.load_enrolled().await?)?;
             for c in db.list_clusters(mid).await? {
                 // Manual names and deliberate unknowns are the owner's; only auto/unnamed move.
                 if c.assigned_by.as_deref() == Some("manual") || c.skipped {

@@ -302,26 +302,53 @@ fn open_meeting_session(db_path: &Path, id: i64, row: &db::MeetingRow, given: Op
     Ok(Ok(session))
 }
 
-/// The meeting behind a session whose `finalize` committed and has not published yet: the state
-/// still carries the record, and the database already says `batch`. `transcribe --resume` and the
-/// daemon's own visit ask this before they reserve anything, because recovery would publish that
-/// meeting a second time under `.recovered/` and leave the provisional files where they are.
+/// Whether a session's `finalize` committed and has not published yet.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Pending {
+    /// No: there is no record, or the archive is not there to say otherwise (missing, another
+    /// archive, an older schema that marks nothing). The caller does what it always did.
+    No,
+    /// Yes: the state still carries the record and the database already says `batch`.
+    Unfinished(i64),
+    /// The database was there and in use by another process for as long as this waited.
+    Unknown,
+}
+
+/// `transcribe --resume` and the daemon's own visit ask this before they reserve anything:
+/// recovery would publish a replaced meeting a second time under `.recovered/` and leave the
+/// provisional files where they are.
 ///
-/// Read-only and silent: no migration, no state save, and any failure to read (an archive that is
-/// missing, foreign or older) is "no": the caller then does exactly what it did before.
-pub(crate) fn unfinished(state: &recovery::State) -> Option<i64> {
-    state.provisional()?;
-    let archive = state.archive_id.as_deref()?;
-    crate::new_runtime().ok()?.block_on(async {
-        let mut database = db::Db::open_read_only(&state.db_path).await.ok()?;
+/// Read-only and silent: no migration, no state save. A database that cannot answer at all is
+/// `No`, so a session whose archive is missing or foreign goes the way it always went. A
+/// database that is merely locked is `Unknown`: guessing "no" there would let recovery through
+/// in the one case it must not pass.
+pub(crate) fn unfinished(state: &recovery::State) -> Pending {
+    if state.provisional().is_none() { return Pending::No; }
+    let (Some(archive), Ok(runtime)) = (state.archive_id.as_deref(), crate::new_runtime()) else { return Pending::No };
+    let read: Result<Option<i64>> = runtime.block_on(async {
+        let mut database = db::Db::open_read_only_within(&state.db_path, probe_timeout()).await?;
         let found = async {
-            if database.archive_id().await.ok()? != archive { return None; }
-            let id = database.ingest_id(&state.key).await.ok()??;
-            (database.recorded_origin(id).await.ok()? == Some(db::TranscriptOrigin::Batch)).then_some(id)
+            if database.archive_id().await? != archive { return anyhow::Ok(None); }
+            let Some(id) = database.ingest_id(&state.key).await? else { return Ok(None) };
+            Ok((database.recorded_origin(id).await? == Some(db::TranscriptOrigin::Batch)).then_some(id))
         }.await;
         let _ = database.close().await;
         found
-    })
+    });
+    match read {
+        Ok(Some(id)) => Pending::Unfinished(id),
+        Ok(None) => Pending::No,
+        Err(error) if db::in_use(&error) => Pending::Unknown,
+        Err(_) => Pending::No,
+    }
+}
+
+/// How long the question above waits on a locked database: sqlx's own default, unless a test
+/// shortened it.
+fn probe_timeout() -> Option<Duration> {
+    #[cfg(test)]
+    if let Some(wait) = TEST_BUSY_TIMEOUT.get() { return Some(wait); }
+    None
 }
 
 fn finalize_meeting(args: &Args, id: i64, key: &mut Option<String>) -> Result<Outcome> {
@@ -337,8 +364,6 @@ fn finalize_meeting(args: &Args, id: i64, key: &mut Option<String>) -> Result<Ou
         Err(_) => bail!("'{}' holds no session of meeting {id}; name its session directory with --session", row.source_dir),
     };
     *key = Some(session.state.key.clone());
-    ensure!(session.state.phase == Phase::Complete,
-        "the session of meeting {id} is not complete; finish it with `meetscribe transcribe {} --resume` first", session.dir.display());
     // Under the lock now: this read of the origin is the one that decides.
     let seen = facts(&args.db_path, id, None)?;
     let row = seen.row.with_context(|| format!("meeting {id} vanished from {}", args.db_path.display()))?;
@@ -347,6 +372,9 @@ fn finalize_meeting(args: &Args, id: i64, key: &mut Option<String>) -> Result<Ou
 
     if row.origin == db::TranscriptOrigin::Batch {
         // Already replaced. With a record, an earlier run stopped after its commit: publish.
+        // Whatever phase the session is in: `transcribe --resume` refuses such a session, so if
+        // something moved it off `Complete` meanwhile (a resume while its archive was away),
+        // this command is the only one left that can finish it, and the last save completes it.
         return match record {
             Some(record) => {
                 let record = if args.overwrite { adopt(&mut session, id)? } else { record };
@@ -356,6 +384,8 @@ fn finalize_meeting(args: &Args, id: i64, key: &mut Option<String>) -> Result<Ou
         };
     }
 
+    ensure!(session.state.phase == Phase::Complete,
+        "the session of meeting {id} is not complete; finish it with `meetscribe transcribe {} --resume` first", session.dir.display());
     ensure!(!status::call_is_live(&args.base), "a call is being recorded; run `meetscribe finalize {id}` when it has ended");
     let scratch = safe_scratch(&args.base, &session)?;
     ensure!(args.drop_names || seen.manual_names == 0,
@@ -406,8 +436,11 @@ fn safe_scratch(base: &Path, session: &Session) -> Result<PathBuf> {
     let base = std::fs::canonicalize(base).with_context(|| format!("--base {} is not a directory", base.display()))?;
     let scratch = base.join("scratch");
     let publication = session.state.publication.as_deref().map(|dir| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()));
-    ensure!(!scratch.starts_with(&session.dir) && !publication.is_some_and(|dir| scratch.starts_with(dir)),
-        "{} is inside the session of the meeting; pass a --base outside it", scratch.display());
+    // Neither may hold the other: scratch inside the session would be written into it, and a
+    // session inside scratch could be taken for a leftover of an earlier run and removed.
+    let overlaps = |dir: &Path| scratch.starts_with(dir) || dir.starts_with(&scratch);
+    ensure!(!overlaps(&session.dir) && !publication.is_some_and(|dir| overlaps(&dir)),
+        "{} and the session of the meeting are inside one another; pass a --base apart from the session", scratch.display());
     match std::fs::symlink_metadata(&scratch) {
         Ok(found) => ensure!(found.file_type().is_dir(),
             "{} is not a real directory (a symlink or a file is in its place); finalize keeps temporary audio there and does not follow it", scratch.display()),
@@ -560,6 +593,9 @@ fn publish(session: &mut Session, id: i64, mut record: Provisional) -> Result<(i
     #[cfg(test)]
     pipeline::cutpoint("finalize_hashes_saved");
 
+    // An absent file is simply written, and so is an absent directory: the recorded place may
+    // have been removed by hand. Only here, after the commit; nothing is created before it.
+    recovery::private_dir(&record.dir)?;
     place(&record.dir.join("transcript.md"), &pair.markdown, &record.markdown, id)?;
     #[cfg(test)]
     pipeline::cutpoint("finalize_markdown_replaced");

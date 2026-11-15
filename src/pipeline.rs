@@ -151,9 +151,14 @@ pub(crate) fn transcribe_with_clock(dir: &Path, opts: &PipelineOpts, promote_liv
     actual.title = Some(managed.state.title.clone());
     // Before anything is reserved or saved: a meeting `finalize` already replaced in the database
     // is finished by `finalize`, not recovered here.
-    if let Some(id) = crate::finalize::unfinished(&managed.state) {
-        anyhow::bail!("meeting {id} was replaced by `meetscribe finalize` and its transcript files are not published yet; \
-            `meetscribe finalize {id}` finishes it. Nothing was changed");
+    match crate::finalize::unfinished(&managed.state) {
+        crate::finalize::Pending::No => {}
+        crate::finalize::Pending::Unfinished(id) => anyhow::bail!(
+            "meeting {id} was replaced by `meetscribe finalize` and its transcript files are not published yet; \
+             `meetscribe finalize {id}` finishes it. Nothing was changed"),
+        crate::finalize::Pending::Unknown => anyhow::bail!(
+            "the database of this session is in use by another process, so it cannot be told whether `meetscribe finalize` \
+             left the meeting half published. Nothing was changed; run this again"),
     }
     managed.reserve(now(), opts.resume)?;
     let result = (|| {

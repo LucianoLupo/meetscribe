@@ -223,8 +223,14 @@ across a `finalize`:
   `--all`, the meeting is skipped and named and the rest are done. A live-stored meeting whose
   stored path is relative needs `--session <dir>` for these too. `speakers rename` and every
   meeting that is not live-stored are untouched.
-- `rerender --write` locks such a meeting before it compares and reads its rows again.
-- `transcribe --resume` refuses the middle state above, before it changes anything.
+- `rerender --write` locks such a meeting before it compares and reads its rows again. A
+  live-stored meeting whose session is not at its stored path cannot be locked and is skipped.
+- `transcribe --resume` refuses the middle state above, before it changes anything. If the
+  database is locked by another process at that moment it cannot tell, and refuses too: run it
+  again.
+
+A meeting in the middle state is finished by `finalize <id>` whatever happened to its session in
+between (for instance a `--resume` tried while the database file was away).
 
 `finalize` logs to stderr, like `transcribe` run by hand: `finalize_started`,
 `finalize_committed` (with `segments` and `clusters`), `finalize_published`, and

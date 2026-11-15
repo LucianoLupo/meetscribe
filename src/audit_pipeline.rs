@@ -1861,8 +1861,99 @@ fn transcribe_goes_on_as_before_unless_a_finalize_is_unfinished() {
         assert_eq!(resumed.status.code(), Some(1), "foreign={foreign}");
         let state = fixture.state();
         assert_eq!((state.phase, state.error_class.as_deref()), (recovery::Phase::NeedsAttention, Some("archive_identity")), "foreign={foreign}: not today's path");
+
+        // The archive is put back. The session is no longer `Complete`, `--resume` now refuses
+        // it, and `finalize` is the one command that can still finish the meeting: it does.
+        fs::rename(fixture.root.join("moved.db"), &fixture.opts.db_path).unwrap();
+        let before = untouched(&fixture);
+        let resumed = child_output(&fixture, spawn_cli(&fixture, &resume_argv(&fixture)));
+        assert_eq!(resumed.status.code(), Some(1), "foreign={foreign}");
+        assert_eq!(untouched(&fixture), before, "foreign={foreign}: a refused --resume changed something");
+        forbid_engine(&fixture);
+        let output = finalize(&fixture, id, &[]);
+        assert!(output.status.success(), "foreign={foreign}: a replaced meeting could not be finished: {}", stderr_of(&output));
+        assert_finalized(&fixture, id, &state);
         fs::remove_dir_all(fixture.root).unwrap();
     }
+}
+
+/// The question "did a finalize stop half way here?" is asked of the database. Locked, it has
+/// no answer yet, and "no" would let recovery reserve the session and publish a second copy.
+#[test]
+fn transcribe_resume_does_not_guess_while_the_database_is_locked() {
+    let (fixture, id) = promoted();
+    let state = fixture.state();
+    finalize_killed_at(&fixture, id, "finalize_committed", &[]);
+    fs::write(fixture.root.join("busy-timeout-ms"), "200\n").unwrap();
+    let before = untouched(&fixture);
+    let (runtime, mut other) = connection(&fixture);
+    runtime.block_on(sqlx::query("BEGIN EXCLUSIVE").execute(&mut other)).unwrap();
+    let resumed = child_output(&fixture, spawn_cli(&fixture, &resume_argv(&fixture)));
+    runtime.block_on(sqlx::query("ROLLBACK").execute(&mut other)).unwrap(); runtime.block_on(other.close()).unwrap();
+    assert_eq!(resumed.status.code(), Some(1), "{resumed:?}");
+    assert_eq!(untouched(&fixture), before, "the session was reserved without knowing");
+    assert!(!fixture.dir.join(".recovered").exists());
+    forbid_engine(&fixture);
+    let output = finalize(&fixture, id, &[]);
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert_finalized(&fixture, id, &state);
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+/// A run clears the scratch directories earlier runs of the same meeting left. A session that
+/// sits inside the scratch place must never be taken for one: it is refused before anything.
+#[test]
+fn a_session_inside_the_scratch_place_is_refused_and_left_alone() {
+    let (first, _) = promoted();
+    let inside = session_at(&first, first.base.join("scratch").join("recording"));
+    write_stream(&inside, &stream_events(&inside));
+    assert!(child_output(&inside, spawn_cli(&inside, &promote_argv(&inside, &inside.job()))).status.success());
+    let id = meeting_of(&inside).id;
+    let before = untouched(&inside);
+    let output = finalize(&inside, id, &[]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(stderr_of(&output).contains("inside one another"), "{}", stderr_of(&output));
+    assert_eq!(untouched(&inside), before);
+    assert_eq!(meeting_of(&inside).origin, db::TranscriptOrigin::Live);
+    fs::remove_dir_all(first.root).unwrap();
+}
+
+/// The directory a meeting was published in can be removed by hand while the recording stays.
+/// The files are then simply absent, the run goes on, and after the commit the directory is
+/// made again; otherwise every later run would fail at the same place.
+#[test]
+fn a_publication_directory_removed_by_hand_is_made_again_after_the_commit() {
+    for after_the_commit in [false, true] {
+        let (fixture, id) = promoted_on_a_retry("live_committed");
+        let state = fixture.state();
+        let publication = state.publication.clone().unwrap();
+        if after_the_commit { finalize_killed_at(&fixture, id, "finalize_committed", &[]); forbid_engine(&fixture); }
+        fs::remove_dir_all(&publication).unwrap();
+        let output = finalize(&fixture, id, &[]);
+        assert!(output.status.success(), "after_the_commit={after_the_commit}: {}", stderr_of(&output));
+        assert_finalized(&fixture, id, &state);
+        fs::remove_dir_all(fixture.root).unwrap();
+    }
+}
+
+/// A live transcript always has a session. When it is not at the path the meeting was stored
+/// from, `rerender --write` cannot take its lock, and a `finalize --session` may hold it: the
+/// meeting is skipped, not rewritten without the lock.
+#[test]
+fn rerender_leaves_a_live_meeting_alone_when_its_session_is_not_where_it_was_stored() {
+    let (fixture, id) = promoted();
+    let elsewhere = fixture.root.join("elsewhere");
+    recovery::private_dir(&elsewhere).unwrap();
+    for name in ["transcript.md", "transcript.json"] { fs::copy(fixture.dir.join(name), elsewhere.join(name)).unwrap(); }
+    sql(&fixture, &[&format!("UPDATE meetings SET source_dir = '{}'", elsewhere.display())]);
+    add_rule(&fixture, "live", "LIVERULE"); // a rewrite would be due
+    let before = session_snapshot(&elsewhere);
+    let argv: Vec<String> = ["rerender", &id.to_string(), "--db", fixture.opts.db_path.to_str().unwrap(), "--write"].into_iter().map(String::from).collect();
+    let output = child_output(&fixture, spawn_cli(&fixture, &argv));
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("0 to change · 0 already current · 1 skipped"), "{}", String::from_utf8_lossy(&output.stdout));
+    assert_eq!(session_snapshot(&elsewhere), before, "a live meeting was rewritten without its session lock");
+    fs::remove_dir_all(fixture.root).unwrap();
 }
 
 fn speakers(fixture: &Fixture, args: &[&str]) -> Result<()> {
@@ -1990,7 +2081,11 @@ fn a_naming_failure_in_the_batch_pass_still_ends_in_the_unstored_export() {
 
 /// Another recorded session in the same archive and under the same base as `first`.
 fn another_session(first: &Fixture, name: &str) -> Fixture {
-    let dir = first.root.join("sessions").join(name);
+    session_at(first, first.root.join("sessions").join(name))
+}
+
+/// As [`another_session`], in a directory of the test's choosing.
+fn session_at(first: &Fixture, dir: PathBuf) -> Fixture {
     let mut owner = recovery::Session::begin(&dir, &first.opts.db_path, &dir, "com.google.Chrome", "Synthetic release review", START).unwrap();
     owner.start_roll(0, 16_000, 0.0).unwrap();
     for (channel, sample) in [("mic", 0.25f32), ("system", -0.5f32)] {

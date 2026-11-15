@@ -278,9 +278,15 @@ impl Db {
     /// cannot write: a journal left by a killed writer makes the read fail here instead of being
     /// replayed by a command that may still refuse.
     pub async fn open_read_only(path: &Path) -> Result<Self> {
-        let conn = SqliteConnection::connect_with(&SqliteConnectOptions::new()
-            .filename(path).create_if_missing(false).read_only(true).foreign_keys(true)).await
-            .with_context(|| format!("open {} for reading", path.display()))?;
+        Self::open_read_only_within(path, None).await
+    }
+
+    /// [`Db::open_read_only`], waiting `busy` for another process's lock instead of sqlx's five
+    /// seconds.
+    pub async fn open_read_only_within(path: &Path, busy: Option<std::time::Duration>) -> Result<Self> {
+        let options = SqliteConnectOptions::new().filename(path).create_if_missing(false).read_only(true).foreign_keys(true);
+        let options = match busy { Some(busy) => options.busy_timeout(busy), None => options };
+        let conn = SqliteConnection::connect_with(&options).await.with_context(|| format!("open {} for reading", path.display()))?;
         Ok(Self { conn })
     }
 
@@ -1069,6 +1075,16 @@ impl Db {
         self.conn.close().await.context("close sqlite connection")?;
         Ok(())
     }
+}
+
+/// Whether an error is SQLite saying the database is locked by someone else (`SQLITE_BUSY` or
+/// `SQLITE_LOCKED`, with or without an extended code): the file is there and may answer later,
+/// unlike a file that is missing or is not this archive.
+pub fn in_use(error: &anyhow::Error) -> bool {
+    error.chain().filter_map(|cause| cause.downcast_ref::<sqlx::Error>()).any(|cause| match cause {
+        sqlx::Error::Database(database) => database.code().and_then(|code| code.parse::<i32>().ok()).is_some_and(|code| matches!(code & 0xff, 5 | 6)),
+        _ => false,
+    })
 }
 
 /// Whether this file has `meetings.transcript_origin` (schema v4). Asked inside the caller's

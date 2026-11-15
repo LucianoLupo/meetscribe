@@ -514,10 +514,10 @@ fn a_publication_record_only_grows_and_stops_at_its_limit() {
 fn an_archive_that_marks_nothing_is_never_taken_for_an_unfinished_finalize() {
     let (base, mut session) = stored_in_a_v3_archive();
     let id = session.state.meeting_id.unwrap();
-    assert_eq!(crate::finalize::unfinished(&session.state), None, "without a record nothing is even asked");
+    assert_eq!(crate::finalize::unfinished(&session.state), crate::finalize::Pending::No, "without a record nothing is even asked");
     let hash = "ab".repeat(32);
     session.published_provisional(&recovery::Provisional::new(&session.dir, Some(hash.clone()), Some(hash))).unwrap();
-    assert_eq!(crate::finalize::unfinished(&session.state), None, "a v3 row is unmarked, not replaced");
+    assert_eq!(crate::finalize::unfinished(&session.state), crate::finalize::Pending::No, "a v3 row is unmarked, not replaced");
     assert_eq!(schema_version(&session.state), 3);
 
     // `finalize <id>` on that database: the meeting is a batch transcript, so there is nothing

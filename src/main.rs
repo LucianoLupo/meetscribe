@@ -572,7 +572,15 @@ fn run_rerender(argv: &[String]) -> Result<()> {
         let mut reloaded = None;
         if write && row.origin == db::TranscriptOrigin::Live {
             let dir = PathBuf::from(&row.source_dir);
-            if dir.is_absolute() && dir.join(recovery::STATE_FILE).exists() {
+            if dir.is_absolute() && dir.is_dir() {
+                // A live transcript always has a session. If it is not where the meeting was
+                // stored from, it was moved, and a `finalize --session` may be at work on it
+                // under a lock this command cannot find: leave the meeting alone.
+                if !dir.join(recovery::STATE_FILE).exists() {
+                    println!("meeting {id}: a live transcript whose session is not at its stored path — skipped");
+                    skipped += 1;
+                    continue;
+                }
                 let Some(session) = recovery::Session::open(&dir)? else {
                     println!("meeting {id}: its session is in use by another meetscribe command — skipped");
                     skipped += 1;
