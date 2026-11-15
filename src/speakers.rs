@@ -37,13 +37,15 @@ const USAGE: &str = "usage: meetscribe speakers <list|play|label|unlabel|skip|me
     \x20 match <meeting-id> | --all                re-run recognition against the current voiceprints\n\
     \x20 rename <speaker-id> \"<first>\" \"<last>\"   fix a typo\n\
     \n\
-    common: [--db <path>]   (an unlabelled voice renders as \"Others\"; relabel = unlabel + label)";
+    common: [--db <path>]   (an unlabelled voice renders as \"Others\"; relabel = unlabel + label)\n\
+    \x20       [--session <dir>]  the session directory of a live-stored meeting whose stored path is relative";
 
 /// Minimum spacing between `play` clips when the cluster allows it.
 const PLAY_MIN_GAP_SECS: f64 = 120.0;
 
 pub(crate) fn run_speakers(argv: &[String]) -> Result<()> {
     let mut db_path = crate::default_db_path();
+    let mut session: Option<PathBuf> = None;
     let mut speaker_model = PathBuf::from(crate::SPEAKER_MODEL_REL);
     let mut all = false;
     let mut recluster = false;
@@ -56,6 +58,7 @@ pub(crate) fn run_speakers(argv: &[String]) -> Result<()> {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--db" => db_path = PathBuf::from(it.next().context("--db needs a path")?),
+            "--session" => session = Some(PathBuf::from(it.next().context("--session needs a directory")?)),
             "--speaker-model" => speaker_model = PathBuf::from(it.next().context("--speaker-model needs a path")?),
             "--clips" => clips = it.next().context("--clips needs a number")?.parse().context("--clips must be a number")?,
             "--secs" => secs = it.next().context("--secs needs a number")?.parse().context("--secs must be a number")?,
@@ -78,6 +81,7 @@ pub(crate) fn run_speakers(argv: &[String]) -> Result<()> {
     }
     let args = &positional[1..];
     let rt = crate::new_runtime()?;
+    let session = session.as_deref();
 
     match sub {
         "list" => match args.first() {
@@ -92,34 +96,36 @@ pub(crate) fn run_speakers(argv: &[String]) -> Result<()> {
         "label" => {
             let (mid, label) = meeting_and_cluster(args)?;
             let (first, last) = names(&args[2..], "label")?;
-            label_cluster(&rt, &db_path, mid, label, first, last)
+            label_cluster(&rt, &db_path, session, mid, label, first, last)
         }
         "unlabel" => {
             let (mid, label) = meeting_and_cluster(args)?;
-            unlabel_cluster(&rt, &db_path, mid, label, false)
+            unlabel_cluster(&rt, &db_path, session, mid, label, false)
         }
         "skip" => {
             let (mid, label) = meeting_and_cluster(args)?;
-            unlabel_cluster(&rt, &db_path, mid, label, true)
+            unlabel_cluster(&rt, &db_path, session, mid, label, true)
         }
         "merge" => {
             let (mid, label) = meeting_and_cluster(args)?;
             if args.len() < 3 {
                 bail!("speakers merge: pass the cluster to keep, then one or more clusters to fold into it");
             }
-            merge_clusters(&rt, &db_path, mid, label, &args[2..])
+            merge_clusters(&rt, &db_path, session, mid, label, &args[2..])
         }
         "split" => {
             let (mid, label) = meeting_and_cluster(args)?;
-            split_cluster(&rt, &db_path, mid, label, cut)
+            split_cluster(&rt, &db_path, session, mid, label, cut)
         }
         "cluster" => {
             let ids = meeting_ids(args, all, "cluster")?;
-            cluster_meetings(&rt, &db_path, ids, recluster, &speaker_model)
+            anyhow::ensure!(session.is_none() || ids.len() == 1, "speakers cluster: --session requires exactly one <meeting-id>");
+            cluster_meetings(&rt, &db_path, session, ids, recluster, &speaker_model)
         }
         "match" => {
             let ids = meeting_ids(args, all, "match")?;
-            match_meetings(&rt, &db_path, ids)
+            anyhow::ensure!(session.is_none() || ids.len() == 1, "speakers match: --session requires exactly one <meeting-id>");
+            match_meetings(&rt, &db_path, session, ids)
         }
         "rename" => {
             let sid = parse_id(args.first().context("speakers rename: missing <speaker-id>")?, "speaker-id")?;
@@ -166,6 +172,42 @@ fn meeting_ids(args: &[&str], all: bool, sub: &str) -> Result<Vec<i64>> {
 }
 
 // ---------------------------------------------------------------- db helpers
+
+/// The lock a command holds while it reads and writes the voice clusters of meeting `mid`.
+///
+/// `meetscribe finalize` replaces every cluster of a live-stored meeting, after a pass of about
+/// half an hour during which it holds the meeting's session lock. A command that reads a cluster
+/// before that replacement and writes after it would name a voice that no longer exists, or put
+/// old memberships on new segments. So for a `live` meeting the command takes the same lock,
+/// from before its first read to after its last write, and is refused while `finalize` runs.
+///
+/// Only a `live` meeting can be replaced: for every other meeting this returns `None` and the
+/// command runs exactly as it always has. So does a live meeting whose recording was pruned (its
+/// transcript is final). Session locks never wait, and none is taken inside a database
+/// transaction, so there is no order to get wrong.
+async fn live_lock(db: &mut db::Db, db_path: &Path, mid: i64, given: Option<&Path>) -> Result<Option<crate::recovery::Session>> {
+    use crate::finalize::Located;
+    let Some(row) = db.get_meeting(mid).await? else { return Ok(None) };
+    if row.origin != db::TranscriptOrigin::Live {
+        return Ok(None);
+    }
+    let dir = match crate::finalize::locate_session(&row, given) {
+        Located::Session(dir) => dir,
+        Located::Gone => return Ok(None),
+        Located::Relative => bail!(
+            "meeting {mid} is a live transcript stored from a relative path ('{}'); name its session directory with --session",
+            row.source_dir
+        ),
+        Located::Unmanaged => bail!("'{}' holds no session of meeting {mid}; name its session directory with --session", row.source_dir),
+    };
+    let session = crate::finalize::lock_session(&dir, mid)?;
+    let (archive, ingest) = (db.archive_id().await?, db.ingest_id(&session.state.key).await?);
+    crate::finalize::ensure_meeting_session(&session, mid, db_path, &archive, ingest)?;
+    // Read again under the lock: a `finalize` that just finished made it a batch meeting, and
+    // then there is nothing left to guard against.
+    let still_live = db.get_meeting(mid).await?.is_some_and(|row| row.origin == db::TranscriptOrigin::Live);
+    Ok(still_live.then_some(session))
+}
 
 async fn cluster_or_bail(db: &mut db::Db, mid: i64, label: &str) -> Result<db::ClusterRow> {
     db.get_meeting(mid).await?.with_context(|| format!("no meeting with id {mid}"))?;
@@ -343,9 +385,10 @@ fn write_wav_16k(path: &Path, audio: &[f32]) -> Result<()> {
 
 // ---------------------------------------------------------------- label / unlabel / skip / rename
 
-fn label_cluster(rt: &tokio::runtime::Runtime, db_path: &Path, mid: i64, label: &str, first: &str, last: &str) -> Result<()> {
+fn label_cluster(rt: &tokio::runtime::Runtime, db_path: &Path, session: Option<&Path>, mid: i64, label: &str, first: &str, last: &str) -> Result<()> {
     let (person, existed, prints) = rt.block_on(async {
         let mut db = db::Db::open(db_path).await?;
+        let _lock = live_lock(&mut db, db_path, mid, session).await?;
         let c = cluster_or_bail(&mut db, mid, label).await?;
         let now = crate::now_epoch();
         let (sid, existed) = match db.find_speaker(first, last).await? {
@@ -371,9 +414,10 @@ fn label_cluster(rt: &tokio::runtime::Runtime, db_path: &Path, mid: i64, label: 
     Ok(())
 }
 
-fn unlabel_cluster(rt: &tokio::runtime::Runtime, db_path: &Path, mid: i64, label: &str, skip: bool) -> Result<()> {
+fn unlabel_cluster(rt: &tokio::runtime::Runtime, db_path: &Path, session: Option<&Path>, mid: i64, label: &str, skip: bool) -> Result<()> {
     let removed = rt.block_on(async {
         let mut db = db::Db::open(db_path).await?;
+        let _lock = live_lock(&mut db, db_path, mid, session).await?;
         let c = cluster_or_bail(&mut db, mid, label).await?;
         db.set_cluster_speaker(c.id, None, None, None).await?;
         db.set_cluster_skipped(c.id, skip).await?;
@@ -406,9 +450,10 @@ fn rename(rt: &tokio::runtime::Runtime, db_path: &Path, sid: i64, first: &str, l
 // ---------------------------------------------------------------- merge / split
 
 
-fn merge_clusters(rt: &tokio::runtime::Runtime, db_path: &Path, mid: i64, keep: &str, others: &[&str]) -> Result<()> {
+fn merge_clusters(rt: &tokio::runtime::Runtime, db_path: &Path, session: Option<&Path>, mid: i64, keep: &str, others: &[&str]) -> Result<()> {
     let (moved, n, secs) = rt.block_on(async {
         let mut db = db::Db::open(db_path).await?;
+        let _lock = live_lock(&mut db, db_path, mid, session).await?;
         let (moved, n, secs) = db.merge_clusters(mid, keep, others, crate::now_epoch()).await?;
         db.close().await?;
         anyhow::Ok((moved, n, secs))
@@ -421,9 +466,10 @@ fn merge_clusters(rt: &tokio::runtime::Runtime, db_path: &Path, mid: i64, keep: 
     Ok(())
 }
 
-fn split_cluster(rt: &tokio::runtime::Runtime, db_path: &Path, mid: i64, label: &str, cut: f32) -> Result<()> {
+fn split_cluster(rt: &tokio::runtime::Runtime, db_path: &Path, session: Option<&Path>, mid: i64, label: &str, cut: f32) -> Result<()> {
     let (labels, matched) = rt.block_on(async {
         let mut db = db::Db::open(db_path).await?;
+        let _lock = live_lock(&mut db, db_path, mid, session).await?;
         let c = cluster_or_bail(&mut db, mid, label).await?;
         let windows: Vec<voices::Window> = db
             .cluster_windows(c.id)
@@ -468,12 +514,13 @@ fn split_cluster(rt: &tokio::runtime::Runtime, db_path: &Path, mid: i64, label: 
 
 // ---------------------------------------------------------------- cluster / match
 
-fn cluster_meetings(rt: &tokio::runtime::Runtime, db_path: &Path, ids: Vec<i64>, recluster: bool, speaker_model: &Path) -> Result<()> {
+fn cluster_meetings(rt: &tokio::runtime::Runtime, db_path: &Path, session: Option<&Path>, ids: Vec<i64>, recluster: bool, speaker_model: &Path) -> Result<()> {
     // The model loads lazily: `--recluster` alone never needs audio or the model.
     let mut embedder: Option<spk::Embedder> = None;
     let summary = rt.block_on(async {
         let mut db = db::Db::open(db_path).await?;
-        let wanted: Vec<i64> = if ids.is_empty() {
+        let every = ids.is_empty();
+        let wanted: Vec<i64> = if every {
             db.list_meetings().await?.iter().map(|m| m.id).collect()
         } else {
             ids
@@ -481,6 +528,17 @@ fn cluster_meetings(rt: &tokio::runtime::Runtime, db_path: &Path, ids: Vec<i64>,
         let enrolled = voices::decode_enrolled(&db.load_enrolled().await?)?;
         let (mut done, mut skipped) = (0usize, Vec::<String>::new());
         for mid in wanted {
+            // Held for this meeting's reads, its minutes of embedding and its write. With --all a
+            // meeting that cannot be locked is skipped and named; asked for by id, it is refused.
+            let _lock = match live_lock(&mut db, db_path, mid, session).await {
+                Ok(lock) => lock,
+                Err(error) if every => {
+                    println!("meeting {mid}: skipped — {error:#}");
+                    skipped.push(format!("{mid}: its session could not be locked"));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let Some(row) = db.get_meeting(mid).await? else {
                 skipped.push(format!("{mid}: no such meeting"));
                 continue;
@@ -553,10 +611,11 @@ fn cluster_meetings(rt: &tokio::runtime::Runtime, db_path: &Path, ids: Vec<i64>,
     Ok(())
 }
 
-fn match_meetings(rt: &tokio::runtime::Runtime, db_path: &Path, ids: Vec<i64>) -> Result<()> {
+fn match_meetings(rt: &tokio::runtime::Runtime, db_path: &Path, session: Option<&Path>, ids: Vec<i64>) -> Result<()> {
     let (assigned, cleared, kept) = rt.block_on(async {
         let mut db = db::Db::open(db_path).await?;
-        let wanted: Vec<i64> = if ids.is_empty() {
+        let every = ids.is_empty();
+        let wanted: Vec<i64> = if every {
             db.list_meetings().await?.iter().map(|m| m.id).collect()
         } else {
             ids
@@ -564,6 +623,14 @@ fn match_meetings(rt: &tokio::runtime::Runtime, db_path: &Path, ids: Vec<i64>) -
         let enrolled = voices::decode_enrolled(&db.load_enrolled().await?)?;
         let (mut assigned, mut cleared, mut kept) = (0usize, 0usize, 0usize);
         for mid in wanted {
+            let _lock = match live_lock(&mut db, db_path, mid, session).await {
+                Ok(lock) => lock,
+                Err(error) if every => {
+                    println!("meeting {mid}: skipped — {error:#}");
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             for c in db.list_clusters(mid).await? {
                 // Manual names and deliberate unknowns are the owner's; only auto/unnamed move.
                 if c.assigned_by.as_deref() == Some("manual") || c.skipped {

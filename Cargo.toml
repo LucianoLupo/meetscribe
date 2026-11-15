@@ -45,6 +45,10 @@ time = { version = "0.3", features = ["formatting", "macros"] }
 # regex: vocabulary corrections applied at render time (word-boundary matching, opt-in raw regex).
 # Already compiled in-tree via env_logger → env_filter, so this is a declaration, not build weight.
 regex = "1"
+# sha2: a published transcript file is recognised as this tool's own by its content hash, so
+# `finalize` replaces only what it wrote. Already compiled in-tree via sqlx-core (same feature
+# set), so this is a declaration, not build weight.
+sha2 = { version = "0.10", default-features = false }
 # Speaker embeddings (spike D): ONNX Runtime + Kaldi fbank front-end for the 3D-Speaker CAM++
 # model. ort is an EXACT pin matching silero's transitive requirement — a floating pre-release
 # req could resolve to a second rc and link two ONNX Runtimes. Default features = same set silero

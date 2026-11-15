@@ -450,3 +450,59 @@ fn a_failed_schema_upgrade_is_a_failed_attempt_not_an_identity_failure() {
         std::fs::remove_dir_all(base).unwrap();
     }
 }
+
+/// A session state as the build before `finalize` wrote it (f138d42), byte for byte. Written out by
+/// hand in that build's field order and checked against it, not regenerated from this code.
+const FROZEN_STATE: &str = r#"{"version":1,"key":"0123456789abcdef0123456789abcdef","started_at":1762880000,"app":"com.google.Chrome","title":"Release readiness sync","db_path":"/synthetic/archive.db","export_dir":"/synthetic/recording","lock_dir":"/synthetic/.locks","archive_id":"fedcba9876543210fedcba9876543210","phase":"complete","capture_status":"complete","rolls":[{"index":0,"sample_rate":16000,"gap_seconds":0.0,"mic_frames":48000,"system_frames":48000}],"duration_seconds":3.0,"attempts":1,"in_flight":false,"next_retry":0,"error_class":null,"meeting_id":7,"publication":"/synthetic/recording","unarchived_manual_output":false}"#;
+
+#[test]
+fn a_state_without_a_publication_record_is_written_as_it_always_was() {
+    let state: recovery::State = serde_json::from_str(FROZEN_STATE).unwrap();
+    assert_eq!(serde_json::to_string(&state).unwrap(), FROZEN_STATE);
+    assert_eq!(state.provisional(), None);
+}
+
+/// The record is read by one piece of code only. Whatever else is stored under its key, every
+/// command that reads the session still can, and the value counts as no record.
+#[test]
+fn a_publication_record_nobody_can_read_is_no_record_and_breaks_nothing() {
+    let hash = "ab".repeat(32);
+    let good = serde_json::json!({"dir": "/synthetic/recording", "markdown": [hash], "json": [hash]});
+    let unreadable = [
+        serde_json::json!(5), serde_json::json!("yes"), serde_json::json!({"dir": "/synthetic/recording"}),
+        serde_json::json!({"dir": "relative/recording", "markdown": [hash], "json": [hash]}),
+        serde_json::json!({"dir": "/synthetic/recording", "markdown": ["not a hash"], "json": [hash]}),
+        serde_json::json!({"dir": "/synthetic/recording", "markdown": [hash.to_uppercase()], "json": [hash]}),
+        serde_json::json!({"dir": "/synthetic/recording", "markdown": vec![hash.clone(); recovery::PROVISIONAL_HASHES + 1], "json": [hash]}),
+    ];
+    let base = std::env::temp_dir().join(format!("meetscribe-record-{}", recovery::new_identity()));
+    recovery::private_dir(&base).unwrap();
+    let with = |value: &serde_json::Value| -> recovery::State {
+        let mut raw: serde_json::Value = serde_json::from_str(FROZEN_STATE).unwrap();
+        raw["provisional"] = value.clone();
+        std::fs::write(base.join(recovery::STATE_FILE), format!("{raw}\n")).unwrap();
+        recovery::State::read(&base).expect("the state stays readable whatever the record holds")
+    };
+    let record = with(&good).provisional().expect("a well-formed record is read");
+    assert_eq!((record.dir.as_path(), record.markdown.len(), record.json.len()), (Path::new("/synthetic/recording"), 1, 1));
+    for value in &unreadable {
+        let state = with(value);
+        assert_eq!(state.provisional(), None, "{value} was read as a record");
+        assert_eq!(state.provisional.as_ref(), Some(value), "an unreadable value is carried, not dropped, by a save");
+    }
+    assert_eq!(with(&serde_json::Value::Null).provisional, None);
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn a_publication_record_only_grows_and_stops_at_its_limit() {
+    let hash = |n: usize| format!("{n:064x}");
+    let mut record = recovery::Provisional::new(Path::new("/synthetic/recording"), Some(hash(0)), Some(hash(0)));
+    for n in 1..recovery::PROVISIONAL_HASHES { assert!(record.append(&hash(n), &hash(0)), "hash {n} fits"); }
+    assert_eq!((record.markdown.len(), record.json.len()), (recovery::PROVISIONAL_HASHES, 1), "a hash already listed is not added twice");
+    assert!(record.append(&hash(3), &hash(0)), "a known pair needs no room");
+    let full = record.clone();
+    assert!(!record.append(&hash(99), &hash(1)), "a seventeenth hash is refused");
+    assert_eq!(record, full, "a refused append changes nothing, in either list");
+    assert_eq!(record.markdown[0], hash(0), "the first hash is still there");
+}

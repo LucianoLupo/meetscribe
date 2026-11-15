@@ -73,6 +73,15 @@ std::thread_local! { static TEST_CUTPOINT: std::cell::Cell<Option<fn(&str)>> = c
 pub(crate) fn test_cutpoints(callback: fn(&str)) { TEST_CUTPOINT.set(Some(callback)); }
 #[cfg(test)]
 pub(crate) fn cutpoint(point: &str) { if let Some(callback) = TEST_CUTPOINT.get() { callback(point); } }
+#[cfg(test)]
+type FaultSwitch = fn(&str) -> bool;
+#[cfg(test)]
+std::thread_local! { static TEST_FAULT: std::cell::Cell<Option<FaultSwitch>> = const { std::cell::Cell::new(None) }; }
+#[cfg(test)]
+pub(crate) fn test_faults(callback: FaultSwitch) { TEST_FAULT.set(Some(callback)); }
+/// Whether a test asked for the failure named `point` to be reported here.
+#[cfg(test)]
+pub(crate) fn fault(point: &str) -> bool { TEST_FAULT.get().is_some_and(|callback| callback(point)) }
 fn load_engine(model: &str, opts: &PipelineOpts) -> Result<Box<dyn SpeechEngine>> {
     #[cfg(test)]
     if let Some(factory) = TEST_ENGINE.get() { return factory(model, opts); }
@@ -140,6 +149,12 @@ pub(crate) fn transcribe_with_clock(dir: &Path, opts: &PipelineOpts, promote_liv
     actual.db_path = managed.state.db_path.clone();
     actual.export_dir = managed.state.export_dir.clone();
     actual.title = Some(managed.state.title.clone());
+    // Before anything is reserved or saved: a meeting `finalize` already replaced in the database
+    // is finished by `finalize`, not recovered here.
+    if let Some(id) = crate::finalize::unfinished(&managed.state) {
+        anyhow::bail!("meeting {id} was replaced by `meetscribe finalize` and its transcript files are not published yet; \
+            `meetscribe finalize {id}` finishes it. Nothing was changed");
+    }
     managed.reserve(now(), opts.resume)?;
     let result = (|| {
         let runtime = crate::new_runtime()?;
@@ -167,6 +182,7 @@ pub(crate) fn transcribe_with_clock(dir: &Path, opts: &PipelineOpts, promote_liv
         transcribe_core(dir, &inputs, &actual, Some(managed))
     })();
     let result = result.and_then(|output| {
+        #[cfg(test)] cutpoint("published");
         managed.state.duration_seconds = output.meeting_secs;
         managed.complete(output.md_path.parent().context("publication has no directory")?)?;
         #[cfg(test)] cutpoint("session_complete");
@@ -241,6 +257,14 @@ fn render_existing(managed: &mut crate::recovery::Session, opts: &PipelineOpts, 
     };
     managed.committed(id)?;
     let (md_path, json_path) = export::write_managed_exports(&opts.export_dir, &managed.state.key, mode, &row, &rendered)?;
+    if row.origin == db::TranscriptOrigin::Live {
+        // What `finalize` may replace later: this pair, recognised by the hash of what was
+        // written, in the directory it was written to. A retry that publishes elsewhere records
+        // that place instead.
+        let (markdown, json) = export::pair_hashes(&row, &rendered)?;
+        let dir = md_path.parent().context("publication has no directory")?;
+        managed.published_provisional(&crate::recovery::Provisional::new(dir, Some(markdown), Some(json)))?;
+    }
     let wall_secs = started.elapsed().as_secs_f64();
     Ok(PipelineOutput {
         segments: rendered, stored_id: Some(id), md_path, json_path, meeting_secs: row.duration_secs,
@@ -252,8 +276,8 @@ fn render_existing(managed: &mut crate::recovery::Session, opts: &PipelineOpts, 
 /// What the batch pass has in hand once the audio is decoded and before any database is opened:
 /// the merged transcript, the far-end voice assemblies (not yet matched against enrolled voices)
 /// and the meeting row to store. Storing and publishing it is `transcribe_core`'s second half.
-struct Decoded {
-    meta: db::MeetingMeta,
+pub(crate) struct Decoded {
+    pub(crate) meta: db::MeetingMeta,
     merged: Vec<transcript::TranscriptSegment>,
     embeddings: Vec<Option<Vec<f32>>>,
     pieces: Vec<split::Piece>,
@@ -266,15 +290,26 @@ struct Decoded {
     rolls_far: usize,
     /// Kept for the provenance log line written once the meeting is stored.
     diarizer: Option<diar::Diarizer>,
-    meeting_secs: f64,
+    pub(crate) meeting_secs: f64,
     wall: f64,
     rtf: f64,
+}
+
+impl Decoded {
+    /// What is stored once the voices are named: the segments and clusters the diarizer's split
+    /// produced, or, without one, the merged segments and path A as they are.
+    pub(crate) fn to_store<'a>(&'a self, split: &'a Option<(Vec<transcript::TranscriptSegment>, voices::Assembly)>) -> (&'a [transcript::TranscriptSegment], &'a voices::Assembly) {
+        match split {
+            Some((segments, assembly)) => (segments, assembly),
+            None => (&self.merged, &self.assembly),
+        }
+    }
 }
 
 /// Decode every channel under `audio_dir` and assemble the far-end voices. Opens no database and
 /// saves no session state; the only files it writes are the diarizer's temporary ones, into
 /// `work_dir`. `state` is the managed session's metadata, when there is one.
-fn decode(dir: &Path, audio_dir: &Path, work_dir: &Path, opts: &PipelineOpts, state: Option<&crate::recovery::State>) -> Result<Decoded> {
+pub(crate) fn decode(dir: &Path, audio_dir: &Path, work_dir: &Path, opts: &PipelineOpts, state: Option<&crate::recovery::State>) -> Result<Decoded> {
     let title = opts.title.clone().unwrap_or_else(|| {
         dir.file_name()
             .and_then(|s| s.to_str())
@@ -492,11 +527,11 @@ fn decode(dir: &Path, audio_dir: &Path, work_dir: &Path, opts: &PipelineOpts, st
 
 /// How many clusters were recognised, and the segments and clusters to store when the diarizer
 /// split the chunks (`None` without one: the merged segments and path A are stored as they are).
-type Named = (usize, Option<(Vec<transcript::TranscriptSegment>, voices::Assembly)>);
+pub(crate) type Named = (usize, Option<(Vec<transcript::TranscriptSegment>, voices::Assembly)>);
 
 /// The naming step: match the far-end voices against the enrolled voiceprints and, when the
 /// diarizer split the chunks, turn the named pieces back into the segments and clusters to store.
-fn name_voices(decoded: &mut Decoded, enrolled: &[spk::Enrolled]) -> Result<Named> {
+pub(crate) fn name_voices(decoded: &mut Decoded, enrolled: &[spk::Enrolled]) -> Result<Named> {
     let mut matched = voices::apply_matches(&mut decoded.assembly, enrolled);
     // Split-then-name: match path B, apply rule C against path A, then turn the
     // named pieces back into stored segments. Without a diarizer: today's insert.
@@ -545,10 +580,7 @@ fn transcribe_core(dir: &Path, audio_dir: &Path, opts: &PipelineOpts, mut manage
             // Inside this block on purpose: a naming failure is a storage failure, and the
             // transcript is still exported unstored below.
             let (matched, finalized) = name_voices(&mut decoded, &enrolled)?;
-            let (final_segs, final_asm): (&[transcript::TranscriptSegment], &voices::Assembly) = match &finalized {
-                Some((segs, asm)) => (segs, asm),
-                None => (&decoded.merged, &decoded.assembly),
-            };
+            let (final_segs, final_asm) = decoded.to_store(&finalized);
             let id = if let Some(key) = &opts.session_key {
                 database.insert_keyed_meeting_with_voices(&decoded.meta, final_segs, &final_asm.clusters, &final_asm.voices, key).await?
             } else {

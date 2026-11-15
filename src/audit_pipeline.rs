@@ -22,6 +22,7 @@ impl pipeline::SpeechEngine for SyntheticEngine {
                 connection.close().await?; anyhow::Ok(())
             })?;
         }
+        cutpoint("decoding");
         let text = if audio.first().is_some_and(|value| *value < 0.0) {
             "We approved the synthetic deployment window"
         } else { "The synthetic release checklist is ready" };
@@ -62,11 +63,17 @@ fn cutpoint(point: &str) {
     }
 }
 
+/// A failure a test switches on by name: the file `fault` in the fixture root holds that name.
+fn fault(point: &str) -> bool {
+    let root = PathBuf::from(std::env::var_os("MEETSCRIBE_PIPELINE_FIXTURE_ROOT").unwrap());
+    fs::read_to_string(root.join("fault")).is_ok_and(|selected| selected.trim() == point)
+}
+
 #[test]
 #[ignore = "sacrificial entry invoked explicitly by mandatory audit parent tests"]
 fn pipeline_child() {
     let root = PathBuf::from(std::env::var_os("MEETSCRIBE_PIPELINE_FIXTURE_ROOT").expect("fixture root required"));
-    crate::diagnostics::init(); pipeline::test_engine(backend); pipeline::test_cutpoints(cutpoint);
+    crate::diagnostics::init(); pipeline::test_engine(backend); pipeline::test_cutpoints(cutpoint); pipeline::test_faults(fault);
     // A promotion test may shorten the wait for the live reader: "<stale ms> <cap ms>".
     if let Ok(limits) = fs::read_to_string(root.join("promote-wait")) {
         let mut ms = limits.split_whitespace().map(|value| Duration::from_millis(value.parse().unwrap()));
@@ -82,6 +89,7 @@ fn pipeline_child() {
         Some("transcribe") => crate::run_transcribe_using(&argv[1..], |dir, opts, promote_live| pipeline::transcribe_with_clock(dir, opts, promote_live, || now)),
         Some("rerender") => crate::run_rerender(&argv[1..]),
         Some("export") => crate::run_export(&argv[1..]),
+        Some("finalize") => crate::finalize::run(&argv[1..]),
         _ => panic!("unsupported sacrificial CLI command"),
     };
     if let Err(error) = result { crate::diagnostics::command_failed(&error); std::process::exit(1); }
@@ -959,6 +967,12 @@ fn promote_argv(fixture: &Fixture, job: &TranscribeJob) -> Vec<String> {
     argv.extend(["--promote-live".to_string(), live_dir(fixture).display().to_string()]); argv
 }
 
+/// The record promotion must leave: the pair in `dir`, each file by the hash of what is on disk.
+fn record_of(dir: &Path) -> recovery::Provisional {
+    let hash = |name: &str| Some(crate::export::sha256_hex(&fs::read(dir.join(name)).unwrap()));
+    recovery::Provisional::new(dir, hash("transcript.md"), hash("transcript.json"))
+}
+
 fn proofs(fixture: &Fixture) -> (bool, bool) {
     let session = recovery::Session::open(&fixture.dir).unwrap().unwrap();
     (session.proof(recovery::ProofScope::Archive).unwrap(), session.proof(recovery::ProofScope::Retention).unwrap())
@@ -990,6 +1004,7 @@ fn a_complete_live_stream_is_stored_without_inference_and_only_once() {
         assert!(stderr.contains("\"event\":\"live_promoted\"") && stderr.contains("\"merged_segments\":2"), "no promotion event in: {stderr}");
         assert!(!stderr.contains("live deployment window"), "meeting text reached the log");
         assert_eq!(proofs(&fixture), (true, true), "the files are a render of the stored rows, and only owned files exist");
+        assert_eq!(state.provisional(), Some(record_of(&fixture.dir)), "promotion records the pair it published");
 
         // The same command again: a Complete session is not due. It fails and changes nothing.
         let before = session_snapshot(&fixture.dir); let database = fs::read(&fixture.opts.db_path).unwrap();
@@ -1045,6 +1060,7 @@ fn a_stream_that_cannot_be_promoted_runs_the_batch_pass_in_the_same_attempt() {
         assert_eq!((state.phase, state.attempts), (recovery::Phase::Complete, 1), "{reason}: exactly one attempt is reserved");
         assert_eq!(state.publication.as_deref(), Some(fixture.dir.as_path()), "{reason}");
         assert!(!fs::read_to_string(fixture.dir.join("transcript.md")).unwrap().contains("provisional"), "{reason}");
+        assert!(!fs::read_to_string(fixture.dir.join(recovery::STATE_FILE)).unwrap().contains("provisional"), "{reason}: a batch session's state gains no key");
         assert_eq!(proofs(&fixture), (true, true), "{reason}");
         fs::remove_dir_all(fixture.root).unwrap();
     }
@@ -1101,7 +1117,147 @@ fn a_promotion_killed_after_its_commit_is_finished_from_the_stored_meeting() {
             assert!(fs::read_to_string(publication.join("transcript.md")).unwrap().contains(&format!("`meetscribe finalize {id}`")));
             assert!(!fixture.dir.join("transcript.md").exists());
             assert_eq!(proofs(&fixture), (true, false), "the archive proof holds; a .recovered directory is not owned capture material");
+            assert_eq!(fixture.state().provisional(), Some(record_of(&publication)), "a retry records the place it published in");
             fs::remove_dir_all(fixture.root).unwrap();
         }
+    }
+}
+
+/// The child dies after both files are written and before the state that would record them is
+/// saved. The retry publishes beside them and records that pair; the first pair stays, unrecorded.
+#[test]
+fn a_promotion_killed_before_its_record_is_saved_is_retried_and_then_has_one() {
+    let (fixture, owner) = Fixture::new(); drop(owner);
+    write_stream(&fixture, &stream_events(&fixture));
+    fs::write(fixture.root.join("forbid-inference"), b"the live stream is the transcript\n").unwrap();
+    fs::write(fixture.root.join("cutpoint"), "published\n").unwrap();
+    let argv = promote_argv(&fixture, &fixture.job());
+    assert_eq!(child_output(&fixture, spawn_cli(&fixture, &argv)).status.code(), Some(85));
+    let state = fixture.state();
+    assert_eq!((state.phase, state.in_flight, state.provisional.is_none()), (recovery::Phase::Archived, true, true));
+    let root = (fs::read(fixture.dir.join("transcript.md")).unwrap(), fs::read(fixture.dir.join("transcript.json")).unwrap());
+    fs::remove_file(fixture.root.join("cutpoint")).unwrap();
+
+    assert_eq!(child_output(&fixture, spawn_cli(&fixture, &argv)).status.code(), Some(1), "the first visit only charges the abandoned attempt");
+    fs::write(fixture.root.join("clock"), format!("{}\n", fixture.state().next_retry)).unwrap();
+    let finished = child_output(&fixture, spawn_cli(&fixture, &argv));
+    assert!(finished.status.success(), "the retry failed: {finished:?}");
+    let state = fixture.state(); let publication = state.publication.clone().unwrap();
+    assert_eq!(state.phase, recovery::Phase::Complete);
+    assert!(publication.starts_with(fixture.dir.join(".recovered").join(&state.key)));
+    assert_eq!(state.provisional(), Some(record_of(&publication)));
+    assert_eq!((fs::read(fixture.dir.join("transcript.md")).unwrap(), fs::read(fixture.dir.join("transcript.json")).unwrap()), root, "the first pair is left as it was");
+    assert_eq!(fixture.meetings().len(), 1);
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+// ---- Finalize: a live-stored meeting is replaced by the batch transcript (`finalize.rs`). The
+// meeting is promoted through the real child first, exactly as the promotion tests do it.
+
+const LIVE_WORDS: [&str; 2] = ["live release checklist", "live deployment window"];
+const BATCH_WORDS: [&str; 2] = ["synthetic release checklist", "synthetic deployment window"];
+
+/// A fixture whose meeting was stored from its live stream; returns it with the meeting id.
+fn promoted() -> (Fixture, i64) {
+    let (fixture, owner) = Fixture::new(); drop(owner);
+    write_stream(&fixture, &stream_events(&fixture));
+    let output = child_output(&fixture, spawn_cli(&fixture, &promote_argv(&fixture, &fixture.job())));
+    assert!(output.status.success(), "promotion failed: {output:?}");
+    assert!(!fixture.root.join("engine-ran").exists());
+    let rows = fixture.meetings(); assert_eq!((rows.len(), rows[0].origin), (1, db::TranscriptOrigin::Live));
+    (fixture, rows[0].id)
+}
+
+fn finalize_argv(fixture: &Fixture, id: i64, extra: &[&str]) -> Vec<String> {
+    let mut argv: Vec<String> = ["finalize", &id.to_string(), "--db", fixture.opts.db_path.to_str().unwrap(),
+        "--base", fixture.base.to_str().unwrap(), "--lang", "en", "--model", fixture.opts.model.to_str().unwrap()]
+        .into_iter().map(String::from).collect();
+    argv.extend(extra.iter().map(|flag| flag.to_string())); argv
+}
+
+fn finalize(fixture: &Fixture, id: i64, extra: &[&str]) -> std::process::Output {
+    child_output(fixture, spawn_cli(fixture, &finalize_argv(fixture, id, extra)))
+}
+
+/// Every entry under a directory with what a rewrite would change even when the bytes stay the
+/// same: its inode and its modification time. Directories are listed too, so an added empty one shows.
+fn entries(dir: &Path) -> std::collections::BTreeMap<PathBuf, (u64, std::time::SystemTime, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let mut found = std::collections::BTreeMap::new();
+    for entry in fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap(); let metadata = fs::symlink_metadata(entry.path()).unwrap();
+        found.insert(entry.path(), (metadata.ino(), metadata.modified().unwrap(), metadata.len()));
+        if metadata.is_dir() { found.extend(entries(&entry.path())); }
+    }
+    found
+}
+
+/// What "unchanged" means for a session and its database: same bytes, same files (not rewritten
+/// in place), no entry added or removed, and the database byte for byte.
+#[derive(PartialEq, Debug)]
+struct Untouched { files: std::collections::BTreeMap<PathBuf, Vec<u8>>, entries: std::collections::BTreeMap<PathBuf, (u64, std::time::SystemTime, u64)>, database: Vec<u8> }
+fn untouched(fixture: &Fixture) -> Untouched {
+    Untouched { files: session_snapshot(&fixture.dir), entries: entries(&fixture.dir), database: fs::read(&fixture.opts.db_path).unwrap() }
+}
+
+/// The end state of a finished `finalize`, whatever road led to it.
+fn assert_finalized(fixture: &Fixture, id: i64, before: &recovery::State) {
+    let rows = fixture.meetings(); assert_eq!(rows.len(), 1, "finalize must not add a meeting");
+    assert_eq!((rows[0].id, rows[0].origin, rows[0].model.as_str(), rows[0].lang.as_str()), (id, db::TranscriptOrigin::Batch, "synthetic-model", "en"));
+    let (segments, clusters) = stored_voices(fixture, id);
+    assert_eq!(rows[0].segment_count, segments.len() as i64);
+    assert!(!clusters.is_empty(), "the batch pass finds the far-end voices the live lane does not");
+    assert!(segments.iter().all(|segment| BATCH_WORDS.iter().any(|words| segment.seg.text.contains(words))), "a live segment survived");
+    let state = fixture.state();
+    assert_eq!((state.phase, state.attempts, state.in_flight, state.meeting_id), (recovery::Phase::Complete, before.attempts, false, Some(id)));
+    assert_eq!(state.publication, before.publication, "the pair is replaced where it was published");
+    assert!(!fs::read_to_string(fixture.dir.join(recovery::STATE_FILE)).unwrap().contains("provisional"), "the record is removed with the last save");
+    let publication = state.publication.unwrap();
+    let markdown = fs::read_to_string(publication.join("transcript.md")).unwrap();
+    assert!(!markdown.contains("provisional") && BATCH_WORDS.iter().all(|words| markdown.contains(words)));
+    let session = recovery::Session::open(&fixture.dir).unwrap().unwrap();
+    assert!(session.proof(recovery::ProofScope::Archive).unwrap(), "the published pair is the render of the stored rows");
+    drop(session);
+    let scratch = fixture.base.join("scratch");
+    assert!(!scratch.exists() || fs::read_dir(&scratch).unwrap().next().is_none(), "a scratch directory was left behind");
+    assert!(session_snapshot(&fixture.dir).keys().all(|path| !path.file_name().unwrap().to_str().unwrap().starts_with(".diar-")));
+}
+
+fn no_meeting_text(output: &std::process::Output) {
+    let said = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    for words in LIVE_WORDS.iter().chain(&BATCH_WORDS) { assert!(!said.contains(words), "meeting text reached the terminal or the log: {words}"); }
+}
+
+#[test]
+fn a_promoted_meeting_is_finalized_under_the_same_id() {
+    for _ in 0..3 {
+        let (fixture, id) = promoted();
+        let before = fixture.state();
+        let live_json = fs::read(fixture.dir.join("transcript.json")).unwrap();
+        let output = finalize(&fixture, id, &[]);
+        assert!(output.status.success(), "finalize failed: {output:?}");
+        assert_finalized(&fixture, id, &before);
+        assert_eq!(proofs(&fixture), (true, true), "and the session is prunable like any batch session");
+        assert!(!fixture.dir.join(".recovered").exists());
+        assert_ne!(fs::read(fixture.dir.join("transcript.json")).unwrap(), live_json);
+        assert!(fixture.root.join("engine-ran").is_file(), "the batch pass did not run");
+        no_meeting_text(&output);
+        let (stdout, stderr) = (String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(stdout.contains(&format!("meeting {id}: finalized")), "{stdout}");
+        for event in ["finalize_started", "finalize_committed", "finalize_published"] {
+            assert!(stderr.contains(&format!("\"event\":\"{event}\"")), "{event} is not in the log: {stderr}");
+        }
+        assert!(stderr.contains("\"clusters\":1") && stderr.contains(&format!("\"session_id\":\"{}\"", before.key)), "{stderr}");
+        assert!(!stderr.contains("invalid_event"), "an event was withheld by the log allowlist: {stderr}");
+
+        // Again: the meeting is final. It says so, exits 0, loads no engine and changes nothing.
+        fs::remove_file(fixture.root.join("engine-ran")).unwrap();
+        let unchanged = untouched(&fixture);
+        let again = finalize(&fixture, id, &[]);
+        assert!(again.status.success(), "{again:?}");
+        assert!(String::from_utf8_lossy(&again.stdout).contains("already the full transcript"));
+        assert!(!fixture.root.join("engine-ran").exists());
+        assert_eq!(untouched(&fixture), unchanged);
+        fs::remove_dir_all(fixture.root).unwrap();
     }
 }
