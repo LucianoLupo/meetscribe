@@ -48,8 +48,10 @@ pub struct MeetingMeta {
 }
 
 /// Which pass produced the stored transcript. `Live` is the live lane's text stored at hangup:
-/// it has no far-end voices and can be replaced by the batch pass while the recording exists.
-/// Retention treats it like any stored meeting: once the audio is pruned it is the final text.
+/// it has no far-end voices, and `meetscribe finalize <id>` replaces it with the batch pass's,
+/// under the same meeting id, while the recording exists. A row goes from `Live` to `Batch` and
+/// never back. Retention treats a live meeting like any stored one: once the audio is pruned it
+/// is the final text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranscriptOrigin {
     Batch,
@@ -252,14 +254,40 @@ impl Db {
 
     /// Open a bound archive without creating, migrating or switching an unknown database.
     pub async fn open_existing(path: &Path, expected_archive_id: &str) -> Result<Self> {
-        let conn = SqliteConnection::connect_with(&SqliteConnectOptions::new()
-            .filename(path).create_if_missing(false).foreign_keys(true)).await
-            .context("open bound archive")?;
+        Self::open_bound(path, expected_archive_id, None).await
+    }
+
+    /// [`Db::open_existing`] for one long-prepared write: wait up to `busy` for another process's
+    /// lock, at `BEGIN` and at `COMMIT`, instead of sqlx's five seconds.
+    pub async fn open_existing_patient(path: &Path, expected_archive_id: &str, busy: std::time::Duration) -> Result<Self> {
+        Self::open_bound(path, expected_archive_id, Some(busy)).await
+    }
+
+    async fn open_bound(path: &Path, expected_archive_id: &str, busy: Option<std::time::Duration>) -> Result<Self> {
+        let options = SqliteConnectOptions::new().filename(path).create_if_missing(false).foreign_keys(true);
+        let options = match busy { Some(busy) => options.busy_timeout(busy), None => options };
+        let conn = SqliteConnection::connect_with(&options).await.context("open bound archive")?;
         let mut db = Self { conn };
         if db.archive_id().await? != expected_archive_id {
             anyhow::bail!("archive identity mismatch; files preserved");
         }
         Ok(db)
+    }
+
+    /// Open an existing database for reading only. It never creates or migrates the file, and it
+    /// cannot write: a journal left by a killed writer makes the read fail here instead of being
+    /// replayed by a command that may still refuse.
+    pub async fn open_read_only(path: &Path) -> Result<Self> {
+        Self::open_read_only_within(path, None).await
+    }
+
+    /// [`Db::open_read_only`], waiting `busy` for another process's lock instead of sqlx's five
+    /// seconds.
+    pub async fn open_read_only_within(path: &Path, busy: Option<std::time::Duration>) -> Result<Self> {
+        let options = SqliteConnectOptions::new().filename(path).create_if_missing(false).read_only(true).foreign_keys(true);
+        let options = match busy { Some(busy) => options.busy_timeout(busy), None => options };
+        let conn = SqliteConnection::connect_with(&options).await.with_context(|| format!("open {} for reading", path.display()))?;
+        Ok(Self { conn })
     }
 
     /// Bring an already-open bound archive to this binary's schema, on this connection: the file
@@ -417,36 +445,7 @@ impl Db {
         .await
         .context("insert meeting")?;
         let meeting_id = res.last_insert_rowid();
-
-        let mut seg_ids = Vec::with_capacity(segs.len());
-        for (i, s) in segs.iter().enumerate() {
-            let r = sqlx::query(
-                "INSERT INTO transcript_segments \
-                 (meeting_id, seq, speaker, text, t_start, t_end, confidence) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(meeting_id)
-            .bind(i as i64)
-            .bind(s.speaker.as_sql())
-            .bind(s.text.as_str())
-            .bind(s.t_start)
-            .bind(s.t_end)
-            .bind(s.confidence)
-            .execute(&mut *tx)
-            .await
-            .with_context(|| format!("insert segment {i}"))?;
-            seg_ids.push(r.last_insert_rowid());
-        }
-
-        let by_id: Vec<SegmentVoice> = voices
-            .iter()
-            .map(|v| {
-                let idx = usize::try_from(v.segment).ok().filter(|i| *i < seg_ids.len());
-                idx.map(|i| SegmentVoice { segment: seg_ids[i], ..v.clone() })
-                    .ok_or_else(|| anyhow!("voice refers to segment index {} of {}", v.segment, seg_ids.len()))
-            })
-            .collect::<Result<_>>()?;
-        write_clusters(&mut tx, meeting_id, clusters, &by_id, meta.created_at).await?;
+        write_transcript(&mut tx, meeting_id, segs, clusters, voices, meta.created_at).await?;
         if let Some(key) = key {
             sqlx::query("INSERT INTO session_ingests (session_key, meeting_id) VALUES (?, ?)")
                 .bind(key).bind(meeting_id).execute(&mut *tx).await?;
@@ -995,10 +994,97 @@ impl Db {
         Ok(res.rows_affected())
     }
 
+    /// The origin a meeting's row records. `None` when there is no such meeting, and also when the
+    /// file has no origin column (schema v3): unlike [`Db::get_meeting`], which reads every row
+    /// of a v3 file as `batch`, this never says `batch` for a row nothing marked.
+    pub async fn recorded_origin(&mut self, id: i64) -> Result<Option<TranscriptOrigin>> {
+        let mut tx = self.conn.begin().await.context("begin origin read")?;
+        let origin = if has_origin_column(&mut tx).await? {
+            sqlx::query_scalar::<_, Option<String>>("SELECT transcript_origin FROM meetings WHERE id = ?")
+                .bind(id).fetch_optional(&mut *tx).await.context("read transcript origin")?
+                .map(|stored| match stored {
+                    Some(token) => TranscriptOrigin::from_sql(&token).with_context(|| format!("unknown transcript origin '{token}'")),
+                    None => Ok(TranscriptOrigin::Batch),
+                }).transpose()?
+        } else { None };
+        tx.commit().await.context("end origin read")?;
+        Ok(origin)
+    }
+
+    /// The live-stored meetings, oldest first (`finalize --all-live`).
+    pub async fn live_meeting_ids(&mut self) -> Result<Vec<i64>> {
+        let mut tx = self.conn.begin().await.context("begin live meetings read")?;
+        let ids = if has_origin_column(&mut tx).await? {
+            sqlx::query_scalar("SELECT id FROM meetings WHERE transcript_origin = 'live' ORDER BY started_at, id")
+                .fetch_all(&mut *tx).await.context("list live meetings")?
+        } else { Vec::new() };
+        tx.commit().await.context("end live meetings read")?;
+        Ok(ids)
+    }
+
+    /// How many of a meeting's voices carry a name set by hand (`speakers label`, a manual merge).
+    pub async fn manual_names(&mut self, meeting_id: i64) -> Result<i64> {
+        sqlx::query_scalar("SELECT COUNT(*) FROM voice_clusters WHERE meeting_id = ? AND assigned_by = 'manual'")
+            .bind(meeting_id).fetch_one(&mut self.conn).await.context("count manual names")
+    }
+
+    /// Replace a live-stored meeting's transcript with the batch pass's, under the same meeting id
+    /// and the same session ingest, in ONE transaction. `voices[i].segment` indexes `segs`.
+    ///
+    /// The two checks run inside the transaction because the pass before it takes about half an
+    /// hour: the row must still be `live`, and no voice may carry a name set by hand unless
+    /// `drop_names` (deleting such a cluster deletes its voiceprint with it). Any error leaves
+    /// every row as it was. The caller closes this connection after an error and reads the
+    /// outcome on a new one: a `COMMIT` that reports an error may still have happened.
+    pub async fn replace_meeting_transcript(
+        &mut self,
+        meeting_id: i64,
+        meta: &MeetingMeta,
+        segs: &[TranscriptSegment],
+        clusters: &[NewCluster],
+        voices: &[SegmentVoice],
+        drop_names: bool,
+    ) -> Result<()> {
+        let mut tx = self.conn.begin_with("BEGIN IMMEDIATE").await.context("begin replace tx")?;
+        anyhow::ensure!(has_origin_column(&mut tx).await?, "meeting {meeting_id} is not a live transcript; nothing was replaced");
+        let origin: Option<Option<String>> = sqlx::query_scalar("SELECT transcript_origin FROM meetings WHERE id = ?")
+            .bind(meeting_id).fetch_optional(&mut *tx).await.context("read transcript origin")?;
+        anyhow::ensure!(origin.flatten().as_deref() == Some(TranscriptOrigin::Live.as_sql()),
+            "meeting {meeting_id} is not a live transcript; nothing was replaced");
+        let manual: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM voice_clusters WHERE meeting_id = ? AND assigned_by = 'manual'")
+            .bind(meeting_id).fetch_one(&mut *tx).await.context("count manual names")?;
+        anyhow::ensure!(manual == 0 || drop_names,
+            "meeting {meeting_id} has {manual} manual name(s) on its voices; nothing was replaced (--drop-names deletes them and their voiceprints)");
+        // Clusters first: their memberships and voiceprints cascade. Then the segments.
+        sqlx::query("DELETE FROM voice_clusters WHERE meeting_id = ?")
+            .bind(meeting_id).execute(&mut *tx).await.context("delete the live meeting's clusters")?;
+        sqlx::query("DELETE FROM transcript_segments WHERE meeting_id = ?")
+            .bind(meeting_id).execute(&mut *tx).await.context("delete the live meeting's segments")?;
+        write_transcript(&mut tx, meeting_id, segs, clusters, voices, meta.created_at).await?;
+        sqlx::query("UPDATE meetings SET model = ?, lang = ?, duration_secs = ?, segment_count = ?, created_at = ?, transcript_origin = ? WHERE id = ?")
+            .bind(meta.model.as_str()).bind(meta.lang.as_str()).bind(meta.duration_secs).bind(segs.len() as i64)
+            .bind(meta.created_at).bind(TranscriptOrigin::Batch.as_sql()).bind(meeting_id)
+            .execute(&mut *tx).await.context("mark the meeting as the batch transcript")?;
+        #[cfg(test)]
+        crate::pipeline::cutpoint("replace_in_transaction");
+        tx.commit().await.context("commit replace tx")?;
+        Ok(())
+    }
+
     pub async fn close(self) -> Result<()> {
         self.conn.close().await.context("close sqlite connection")?;
         Ok(())
     }
+}
+
+/// Whether an error is SQLite saying the database is locked by someone else (`SQLITE_BUSY` or
+/// `SQLITE_LOCKED`, with or without an extended code): the file is there and may answer later,
+/// unlike a file that is missing or is not this archive.
+pub fn in_use(error: &anyhow::Error) -> bool {
+    error.chain().filter_map(|cause| cause.downcast_ref::<sqlx::Error>()).any(|cause| match cause {
+        sqlx::Error::Database(database) => database.code().and_then(|code| code.parse::<i32>().ok()).is_some_and(|code| matches!(code & 0xff, 5 | 6)),
+        _ => false,
+    })
 }
 
 /// Whether this file has `meetings.transcript_origin` (schema v4). Asked inside the caller's
@@ -1073,6 +1159,49 @@ fn window_from_row(r: &SqliteRow) -> Result<WindowRow> {
         inherited: r.try_get::<i64, _>("inherited")? != 0,
         embedding: r.try_get("embedding")?,
     })
+}
+
+/// Write a meeting's segments, then its voice clusters, inside a caller-owned transaction.
+/// `voices[i].segment` indexes `segs` and is turned into the row id that segment was given; an
+/// index outside `segs` is an error, never a pointer at another meeting's segment. The insert of
+/// a new meeting and the replacement of a live-stored one both store through this.
+async fn write_transcript(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    meeting_id: i64,
+    segs: &[TranscriptSegment],
+    clusters: &[NewCluster],
+    voices: &[SegmentVoice],
+    created_at: i64,
+) -> Result<()> {
+    let mut seg_ids = Vec::with_capacity(segs.len());
+    for (i, s) in segs.iter().enumerate() {
+        let r = sqlx::query(
+            "INSERT INTO transcript_segments \
+             (meeting_id, seq, speaker, text, t_start, t_end, confidence) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(meeting_id)
+        .bind(i as i64)
+        .bind(s.speaker.as_sql())
+        .bind(s.text.as_str())
+        .bind(s.t_start)
+        .bind(s.t_end)
+        .bind(s.confidence)
+        .execute(&mut **tx)
+        .await
+        .with_context(|| format!("insert segment {i}"))?;
+        seg_ids.push(r.last_insert_rowid());
+    }
+
+    let by_id: Vec<SegmentVoice> = voices
+        .iter()
+        .map(|v| {
+            let idx = usize::try_from(v.segment).ok().filter(|i| *i < seg_ids.len());
+            idx.map(|i| SegmentVoice { segment: seg_ids[i], ..v.clone() })
+                .ok_or_else(|| anyhow!("voice refers to segment index {} of {}", v.segment, seg_ids.len()))
+        })
+        .collect::<Result<_>>()?;
+    write_clusters(tx, meeting_id, clusters, &by_id, created_at).await
 }
 
 /// Write clusters + memberships inside a caller-owned transaction. `voices[i].segment` are
@@ -1919,5 +2048,141 @@ mod tests {
             "stored transcript text is raw ASR output and must never be rewritten in place — \
              presentation belongs in render.rs, which is what keeps re-rendering retroactive"
         );
+    }
+
+    // ------------------------------------------------------------------ finalize: the replacement
+
+    const LIVE_KEY: &str = "abababababababababababababababab";
+
+    /// A live-stored meeting (two segments, no voices) stored after another meeting, so that its
+    /// segment ids do not start at 1 and a segment INDEX used as an id would hit the other meeting.
+    async fn live_after_another(db: &mut Db) -> i64 {
+        db.insert_meeting(&meta(), &[seg(Speaker::You, 0.0, "first a"), seg(Speaker::Others, 1.0, "first b"), seg(Speaker::Others, 2.0, "first c")]).await.unwrap();
+        let live = MeetingMeta { origin: TranscriptOrigin::Live, model: "ggml-live".into(), ..meta() };
+        db.insert_keyed_meeting_with_voices(&live, &[seg(Speaker::You, 0.0, "live a"), seg(Speaker::Others, 1.0, "live b")], &[], &[], LIVE_KEY).await.unwrap()
+    }
+
+    fn batch_meta() -> MeetingMeta {
+        MeetingMeta { model: "ggml-large-v3".into(), lang: "en".into(), duration_secs: 99.0, created_at: 1_752_999_999, ..meta() }
+    }
+
+    fn batch_segs() -> Vec<TranscriptSegment> {
+        vec![seg(Speaker::You, 0.0, "batch a"), seg(Speaker::Others, 1.0, "batch b"), seg(Speaker::Others, 2.0, "batch c")]
+    }
+
+    async fn texts(db: &mut Db, id: i64) -> Vec<String> {
+        db.load_segments(id).await.unwrap().into_iter().map(|s| s.seg.text).collect()
+    }
+
+    #[tokio::test]
+    async fn replacing_a_live_transcript_keeps_the_meeting_and_points_every_voice_at_its_own_segments() {
+        let mut db = Db::open_in_memory().await.unwrap();
+        let id = live_after_another(&mut db).await;
+        db.replace_meeting_transcript(id, &batch_meta(), &batch_segs(), &[new_cluster("A", 2, 2.0)], &[voice(1, 0, false), voice(2, 0, true)], false).await.unwrap();
+
+        let row = db.get_meeting(id).await.unwrap().unwrap();
+        assert_eq!((row.origin, row.model.as_str(), row.lang.as_str(), row.duration_secs, row.segment_count, row.created_at),
+            (TranscriptOrigin::Batch, "ggml-large-v3", "en", 99.0, 3, 1_752_999_999));
+        assert_eq!((row.title.as_str(), row.started_at), ("team sync", 1_752_900_000), "what the meeting is does not change");
+        assert_eq!(db.ingest_id(LIVE_KEY).await.unwrap(), Some(id), "same meeting behind the same session");
+        assert_eq!(db.list_meetings().await.unwrap().len(), 2);
+        let stored = db.load_segments(id).await.unwrap();
+        assert_eq!(stored.iter().map(|s| (s.seg.text.as_str(), s.voice_cluster.as_deref())).collect::<Vec<_>>(),
+            [("batch a", None), ("batch b", Some("A")), ("batch c", Some("A"))]);
+        let foreign: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM segment_voices sv JOIN transcript_segments ts ON ts.id = sv.segment_id WHERE ts.meeting_id != ?")
+            .bind(id).fetch_one(&mut db.conn).await.unwrap();
+        assert_eq!(foreign, 0, "a voice was attached to another meeting's segment");
+        assert_eq!(texts(&mut db, 1).await, ["first a", "first b", "first c"], "the other meeting is untouched");
+        let orphans: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transcript_segments WHERE text LIKE 'live %'").fetch_one(&mut db.conn).await.unwrap();
+        assert_eq!(orphans, 0, "the live segments are gone");
+    }
+
+    #[tokio::test]
+    async fn a_replacement_that_cannot_finish_leaves_every_row_as_it_was() {
+        let mut db = Db::open_in_memory().await.unwrap();
+        let id = live_after_another(&mut db).await;
+        // The last voice names a segment that does not exist: by then the old rows are deleted
+        // and the new segments inserted, and all of it has to come back.
+        let error = db.replace_meeting_transcript(id, &batch_meta(), &batch_segs(), &[new_cluster("A", 1, 1.0)], &[voice(1, 0, false), voice(3, 0, false)], false).await.unwrap_err();
+        assert!(format!("{error:#}").contains("segment index 3 of 3"), "{error:#}");
+        let row = db.get_meeting(id).await.unwrap().unwrap();
+        assert_eq!((row.origin, row.model.as_str(), row.segment_count), (TranscriptOrigin::Live, "ggml-live", 2));
+        assert_eq!(texts(&mut db, id).await, ["live a", "live b"]);
+        assert!(db.list_clusters(id).await.unwrap().is_empty());
+
+        // Only a live row is ever replaced: a batch meeting, and an id nobody has, are refused.
+        for refused in [1, 999] {
+            let error = db.replace_meeting_transcript(refused, &batch_meta(), &batch_segs(), &[], &[], true).await.unwrap_err();
+            assert!(format!("{error:#}").contains("is not a live transcript"), "{error:#}");
+        }
+        assert_eq!(texts(&mut db, 1).await, ["first a", "first b", "first c"]);
+        assert_eq!(db.get_meeting(1).await.unwrap().unwrap().model, "ggml-large-v3.bin");
+
+        // And once replaced it is a batch row: a second replacement is refused too.
+        db.replace_meeting_transcript(id, &batch_meta(), &batch_segs(), &[], &[], false).await.unwrap();
+        assert!(db.replace_meeting_transcript(id, &batch_meta(), &[seg(Speaker::You, 0.0, "again")], &[], &[], false).await.is_err());
+        assert_eq!(texts(&mut db, id).await, ["batch a", "batch b", "batch c"]);
+    }
+
+    #[tokio::test]
+    async fn a_name_set_by_hand_stops_the_replacement_unless_names_are_dropped() {
+        let mut db = Db::open_in_memory().await.unwrap();
+        let id = live_after_another(&mut db).await;
+        // `speakers cluster` then `speakers label` on the live-stored meeting.
+        let far = db.load_segments(id).await.unwrap()[1].id;
+        db.replace_meeting_clusters(id, &[new_cluster("A", 1, 1.0)], &[voice(far, 0, false)], 1_752_900_500).await.unwrap();
+        let cluster = db.get_cluster(id, "A").await.unwrap().unwrap();
+        let person = db.add_speaker("Ada", "Example", 1_752_900_500).await.unwrap();
+
+        // A name the tool matched by itself is not the owner's: it does not stop anything.
+        db.set_cluster_speaker(cluster.id, Some(person), Some("auto"), Some(0.9)).await.unwrap();
+        assert_eq!(db.manual_names(id).await.unwrap(), 0);
+
+        db.set_cluster_speaker(cluster.id, Some(person), Some("manual"), None).await.unwrap();
+        db.add_voiceprint(person, &cluster, 1_752_900_500).await.unwrap();
+        assert_eq!(db.manual_names(id).await.unwrap(), 1);
+        let error = db.replace_meeting_transcript(id, &batch_meta(), &batch_segs(), &[new_cluster("A", 2, 2.0)], &[voice(1, 0, false)], false).await.unwrap_err();
+        assert_eq!(crate::diagnostics::error_class(&error), "speaker_conflict", "{error:#}");
+        assert_eq!(texts(&mut db, id).await, ["live a", "live b"], "a refused replacement deletes nothing");
+        assert_eq!(db.get_cluster(id, "A").await.unwrap().unwrap().assigned_by.as_deref(), Some("manual"));
+        assert_eq!(db.get_speaker(person).await.unwrap().unwrap().voiceprints, 1);
+        assert_eq!(db.get_meeting(id).await.unwrap().unwrap().origin, TranscriptOrigin::Live);
+
+        db.replace_meeting_transcript(id, &batch_meta(), &batch_segs(), &[new_cluster("A", 2, 2.0)], &[voice(1, 0, false)], true).await.unwrap();
+        assert_eq!(texts(&mut db, id).await, ["batch a", "batch b", "batch c"]);
+        let person = db.get_speaker(person).await.unwrap().expect("the person stays; only this meeting's voiceprint goes");
+        assert_eq!(person.voiceprints, 0);
+        assert_eq!(db.get_cluster(id, "A").await.unwrap().unwrap().assigned_by, None, "the new cluster carries no name");
+    }
+
+    #[tokio::test]
+    async fn the_recorded_origin_never_calls_an_unmarked_row_batch_on_a_v3_file() {
+        let dir = tempdir();
+        let path = dir.join("v3.db");
+        let identity = Db::create_v3_archive(&path).await.unwrap();
+        let mut db = Db::open_existing(&path, &identity).await.unwrap();
+        let id = db.insert_meeting(&meta(), &[seg(Speaker::You, 0.0, "hola")]).await.unwrap();
+        assert_eq!(db.get_meeting(id).await.unwrap().unwrap().origin, TranscriptOrigin::Batch);
+        assert_eq!(db.recorded_origin(id).await.unwrap(), None, "a v3 file records no origin");
+        assert!(db.live_meeting_ids().await.unwrap().is_empty());
+        db.close().await.unwrap();
+
+        // The read-only open reads the same file and leaves it at v3.
+        let mut reader = Db::open_read_only(&path).await.unwrap();
+        assert_eq!(reader.archive_id().await.unwrap(), identity);
+        assert_eq!(reader.schema_version().await.unwrap(), 3);
+        assert!(sqlx::query("DELETE FROM meetings").execute(&mut reader.conn).await.is_err(), "a read-only connection wrote");
+        reader.close().await.unwrap();
+        assert!(Db::open_read_only(&dir.join("absent.db")).await.is_err());
+        assert!(!dir.join("absent.db").exists(), "a read-only open created a database");
+
+        let mut db = Db::open(&path).await.unwrap();
+        assert_eq!(db.recorded_origin(id).await.unwrap(), Some(TranscriptOrigin::Batch), "an unmarked row of a v4 file is a batch transcript");
+        assert_eq!(db.recorded_origin(999).await.unwrap(), None);
+        let live = live_after_another(&mut db).await;
+        assert_eq!(db.recorded_origin(live).await.unwrap(), Some(TranscriptOrigin::Live));
+        assert_eq!(db.live_meeting_ids().await.unwrap(), [live]);
+        db.close().await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -57,10 +57,11 @@ fn safe_fields(fields: Map<String, Value>) -> Option<Map<String, Value>> {
                 "model_stage_ready" | "model_published" | "runtime_stage_ready" | "runtime_backup_retained" |
                 "runtime_published" | "runtime_restored" | "stop_requested" | "stop_received" | "status_published" | "recovery_scan_failed" | "launch_failure_persist_failed" |
                 "live_started" | "live_lag" | "live_stopped" | "live_failed" |
-                "live_promoted" | "live_promotion_rejected")),
+                "live_promoted" | "live_promotion_rejected" |
+                "finalize_started" | "finalize_committed" | "finalize_published" | "finalize_failed")),
             // Live-lane measurements: numbers only, so a transcript can never ride along.
             "audio_secs" | "decoded_secs" => value.as_f64().is_some_and(|value| value.is_finite() && value >= 0.0),
-            "segments" | "short_windows" | "lag_ms" | "merged_segments" | "wait_ms" => value.as_u64().is_some(),
+            "segments" | "short_windows" | "lag_ms" | "merged_segments" | "wait_ms" | "clusters" => value.as_u64().is_some(),
             // Why a live stream was not stored: one of the gate's reasons, never free text.
             "reason" => value.as_str().is_some_and(crate::promote::Reject::is_known),
             "session_id" | "instance_id" => value.as_str().is_some_and(|value| value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())),
@@ -285,6 +286,28 @@ mod tests {
             assert_eq!(withheld["event"], "invalid_event", "{field}");
             assert!(!withheld.to_string().contains("SYNTHETIC_PRIVATE_SENTENCE"), "{field}");
         }
+    }
+
+    #[test]
+    fn finalize_events_keep_their_numbers_and_never_carry_text() {
+        let event = |fields: Value| formatted(&log::Record::builder().target("meetscribe::event")
+            .args(format_args!("{fields}")).build(), "synthetic-run");
+        let session = "a6e79ba0314c4cc2b647f4d25b327011";
+        for name in ["finalize_started", "finalize_committed", "finalize_published"] {
+            let kept = event(json!({"component":"pipeline", "event":name, "session_id":session, "outcome":"ok",
+                "segments":682, "clusters":19, "text":"SYNTHETIC_PRIVATE_SENTENCE"}));
+            assert_eq!((kept["component"].as_str(), kept["event"].as_str(), kept["session_id"].as_str()), (Some("pipeline"), Some(name), Some(session)));
+            assert_eq!((kept["segments"].as_u64(), kept["clusters"].as_u64()), (Some(682), Some(19)), "{name}");
+            assert!(!kept.to_string().contains("SYNTHETIC_PRIVATE_SENTENCE"), "{name}");
+        }
+        // A failure is a class, with the guidance for that class, and may have no session yet.
+        let failed = event(json!({"component":"pipeline", "event":"finalize_failed", "outcome":"error", "error_class":"speaker_conflict"}));
+        assert_eq!((failed["event"].as_str(), failed["error_class"].as_str()), (Some("finalize_failed"), Some("speaker_conflict")));
+        assert!(failed["help"].is_string() && failed["session_id"].is_null());
+        // Text where the count of voices belongs withholds the whole event.
+        let withheld = event(json!({"component":"pipeline", "event":"finalize_committed", "session_id":session, "clusters":"SYNTHETIC_PRIVATE_SENTENCE"}));
+        assert_eq!(withheld["event"], "invalid_event");
+        assert!(!withheld.to_string().contains("SYNTHETIC_PRIVATE_SENTENCE"));
     }
 
     #[test]

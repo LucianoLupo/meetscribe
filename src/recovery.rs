@@ -58,9 +58,58 @@ pub struct State {
     pub meeting_id: Option<i64>,
     pub publication: Option<PathBuf>,
     pub unarchived_manual_output: bool,
+    /// For a live-stored meeting: which published files are this tool's own, so `finalize` can
+    /// replace those and no others. Carried untyped on purpose: a value this binary cannot read
+    /// must never make the whole state unreadable. [`State::provisional`] is the typed view, and
+    /// a value it cannot read counts as no record. Absent, and not written, for every other session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provisional: Option<serde_json::Value>,
+}
+
+/// Most hashes kept per published file. Promotion writes one; each `finalize` run that reaches
+/// its publication step adds one, so only repeated interrupted runs come near the limit.
+pub const PROVISIONAL_HASHES: usize = 16;
+
+/// The publication record of a live-stored meeting: the directory its pair was published in and
+/// the sha256 of every version of each file this tool wrote there. A file whose hash is listed is
+/// the tool's own; anything else was changed by someone and is left alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Provisional {
+    pub dir: PathBuf,
+    pub markdown: Vec<String>,
+    pub json: Vec<String>,
+}
+
+impl Provisional {
+    pub fn new(dir: &Path, markdown: Option<String>, json: Option<String>) -> Self {
+        Self { dir: dir.to_path_buf(), markdown: markdown.into_iter().collect(), json: json.into_iter().collect() }
+    }
+
+    fn valid(&self) -> bool {
+        let hashes = |list: &[String]| list.len() <= PROVISIONAL_HASHES && list.iter().all(|hash|
+            hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        self.dir.is_absolute() && hashes(&self.markdown) && hashes(&self.json)
+    }
+
+    /// Add the hashes of a pair about to be published; nothing already listed is ever removed.
+    /// `false`, with the record unchanged, when a list is full.
+    #[must_use]
+    pub fn append(&mut self, markdown: &str, json: &str) -> bool {
+        let room = |list: &[String], hash: &str| list.iter().any(|known| known == hash) || list.len() < PROVISIONAL_HASHES;
+        if !room(&self.markdown, markdown) || !room(&self.json, json) { return false; }
+        for (list, hash) in [(&mut self.markdown, markdown), (&mut self.json, json)] {
+            if !list.iter().any(|known| known == hash) { list.push(hash.to_owned()); }
+        }
+        true
+    }
 }
 
 impl State {
+    /// The publication record, when there is one this binary can read.
+    pub fn provisional(&self) -> Option<Provisional> {
+        serde_json::from_value::<Provisional>(self.provisional.clone()?).ok().filter(Provisional::valid)
+    }
+
     pub fn read(dir: &Path) -> Result<Self> {
         let path = dir.join(STATE_FILE);
         if fs::metadata(&path)?.len() > 1_048_576 { bail!("session metadata exceeds its size limit"); }
@@ -188,7 +237,7 @@ impl Session {
             archive_id: None, phase: Phase::Recording, capture_status: CaptureStatus::Unknown,
             rolls: Vec::new(), duration_seconds: 0.0, attempts: 0, in_flight: false,
             next_retry: 0, error_class: None, meeting_id: None, publication: None,
-            unarchived_manual_output: false,
+            unarchived_manual_output: false, provisional: None,
         };
         let lock = SessionLock::acquire(&state.lock_dir, &state.key)?.context("new capture session is busy")?;
         let session = Self { dir, state, _lock: lock };
@@ -363,6 +412,28 @@ impl Session {
         Ok(())
     }
 
+    /// Note the pair just published for a live-stored meeting. Not saved here: the `complete`
+    /// that follows a publication saves it together with the publication itself.
+    pub fn published_provisional(&mut self, record: &Provisional) -> Result<()> {
+        self.state.provisional = Some(serde_json::to_value(record).context("publication record")?);
+        Ok(())
+    }
+
+    /// Save the record now. `finalize` does this twice: when `--overwrite` adopts the files it
+    /// finds, and with the hashes of a render before that render replaces anything.
+    pub fn save_provisional(&mut self, record: &Provisional) -> Result<()> {
+        self.published_provisional(record)?;
+        self.save()
+    }
+
+    /// The last save of a `finalize`: the published pair is the stored batch transcript, so the
+    /// record goes and the state is that of any batch session.
+    pub fn finalized(&mut self, duration_seconds: f64, publication: &Path) -> Result<()> {
+        self.state.duration_seconds = duration_seconds;
+        self.state.provisional = None;
+        self.complete(publication)
+    }
+
     pub fn protect_outputs(&mut self) -> Result<()> {
         self.state.unarchived_manual_output = true;
         self.save()
@@ -437,30 +508,16 @@ impl Session {
         Ok(())
     }
 
+    /// Whether the recording can be decoded straight from this directory: every committed roll
+    /// file is there and holds exactly its committed frames, so `inputs` would make no repaired
+    /// copy. Reads only; the same checks and the same errors as `inputs`, and nothing is saved.
+    pub fn inputs_intact(&self) -> Result<bool> {
+        Ok(!self.committed_sources()?.0)
+    }
+
     /// Validate every committed roll. Repair only into fresh copies, preserving original tails.
     pub fn inputs(&mut self) -> Result<PathBuf> {
-        if !self.state.rolls.iter().any(|roll| roll.mic_frames > 0 || roll.system_frames > 0) {
-            bail!("recording has no trusted nonzero checkpoint; files preserved");
-        }
-        let mut copy_required = false;
-        let mut sources = Vec::new();
-        for roll in &self.state.rolls {
-            for (channel, frames) in [("mic", roll.mic_frames), ("system", roll.system_frames)] {
-                let name = roll_name(channel, roll.index);
-                let path = self.dir.join(&name);
-                let offset = if frames == 0 && !path.exists() { None } else {
-                    Some(committed_data_offset(&path, roll.sample_rate, frames)?)
-                };
-                let exact = hound::WavReader::open(&path).is_ok_and(|reader| {
-                    let spec = reader.spec();
-                    spec.channels == 1 && spec.sample_rate == roll.sample_rate
-                        && spec.bits_per_sample == 32 && spec.sample_format == hound::SampleFormat::Float
-                        && u64::from(reader.len()) == frames
-                });
-                copy_required |= !exact;
-                sources.push((path, name, roll.sample_rate, frames, offset));
-            }
-        }
+        let (copy_required, sources) = self.committed_sources()?;
         if self.state.capture_status == CaptureStatus::Unknown {
             self.state.capture_status = CaptureStatus::Partial;
         }
@@ -491,6 +548,34 @@ impl Session {
         Ok(destination)
     }
 
+    /// The read-only half of `inputs`: each committed channel file with where its samples start,
+    /// and whether any of them is not exactly its committed prefix (a copy would be required).
+    fn committed_sources(&self) -> Result<(bool, Vec<CommittedSource>)> {
+        if !self.state.rolls.iter().any(|roll| roll.mic_frames > 0 || roll.system_frames > 0) {
+            bail!("recording has no trusted nonzero checkpoint; files preserved");
+        }
+        let mut copy_required = false;
+        let mut sources = Vec::new();
+        for roll in &self.state.rolls {
+            for (channel, frames) in [("mic", roll.mic_frames), ("system", roll.system_frames)] {
+                let name = roll_name(channel, roll.index);
+                let path = self.dir.join(&name);
+                let offset = if frames == 0 && !path.exists() { None } else {
+                    Some(committed_data_offset(&path, roll.sample_rate, frames)?)
+                };
+                let exact = hound::WavReader::open(&path).is_ok_and(|reader| {
+                    let spec = reader.spec();
+                    spec.channels == 1 && spec.sample_rate == roll.sample_rate
+                        && spec.bits_per_sample == 32 && spec.sample_format == hound::SampleFormat::Float
+                        && u64::from(reader.len()) == frames
+                });
+                copy_required |= !exact;
+                sources.push((path, name, roll.sample_rate, frames, offset));
+            }
+        }
+        Ok((copy_required, sources))
+    }
+
     pub fn capture_failed(&mut self) -> Result<()> {
         self.state.phase = Phase::NeedsAttention;
         self.state.error_class = Some("capture_io".into());
@@ -499,6 +584,10 @@ impl Session {
         Ok(())
     }
 }
+
+/// One committed channel file: its path, its name, its sample rate, its committed frames and
+/// where its samples start (`None` for a channel that recorded nothing and has no file).
+type CommittedSource = (PathBuf, String, u32, u64, Option<u64>);
 
 pub(crate) fn roll_name(channel: &str, index: u32) -> String {
     if index == 0 { format!("{channel}.wav") } else { format!("{channel}.{index:03}.wav") }

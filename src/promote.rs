@@ -530,12 +530,17 @@ mod tests {
         assert_eq!(handed, Some(None), "without the flag the pipeline is told nothing");
     }
 
-    /// A live-stored meeting's Markdown names `meetscribe finalize <id>`. An unknown subcommand
-    /// starts a recording, so until the command exists it has to be a known one that fails.
+    /// A live-stored meeting's Markdown names `meetscribe finalize <id>`. An unknown word after
+    /// `meetscribe` starts a recording, so whatever is wrong with a `finalize` command line it
+    /// has to end as a usage error of that command, in the log's class for one.
     #[test]
-    fn finalize_is_refused_instead_of_falling_through_to_a_capture() {
-        let refused = crate::run_subcommand(&args(&["meetscribe", "finalize", "57"])).expect("finalize fell through to the capture path");
-        assert!(format!("{:#}", refused.unwrap_err()).contains("not part of this build"));
+    fn finalize_without_a_meeting_is_a_usage_error_and_never_a_capture() {
+        for argv in [&["meetscribe", "finalize"][..], &["meetscribe", "finalize", "--drop-names"], &["meetscribe", "finalize", "--no-such-flag", "57"],
+            &["meetscribe", "finalize", "57", "--all-live"], &["meetscribe", "finalize", "57", "58", "--session", "/synthetic/recording"]] {
+            let refused = crate::run_subcommand(&args(argv)).expect("finalize fell through to the capture path");
+            let error = refused.unwrap_err();
+            assert_eq!(crate::diagnostics::error_class(&error), "invalid_args", "{argv:?}: {error:#}");
+        }
         // The capture path itself is unchanged: no subcommand, or flags only, is still a capture.
         assert!(crate::run_subcommand(&args(&["meetscribe"])).is_none());
         assert!(crate::run_subcommand(&args(&["meetscribe", "--seconds", "300"])).is_none());

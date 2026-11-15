@@ -1626,6 +1626,7 @@ dependencies = [
  "rubato 0.15.0",
  "serde",
  "serde_json",
+ "sha2",
  "silero",
  "sqlx",
  "tao",

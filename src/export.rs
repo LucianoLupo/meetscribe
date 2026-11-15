@@ -65,6 +65,45 @@ pub fn to_json(segs: &[RenderedSegment]) -> Result<String> {
     serde_json::to_string_pretty(segs).context("serialize transcript json")
 }
 
+/// sha256 of `bytes` in lowercase hex: how a published file is recognised as one this tool wrote.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
+/// The two files a meeting publishes, rendered: `transcript.md` and `transcript.json`.
+pub struct Pair {
+    pub markdown: String,
+    pub json: String,
+}
+
+impl Pair {
+    pub fn render(meeting: &MeetingRow, segs: &[RenderedSegment]) -> Result<Self> {
+        Ok(Self { markdown: to_markdown(meeting, segs), json: to_json(segs)? })
+    }
+
+    /// The sha256 of each file as it would be written: (markdown, json).
+    pub fn hashes(&self) -> (String, String) {
+        (sha256_hex(self.markdown.as_bytes()), sha256_hex(self.json.as_bytes()))
+    }
+}
+
+/// The hashes of the Markdown and the JSON a meeting publishes as: (markdown, json).
+pub fn pair_hashes(meeting: &MeetingRow, segs: &[RenderedSegment]) -> Result<(String, String)> {
+    Ok(Pair::render(meeting, segs)?.hashes())
+}
+
+/// Put `contents` in place of the file at `path` in one rename; a reader sees the old file or the
+/// new one, never part of either.
+pub fn replace_file(path: &Path, contents: &str) -> Result<()> {
+    atomic_export(path, contents, PublishMode::Replace)
+}
+
+/// Create the file at `path`; an existing one is an error and is left as it is.
+pub fn create_file(path: &Path, contents: &str) -> Result<()> {
+    atomic_export(path, contents, PublishMode::CreateNew)
+}
+
 /// Speaker-labeled, timestamped Markdown for one meeting.
 pub fn to_markdown(m: &MeetingRow, segs: &[RenderedSegment]) -> String {
     let mut out = String::new();
@@ -129,6 +168,8 @@ fn atomic_export(path: &Path, contents: &str, mode: PublishMode) -> Result<()> {
         let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary)?;
         file.write_all(contents.as_bytes())?;
         file.sync_all()?;
+        #[cfg(test)]
+        crate::pipeline::cutpoint("export_staged");
         match mode {
             PublishMode::Replace => std::fs::rename(&temporary, path)?,
             PublishMode::CreateNew => {

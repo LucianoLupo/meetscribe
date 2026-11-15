@@ -12,7 +12,7 @@ impl pipeline::SpeechEngine for SyntheticEngine {
     fn windows(&mut self, audio: &[f32]) -> Result<Vec<vad::SpeechWindow>> {
         Ok(if audio.is_empty() { Vec::new() } else { vec![vad::SpeechWindow { start_ms: 0, end_ms: audio.len() / 16 }] })
     }
-    fn transcribe(&mut self, audio: &[f32], _lang: &str, _words: bool) -> Result<(String, f32, Vec<asr::Word>)> {
+    fn transcribe(&mut self, audio: &[f32], _lang: &str, words: bool) -> Result<(String, f32, Vec<asr::Word>)> {
         if !self.no_store && self.root.join("storage-fault").exists() {
             crate::new_runtime()?.block_on(async {
                 let mut connection = sqlx::SqliteConnection::connect_with(&sqlx::sqlite::SqliteConnectOptions::new()
@@ -22,12 +22,23 @@ impl pipeline::SpeechEngine for SyntheticEngine {
                 connection.close().await?; anyhow::Ok(())
             })?;
         }
+        // Far-end windows of a run that splits are decoded with word timings, after the diarizer started.
+        cutpoint(if words { "decoding_far_end" } else { "decoding" });
         let text = if audio.first().is_some_and(|value| *value < 0.0) {
             "We approved the synthetic deployment window"
         } else { "The synthetic release checklist is ready" };
-        Ok((text.into(), 0.94, Vec::new()))
+        // A run that splits far-end chunks asks for word timings: one word in each half of the window.
+        let half = audio.len() as f64 / 32_000.0;
+        let timed = if words { vec![asr::Word { text: "approved".into(), t_start: 0.2, t_end: half - 0.2 },
+            asr::Word { text: "deployed".into(), t_start: half + 0.2, t_end: 2.0 * half - 0.2 }] } else { Vec::new() };
+        Ok((text.into(), 0.94, timed))
     }
-    fn embed(&mut self, _audio: &[f32]) -> Result<Option<Vec<f32>>> { Ok(Some(vec![1.0 / 192.0f32.sqrt(); 192])) }
+    /// One voice for every fixture, and a second one, orthogonal to it, for audio below -0.7.
+    fn embed(&mut self, audio: &[f32]) -> Result<Option<Vec<f32>>> {
+        let second = audio.first().is_some_and(|value| *value < -0.7);
+        let sign = |axis: usize| if second && axis % 2 == 1 { -1.0f32 } else { 1.0 };
+        Ok(Some((0..192).map(|axis| sign(axis) / 192.0f32.sqrt()).collect()))
+    }
 }
 fn backend(_model: &str, opts: &pipeline::PipelineOpts) -> Result<Box<dyn pipeline::SpeechEngine>> {
     let root = PathBuf::from(std::env::var_os("MEETSCRIBE_PIPELINE_FIXTURE_ROOT").context("fixture root absent")?);
@@ -53,15 +64,25 @@ fn cutpoint(point: &str) {
     }
 }
 
+/// A failure a test switches on by name: the file `fault` in the fixture root holds that name.
+fn fault(point: &str) -> bool {
+    let root = PathBuf::from(std::env::var_os("MEETSCRIBE_PIPELINE_FIXTURE_ROOT").unwrap());
+    fs::read_to_string(root.join("fault")).is_ok_and(|selected| selected.trim() == point)
+}
+
 #[test]
 #[ignore = "sacrificial entry invoked explicitly by mandatory audit parent tests"]
 fn pipeline_child() {
     let root = PathBuf::from(std::env::var_os("MEETSCRIBE_PIPELINE_FIXTURE_ROOT").expect("fixture root required"));
-    crate::diagnostics::init(); pipeline::test_engine(backend); pipeline::test_cutpoints(cutpoint);
+    crate::diagnostics::init(); pipeline::test_engine(backend); pipeline::test_cutpoints(cutpoint); pipeline::test_faults(fault);
     // A promotion test may shorten the wait for the live reader: "<stale ms> <cap ms>".
     if let Ok(limits) = fs::read_to_string(root.join("promote-wait")) {
         let mut ms = limits.split_whitespace().map(|value| Duration::from_millis(value.parse().unwrap()));
         crate::promote::test_wait(crate::promote::Wait { stale: ms.next().unwrap(), cap: ms.next().unwrap(), poll: Duration::from_millis(5) });
+    }
+    // A finalize test may shorten the wait for a locked database: "<ms>".
+    if let Ok(wait) = fs::read_to_string(root.join("busy-timeout-ms")) {
+        crate::finalize::test_busy_timeout(Duration::from_millis(wait.trim().parse().unwrap()));
     }
     recovery::atomic_json(&root.join(format!("entry-{}.json", std::process::id())),
         &serde_json::json!({"event":"pipeline_child_entered", "pid":std::process::id()})).unwrap();
@@ -73,6 +94,7 @@ fn pipeline_child() {
         Some("transcribe") => crate::run_transcribe_using(&argv[1..], |dir, opts, promote_live| pipeline::transcribe_with_clock(dir, opts, promote_live, || now)),
         Some("rerender") => crate::run_rerender(&argv[1..]),
         Some("export") => crate::run_export(&argv[1..]),
+        Some("finalize") => crate::finalize::run(&argv[1..]),
         _ => panic!("unsupported sacrificial CLI command"),
     };
     if let Err(error) = result { crate::diagnostics::command_failed(&error); std::process::exit(1); }
@@ -843,6 +865,79 @@ fn ordinary_no_store_child_succeeds_without_a_database() {
     println!(r#"{{"event":"audit_case_complete","case":"f3_unmanaged_no_store_child","iterations":5}}"#);
 }
 
+/// Segments and voice clusters of a stored meeting, as the database has them.
+fn stored_voices(fixture: &Fixture, id: i64) -> (Vec<db::StoredSegment>, Vec<db::ClusterRow>) {
+    crate::new_runtime().unwrap().block_on(async {
+        let mut db = db::Db::open_existing(&fixture.opts.db_path, fixture.state().archive_id.as_deref().unwrap()).await.unwrap();
+        let stored = (db.load_segments(id).await.unwrap(), db.list_clusters(id).await.unwrap());
+        db.close().await.unwrap(); stored
+    })
+}
+
+/// The far end of the fixture becomes two voices: 1.5 s of one, then 1.5 s of another, with the
+/// diarizer's turns replayed from a file. Returns the fixture set up to split at that change.
+fn two_voice_fixture() -> Fixture {
+    let (mut fixture, owner) = Fixture::new(); drop(owner);
+    let mut wav = hound::WavWriter::create(fixture.dir.join("system.wav"), hound::WavSpec {
+        channels: 1, sample_rate: 16_000, bits_per_sample: 32, sample_format: hound::SampleFormat::Float }).unwrap();
+    for frame in 0..48_000 { wav.write_sample(if frame < 24_000 { -0.5f32 } else { -0.9f32 }).unwrap(); } wav.finalize().unwrap();
+    let turns = fixture.root.join("turns.rttm");
+    fs::write(&turns, "SPEAKER far 1 0.000 1.500 <NA> <NA> speaker_0 <NA> <NA>\nSPEAKER far 1 1.500 1.500 <NA> <NA> speaker_1 <NA> <NA>\n").unwrap();
+    fixture.opts.split = true; fixture.opts.diarizer_rttm = Some(turns);
+    fixture
+}
+
+/// The batch pass with the far-end split on, which is what the daemon runs by default. The
+/// expected values are frozen from the build before `transcribe_core` was divided in two (f138d42),
+/// not regenerated from this code: they pin what that pass stores and writes.
+#[test]
+fn the_batch_pass_with_the_far_end_split_stores_what_it_did_before_it_was_divided() {
+    let fixture = two_voice_fixture();
+    let output = child_output(&fixture, spawn_cli(&fixture, &transcribe_argv(&fixture, &fixture.job())));
+    assert!(output.status.success(), "split transcription failed: {output:?}");
+    let rows = fixture.meetings(); assert_eq!(rows.len(), 1);
+    let (segments, clusters) = stored_voices(&fixture, rows[0].id);
+    let facts = format!("{}\n{}\n{}",
+        segments.iter().map(|s| format!("{:?} {:.3}-{:.3} {:?} {}", s.seg.speaker, s.seg.t_start, s.seg.t_end, s.voice_cluster, s.seg.text)).collect::<Vec<_>>().join("\n"),
+        clusters.iter().map(|c| format!("{} windows={} secs={:.3} speaker={:?}", c.cluster, c.n_windows, c.speech_secs, c.speaker_id)).collect::<Vec<_>>().join("\n"),
+        fs::read_to_string(fixture.dir.join("transcript.json")).unwrap());
+    assert_eq!(facts, SPLIT_FACTS);
+    assert_eq!((rows[0].segment_count, rows[0].origin), (segments.len() as i64, db::TranscriptOrigin::Batch));
+    assert_eq!(proofs(&fixture), (true, true));
+    assert!(session_snapshot(&fixture.dir).keys().all(|path| !path.file_name().unwrap().to_str().unwrap().starts_with(".diar-")));
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+const SPLIT_FACTS: &str = r#"You 0.000-3.000 None The synthetic release checklist is ready
+Others 0.000-1.500 Some("A") approved
+Others 1.500-3.000 Some("B") deployed
+A windows=1 secs=1.500 speaker=None
+B windows=1 secs=1.500 speaker=None
+[
+  {
+    "speaker": "you",
+    "text": "The synthetic release checklist is ready",
+    "t_start": 0.0,
+    "t_end": 3.0,
+    "confidence": 0.94
+  },
+  {
+    "speaker": "others",
+    "text": "approved",
+    "t_start": 0.0,
+    "t_end": 1.5,
+    "confidence": 0.94,
+    "voice_cluster": "A"
+  },
+  {
+    "speaker": "others",
+    "text": "deployed",
+    "t_start": 1.5,
+    "t_end": 3.0,
+    "confidence": 0.94,
+    "voice_cluster": "B"
+  }
+]"#;
+
 // ---- Promotion: the live stream becomes the stored transcript (`promote.rs`). The stream is
 // fictional and written by hand in the reader's format; the child is the real argv, parser and
 // pipeline. `child_args` does not pass the flag yet (the daemon is wired later), so it is appended.
@@ -877,6 +972,12 @@ fn promote_argv(fixture: &Fixture, job: &TranscribeJob) -> Vec<String> {
     argv.extend(["--promote-live".to_string(), live_dir(fixture).display().to_string()]); argv
 }
 
+/// The record promotion must leave: the pair in `dir`, each file by the hash of what is on disk.
+fn record_of(dir: &Path) -> recovery::Provisional {
+    let hash = |name: &str| Some(crate::export::sha256_hex(&fs::read(dir.join(name)).unwrap()));
+    recovery::Provisional::new(dir, hash("transcript.md"), hash("transcript.json"))
+}
+
 fn proofs(fixture: &Fixture) -> (bool, bool) {
     let session = recovery::Session::open(&fixture.dir).unwrap().unwrap();
     (session.proof(recovery::ProofScope::Archive).unwrap(), session.proof(recovery::ProofScope::Retention).unwrap())
@@ -908,6 +1009,7 @@ fn a_complete_live_stream_is_stored_without_inference_and_only_once() {
         assert!(stderr.contains("\"event\":\"live_promoted\"") && stderr.contains("\"merged_segments\":2"), "no promotion event in: {stderr}");
         assert!(!stderr.contains("live deployment window"), "meeting text reached the log");
         assert_eq!(proofs(&fixture), (true, true), "the files are a render of the stored rows, and only owned files exist");
+        assert_eq!(state.provisional(), Some(record_of(&fixture.dir)), "promotion records the pair it published");
 
         // The same command again: a Complete session is not due. It fails and changes nothing.
         let before = session_snapshot(&fixture.dir); let database = fs::read(&fixture.opts.db_path).unwrap();
@@ -963,6 +1065,7 @@ fn a_stream_that_cannot_be_promoted_runs_the_batch_pass_in_the_same_attempt() {
         assert_eq!((state.phase, state.attempts), (recovery::Phase::Complete, 1), "{reason}: exactly one attempt is reserved");
         assert_eq!(state.publication.as_deref(), Some(fixture.dir.as_path()), "{reason}");
         assert!(!fs::read_to_string(fixture.dir.join("transcript.md")).unwrap().contains("provisional"), "{reason}");
+        assert!(!fs::read_to_string(fixture.dir.join(recovery::STATE_FILE)).unwrap().contains("provisional"), "{reason}: a batch session's state gains no key");
         assert_eq!(proofs(&fixture), (true, true), "{reason}");
         fs::remove_dir_all(fixture.root).unwrap();
     }
@@ -1019,7 +1122,1100 @@ fn a_promotion_killed_after_its_commit_is_finished_from_the_stored_meeting() {
             assert!(fs::read_to_string(publication.join("transcript.md")).unwrap().contains(&format!("`meetscribe finalize {id}`")));
             assert!(!fixture.dir.join("transcript.md").exists());
             assert_eq!(proofs(&fixture), (true, false), "the archive proof holds; a .recovered directory is not owned capture material");
+            assert_eq!(fixture.state().provisional(), Some(record_of(&publication)), "a retry records the place it published in");
             fs::remove_dir_all(fixture.root).unwrap();
         }
     }
+}
+
+/// The child dies after both files are written and before the state that would record them is
+/// saved. The retry publishes beside them and records that pair; the first pair stays, unrecorded.
+#[test]
+fn a_promotion_killed_before_its_record_is_saved_is_retried_and_then_has_one() {
+    let (fixture, owner) = Fixture::new(); drop(owner);
+    write_stream(&fixture, &stream_events(&fixture));
+    fs::write(fixture.root.join("forbid-inference"), b"the live stream is the transcript\n").unwrap();
+    fs::write(fixture.root.join("cutpoint"), "published\n").unwrap();
+    let argv = promote_argv(&fixture, &fixture.job());
+    assert_eq!(child_output(&fixture, spawn_cli(&fixture, &argv)).status.code(), Some(85));
+    let state = fixture.state();
+    assert_eq!((state.phase, state.in_flight, state.provisional.is_none()), (recovery::Phase::Archived, true, true));
+    let root = (fs::read(fixture.dir.join("transcript.md")).unwrap(), fs::read(fixture.dir.join("transcript.json")).unwrap());
+    fs::remove_file(fixture.root.join("cutpoint")).unwrap();
+
+    assert_eq!(child_output(&fixture, spawn_cli(&fixture, &argv)).status.code(), Some(1), "the first visit only charges the abandoned attempt");
+    fs::write(fixture.root.join("clock"), format!("{}\n", fixture.state().next_retry)).unwrap();
+    let finished = child_output(&fixture, spawn_cli(&fixture, &argv));
+    assert!(finished.status.success(), "the retry failed: {finished:?}");
+    let state = fixture.state(); let publication = state.publication.clone().unwrap();
+    assert_eq!(state.phase, recovery::Phase::Complete);
+    assert!(publication.starts_with(fixture.dir.join(".recovered").join(&state.key)));
+    assert_eq!(state.provisional(), Some(record_of(&publication)));
+    assert_eq!((fs::read(fixture.dir.join("transcript.md")).unwrap(), fs::read(fixture.dir.join("transcript.json")).unwrap()), root, "the first pair is left as it was");
+    assert_eq!(fixture.meetings().len(), 1);
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+// ---- Finalize: a live-stored meeting is replaced by the batch transcript (`finalize.rs`). The
+// meeting is promoted through the real child first, exactly as the promotion tests do it.
+
+const LIVE_WORDS: [&str; 2] = ["live release checklist", "live deployment window"];
+const BATCH_WORDS: [&str; 2] = ["synthetic release checklist", "synthetic deployment window"];
+
+/// A fixture whose meeting was stored from its live stream; returns it with the meeting id.
+fn promoted() -> (Fixture, i64) {
+    let (fixture, owner) = Fixture::new(); drop(owner);
+    write_stream(&fixture, &stream_events(&fixture));
+    let output = child_output(&fixture, spawn_cli(&fixture, &promote_argv(&fixture, &fixture.job())));
+    assert!(output.status.success(), "promotion failed: {output:?}");
+    assert!(!fixture.root.join("engine-ran").exists());
+    let rows = fixture.meetings(); assert_eq!((rows.len(), rows[0].origin), (1, db::TranscriptOrigin::Live));
+    (fixture, rows[0].id)
+}
+
+fn finalize_argv(fixture: &Fixture, id: i64, extra: &[&str]) -> Vec<String> {
+    let mut argv: Vec<String> = ["finalize", &id.to_string(), "--db", fixture.opts.db_path.to_str().unwrap(),
+        "--base", fixture.base.to_str().unwrap(), "--lang", "en", "--model", fixture.opts.model.to_str().unwrap()]
+        .into_iter().map(String::from).collect();
+    argv.extend(extra.iter().map(|flag| flag.to_string())); argv
+}
+
+fn finalize(fixture: &Fixture, id: i64, extra: &[&str]) -> std::process::Output {
+    child_output(fixture, spawn_cli(fixture, &finalize_argv(fixture, id, extra)))
+}
+
+/// Every entry under a directory with what a rewrite would change even when the bytes stay the
+/// same: its inode and its modification time. Directories are listed too, so an added empty one shows.
+fn entries(dir: &Path) -> std::collections::BTreeMap<PathBuf, (u64, std::time::SystemTime, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let mut found = std::collections::BTreeMap::new();
+    for entry in fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap(); let metadata = fs::symlink_metadata(entry.path()).unwrap();
+        found.insert(entry.path(), (metadata.ino(), metadata.modified().unwrap(), metadata.len()));
+        if metadata.is_dir() { found.extend(entries(&entry.path())); }
+    }
+    found
+}
+
+/// What "unchanged" means for a session and its database: same bytes, same files (not rewritten
+/// in place), no entry added or removed, and the database byte for byte.
+#[derive(PartialEq, Debug)]
+struct Untouched { files: std::collections::BTreeMap<PathBuf, Vec<u8>>, entries: std::collections::BTreeMap<PathBuf, (u64, std::time::SystemTime, u64)>, database: Vec<u8> }
+fn untouched(fixture: &Fixture) -> Untouched {
+    Untouched { files: session_snapshot(&fixture.dir), entries: entries(&fixture.dir), database: fs::read(&fixture.opts.db_path).unwrap() }
+}
+
+/// The end state of a finished `finalize`, whatever road led to it.
+fn assert_finalized(fixture: &Fixture, id: i64, before: &recovery::State) {
+    let rows = fixture.meetings(); assert_eq!(rows.len(), 1, "finalize must not add a meeting");
+    assert_eq!((rows[0].id, rows[0].origin, rows[0].model.as_str(), rows[0].lang.as_str()), (id, db::TranscriptOrigin::Batch, "synthetic-model", "en"));
+    let (segments, clusters) = stored_voices(fixture, id);
+    assert_eq!(rows[0].segment_count, segments.len() as i64);
+    assert!(!clusters.is_empty(), "the batch pass finds the far-end voices the live lane does not");
+    assert!(segments.iter().all(|segment| BATCH_WORDS.iter().any(|words| segment.seg.text.contains(words))), "a live segment survived");
+    let state = fixture.state();
+    assert_eq!((state.phase, state.attempts, state.in_flight, state.meeting_id), (recovery::Phase::Complete, before.attempts, false, Some(id)));
+    assert_eq!(state.publication, before.publication, "the pair is replaced where it was published");
+    assert!(!fs::read_to_string(fixture.dir.join(recovery::STATE_FILE)).unwrap().contains("provisional"), "the record is removed with the last save");
+    let publication = state.publication.unwrap();
+    let markdown = fs::read_to_string(publication.join("transcript.md")).unwrap();
+    assert!(!markdown.contains("provisional") && BATCH_WORDS.iter().all(|words| markdown.contains(words)));
+    let session = recovery::Session::open(&fixture.dir).unwrap().unwrap();
+    assert!(session.proof(recovery::ProofScope::Archive).unwrap(), "the published pair is the render of the stored rows");
+    drop(session);
+    let scratch = fixture.base.join("scratch");
+    assert!(!scratch.exists() || fs::read_dir(&scratch).unwrap().next().is_none(), "a scratch directory was left behind");
+    assert!(session_snapshot(&fixture.dir).keys().all(|path| !path.file_name().unwrap().to_str().unwrap().starts_with(".diar-")));
+}
+
+fn no_meeting_text(output: &std::process::Output) {
+    let said = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    for words in LIVE_WORDS.iter().chain(&BATCH_WORDS) { assert!(!said.contains(words), "meeting text reached the terminal or the log: {words}"); }
+}
+
+#[test]
+fn a_promoted_meeting_is_finalized_under_the_same_id() {
+    for _ in 0..3 {
+        let (fixture, id) = promoted();
+        let before = fixture.state();
+        let live_json = fs::read(fixture.dir.join("transcript.json")).unwrap();
+        let output = finalize(&fixture, id, &[]);
+        assert!(output.status.success(), "finalize failed: {output:?}");
+        assert_finalized(&fixture, id, &before);
+        assert_eq!(proofs(&fixture), (true, true), "and the session is prunable like any batch session");
+        assert!(!fixture.dir.join(".recovered").exists());
+        assert_ne!(fs::read(fixture.dir.join("transcript.json")).unwrap(), live_json);
+        assert!(fixture.root.join("engine-ran").is_file(), "the batch pass did not run");
+        no_meeting_text(&output);
+        let (stdout, stderr) = (String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(stdout.contains(&format!("meeting {id}: finalized")), "{stdout}");
+        for event in ["finalize_started", "finalize_committed", "finalize_published"] {
+            assert!(stderr.contains(&format!("\"event\":\"{event}\"")), "{event} is not in the log: {stderr}");
+        }
+        assert!(stderr.contains("\"clusters\":1") && stderr.contains(&format!("\"session_id\":\"{}\"", before.key)), "{stderr}");
+        assert!(!stderr.contains("invalid_event"), "an event was withheld by the log allowlist: {stderr}");
+
+        // Again: the meeting is final. It says so, exits 0, loads no engine and changes nothing.
+        fs::remove_file(fixture.root.join("engine-ran")).unwrap();
+        let unchanged = untouched(&fixture);
+        let again = finalize(&fixture, id, &[]);
+        assert!(again.status.success(), "{again:?}");
+        assert!(String::from_utf8_lossy(&again.stdout).contains("already the full transcript"));
+        assert!(!fixture.root.join("engine-ran").exists());
+        assert_eq!(untouched(&fixture), unchanged);
+        fs::remove_dir_all(fixture.root).unwrap();
+    }
+}
+
+// ---- Finalize: helpers shared by the refusal, kill and interleaving tests.
+
+fn stderr_of(output: &std::process::Output) -> String { String::from_utf8_lossy(&output.stderr).into_owned() }
+
+/// Rewrite the session's state file through plain JSON, as an older build or a hand edit would.
+fn edit_state(fixture: &Fixture, edit: impl FnOnce(&mut serde_json::Value)) {
+    let path = fixture.dir.join(recovery::STATE_FILE);
+    let mut raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    edit(&mut raw);
+    fs::write(&path, format!("{raw}\n")).unwrap();
+}
+
+/// Run statements against the fixture's archive on a connection of the test's own.
+fn sql(fixture: &Fixture, statements: &[&str]) {
+    crate::new_runtime().unwrap().block_on(async {
+        let mut connection = sqlx::SqliteConnection::connect_with(&sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&fixture.opts.db_path).create_if_missing(false).foreign_keys(true)).await.unwrap();
+        for statement in statements { sqlx::query(statement).execute(&mut connection).await.unwrap(); }
+        connection.close().await.unwrap();
+    });
+}
+
+/// Give the meeting one far-end voice cluster, as `speakers cluster` does, optionally named by hand.
+fn add_voice(fixture: &Fixture, id: i64, manual: bool) {
+    crate::new_runtime().unwrap().block_on(async {
+        let mut db = db::Db::open_existing(&fixture.opts.db_path, fixture.state().archive_id.as_deref().unwrap()).await.unwrap();
+        let far = db.load_segments(id).await.unwrap().into_iter().find(|segment| segment.seg.speaker == crate::transcript::Speaker::Others).unwrap().id;
+        let centroid: Vec<u8> = [1.0f32, 0.0].iter().flat_map(|value| value.to_le_bytes()).collect();
+        let cluster = db::NewCluster { cluster: "A".into(), speaker_id: None, assigned_by: None, match_score: None, centroid, dim: 2, n_windows: 1, speech_secs: 1.2 };
+        db.replace_meeting_clusters(id, &[cluster], &[db::SegmentVoice { segment: far, cluster: 0, inherited: false, embedding: None }], START).await.unwrap();
+        if manual {
+            let stored = db.get_cluster(id, "A").await.unwrap().unwrap();
+            let person = db.add_speaker("Ada", "Example", START).await.unwrap();
+            db.set_cluster_speaker(stored.id, Some(person), Some("manual"), None).await.unwrap();
+            db.add_voiceprint(person, &stored, START).await.unwrap();
+        }
+        db.close().await.unwrap();
+    });
+}
+
+/// Run `finalize` until the test-only point `point`, where the child exits without unwinding.
+fn finalize_killed_at(fixture: &Fixture, id: i64, point: &str, extra: &[&str]) {
+    fs::write(fixture.root.join("cutpoint"), format!("{point}\n")).unwrap();
+    let killed = finalize(fixture, id, extra);
+    assert_eq!(killed.status.code(), Some(85), "finalize did not reach {point}: {killed:?}");
+    let ack: serde_json::Value = serde_json::from_slice(&fs::read(fixture.root.join("cutpoint-ack.json")).unwrap()).unwrap();
+    assert_eq!(ack["point"], point);
+    fs::remove_file(fixture.root.join("cutpoint")).unwrap(); fs::remove_file(fixture.root.join("cutpoint-ack.json")).unwrap();
+}
+
+fn resume_argv(fixture: &Fixture) -> Vec<String> {
+    let mut job = fixture.job(); job.opts.resume = true; transcribe_argv(fixture, &job)
+}
+
+fn origin(fixture: &Fixture) -> db::TranscriptOrigin { fixture.meetings()[0].origin }
+
+/// The run must not have needed the engine: used after a stop that follows the commit.
+fn forbid_engine(fixture: &Fixture) {
+    let _ = fs::remove_file(fixture.root.join("engine-ran"));
+    fs::write(fixture.root.join("forbid-inference"), b"the batch transcript is already stored\n").unwrap();
+}
+
+/// A diarizer that only waits: installed where `finalize` looks for one under `--base`. While the
+/// file `hold` is beside it, it writes its pid and sleeps; without it, it fails at once and the
+/// pass falls back to whole chunks.
+fn install_waiting_diarizer(fixture: &Fixture) -> PathBuf {
+    let bin_dir = fixture.base.join("models/diarizer/bin"); fs::create_dir_all(&bin_dir).unwrap();
+    fs::write(fixture.base.join(crate::DIARIZER_MODEL_REL), b"gguf").unwrap();
+    let bin = fixture.base.join(crate::DIARIZER_BIN_REL);
+    fs::write(&bin, "#!/bin/sh\nhere=$(dirname \"$0\")\n[ -f \"$here/hold\" ] || exit 1\necho $$ > \"$here/pid\"\nexec sleep 30\n").unwrap();
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(bin_dir.join("hold"), b"wait\n").unwrap();
+    bin_dir
+}
+
+/// A stop before the transaction, of the hardest kind: SIGKILL from outside, in the middle of a
+/// decode, with the diarizer running. Nothing under the session directory has changed and nothing
+/// will: the daemon's own visit finds a `Complete` session and leaves it.
+#[test]
+fn finalize_killed_during_the_pass_has_changed_nothing_and_nothing_follows() {
+    let (fixture, id) = promoted();
+    let bin_dir = install_waiting_diarizer(&fixture);
+    let (before, state, proof) = (untouched(&fixture), fixture.state(), proofs(&fixture));
+    fs::write(fixture.root.join("holdpoint"), "decoding_far_end\n").unwrap();
+    let mut child = spawn_cli(&fixture, &finalize_argv(&fixture, id, &[]));
+    wait_for_owner(&fixture, "decoding_far_end");
+
+    // Mid-pass: the diarizer is running, on a copy of the audio that is NOT in the session.
+    let scratch = fixture.base.join("scratch");
+    let runs: Vec<PathBuf> = fs::read_dir(&scratch).unwrap().map(|entry| entry.unwrap().path()).collect();
+    assert_eq!(runs.len(), 1, "one scratch directory per run");
+    assert!(runs[0].file_name().unwrap().to_str().unwrap().starts_with(&format!("finalize-{}-", state.key)));
+    let working: Vec<String> = fs::read_dir(&runs[0]).unwrap().map(|entry| entry.unwrap().file_name().into_string().unwrap()).collect();
+    assert!(working.iter().any(|name| name.starts_with(".diar-") && name.ends_with(".wav")), "the diarizer was not given the scratch directory: {working:?}");
+    // The diarizer was spawned a moment ago; give its first line the time to run.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let diarizer: i32 = loop {
+        if let Some(pid) = fs::read_to_string(bin_dir.join("pid")).ok().and_then(|pid| pid.trim().parse().ok()) { break pid; }
+        assert!(std::time::Instant::now() < deadline, "the diarizer is not running");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(untouched(&fixture), before, "the pass wrote under the session directory");
+
+    child.kill().unwrap(); // SIGKILL: no destructor runs, the diarizer is orphaned
+    let _ = child.wait().unwrap();
+    // SAFETY: a plain signal to the fixture's own orphaned `sleep`; no memory is passed.
+    unsafe { libc::kill(diarizer, libc::SIGKILL); }
+    fs::remove_file(fixture.root.join("holdpoint")).unwrap(); fs::remove_file(fixture.root.join("hold-ack.json")).unwrap();
+    assert_eq!(untouched(&fixture), before, "a killed finalize left a trace in the session or the database");
+    assert_eq!(origin(&fixture), db::TranscriptOrigin::Live);
+
+    // The daemon's visit, and retention's question, get the answers they got before.
+    let visit = child_output(&fixture, spawn_cli(&fixture, &transcribe_argv(&fixture, &fixture.job())));
+    assert_eq!(visit.status.code(), Some(1), "a Complete session is not due");
+    assert_eq!(untouched(&fixture), before);
+    assert_eq!(proofs(&fixture), proof);
+    assert!(!fixture.dir.join(".recovered").exists());
+
+    // A second run clears the first one's scratch directory and finishes.
+    fs::remove_file(bin_dir.join("hold")).unwrap();
+    let output = finalize(&fixture, id, &[]);
+    assert!(output.status.success(), "the second finalize failed: {output:?}");
+    assert_finalized(&fixture, id, &state);
+    assert!(!runs[0].exists(), "the killed run's scratch directory was left");
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+#[test]
+fn every_refusal_of_finalize_leaves_the_session_and_the_database_as_they_were() {
+    type Arrange = fn(&Fixture, i64);
+    let cases: [(&str, Arrange, &str); 9] = [
+        ("a call is being recorded", |fixture, _| {
+            fs::write(fixture.base.join("status.json"), format!("{}\n", serde_json::json!({"state": "recording", "app": "Chrome", "since_epoch": START, "updated_epoch": START, "pid": 1}))).unwrap();
+            assert!(crate::status::call_is_live(&fixture.base), "the fixture's status file is not read as a recording");
+        }, "a call is being recorded"),
+        ("a name set by hand", |fixture, id| add_voice(fixture, id, true), "manual name"),
+        ("a file changed by hand", |fixture, _| {
+            let path = fixture.dir.join("transcript.md"); let edited = format!("{}\nmy own note\n", fs::read_to_string(&path).unwrap()); fs::write(path, edited).unwrap();
+        }, "was changed since meetscribe wrote it"),
+        ("no record", |fixture, _| edit_state(fixture, |state| { state.as_object_mut().unwrap().remove("provisional"); }), "--overwrite"),
+        ("a record for another directory", |fixture, _| edit_state(fixture, |state| state["provisional"]["dir"] = serde_json::json!(fixture.root)), "--overwrite"),
+        ("a session that is not complete", |fixture, _| edit_state(fixture, |state| state["phase"] = serde_json::json!("archived")), "is not complete"),
+        ("a missing recording file", |fixture, _| fs::remove_file(fixture.dir.join("system.wav")).unwrap(), ""),
+        ("a scratch place that points into the session", |fixture, _| std::os::unix::fs::symlink(&fixture.dir, fixture.base.join("scratch")).unwrap(), "not a real directory"),
+        ("a relative stored path", |fixture, _| sql(fixture, &["UPDATE meetings SET source_dir = 'recording'"]), "--session"),
+    ];
+    for (name, arrange, said) in cases {
+        let (fixture, id) = promoted();
+        arrange(&fixture, id);
+        let before = untouched(&fixture);
+        let output = finalize(&fixture, id, &[]);
+        assert_eq!(output.status.code(), Some(1), "{name}: {output:?}");
+        assert_eq!(untouched(&fixture), before, "{name}: a refused finalize changed something");
+        assert!(!fixture.root.join("engine-ran").exists(), "{name}: refused only after the pass had started");
+        let stderr = stderr_of(&output);
+        assert!(stderr.contains(said), "{name}: the reason is not said: {stderr}");
+        assert!(stderr.contains("\"event\":\"finalize_failed\"") && !stderr.contains("invalid_event"), "{name}: {stderr}");
+        assert_eq!(fixture.state().phase, if name.contains("not complete") { recovery::Phase::Archived } else { recovery::Phase::Complete }, "{name}");
+        assert_eq!(origin(&fixture), db::TranscriptOrigin::Live, "{name}");
+        no_meeting_text(&output);
+        fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    // A meeting nobody stored.
+    let (fixture, id) = promoted();
+    let before = untouched(&fixture);
+    let output = finalize(&fixture, id + 41, &[]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr_of(&output).contains("no meeting with id"));
+    assert_eq!(untouched(&fixture), before);
+
+    // The session lock held by someone else (here: this test). Not the daemon's "busy" class,
+    // which its log counts as a recording it must leave alone.
+    let held = recovery::Session::open(&fixture.dir).unwrap().unwrap();
+    let output = finalize(&fixture, id, &[]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("is in use by another meetscribe command") && !stderr.contains("session_busy"), "{stderr}");
+    assert_eq!(untouched(&fixture), before);
+    drop(held);
+
+    // The session of another meeting, named with --session: another key, archive and database.
+    let (other, _) = promoted();
+    let other_before = untouched(&other);
+    let output = finalize(&fixture, id, &["--session", other.dir.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr_of(&output).contains("does not hold the session of meeting"), "{}", stderr_of(&output));
+    assert_eq!((untouched(&fixture), untouched(&other)), (before, other_before));
+    assert!(!fixture.root.join("engine-ran").exists());
+    fs::remove_dir_all(fixture.root).unwrap(); fs::remove_dir_all(other.root).unwrap();
+}
+
+/// The checks that say "this is that meeting's session" run for a `batch` row too: after a stop
+/// that follows the commit, the publish step replaces files, and it must not do that in the
+/// directory of another meeting.
+#[test]
+fn a_replaced_meeting_is_published_only_into_its_own_session() {
+    let (fixture, id) = promoted();
+    finalize_killed_at(&fixture, id, "finalize_committed", &[]);
+    assert_eq!(origin(&fixture), db::TranscriptOrigin::Batch);
+    let before = untouched(&fixture);
+    forbid_engine(&fixture);
+
+    // Copies of the session with one thing wrong each: they share the real session's lock, so
+    // the lock is free and only the identity checks stand between them and the publish step.
+    type Wrong = fn(&mut serde_json::Value);
+    let wrong: [(&str, Wrong); 3] = [
+        ("another meeting id", |state| state["meeting_id"] = serde_json::json!(4242)),
+        ("another key", |state| state["key"] = serde_json::json!("c".repeat(32))),
+        ("another archive", |state| state["archive_id"] = serde_json::json!("d".repeat(32))),
+    ];
+    for (name, change) in wrong {
+        let copy = fixture.root.join("copy");
+        recovery::private_dir(&copy).unwrap();
+        for entry in fs::read_dir(&fixture.dir).unwrap() { let entry = entry.unwrap(); fs::copy(entry.path(), copy.join(entry.file_name())).unwrap(); }
+        let mut raw: serde_json::Value = serde_json::from_slice(&fs::read(copy.join(recovery::STATE_FILE)).unwrap()).unwrap();
+        change(&mut raw); raw["export_dir"] = serde_json::json!(copy); raw["publication"] = serde_json::json!(copy); raw["provisional"]["dir"] = serde_json::json!(copy);
+        fs::write(copy.join(recovery::STATE_FILE), format!("{raw}\n")).unwrap();
+        let copied = session_snapshot(&copy);
+        let output = finalize(&fixture, id, &["--session", copy.to_str().unwrap()]);
+        assert_eq!(output.status.code(), Some(1), "{name}: {output:?}");
+        assert!(stderr_of(&output).contains("does not hold the session of meeting"), "{name}: {}", stderr_of(&output));
+        assert_eq!(session_snapshot(&copy), copied, "{name}: files were replaced in a directory that is not the meeting's");
+        assert_eq!(untouched(&fixture), before, "{name}");
+        fs::remove_dir_all(copy).unwrap();
+    }
+    // The real session, without --session, is finished.
+    let state = fixture.state();
+    let output = finalize(&fixture, id, &[]);
+    assert!(output.status.success(), "{output:?}");
+    assert_finalized(&fixture, id, &state);
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+/// A kill at each step from inside the transaction to the last file. Whatever the step, the
+/// stop is safe for the daemon, for retention and for `transcribe --resume`, and one more
+/// `finalize <id>` reaches the same end, without the engine once the commit has happened.
+#[test]
+fn finalize_killed_at_any_step_is_finished_by_running_it_again() {
+    // (point, row afterwards is batch, archive proof afterwards)
+    let stops = [
+        ("replace_in_transaction", false, true),
+        ("finalize_committed", true, false),
+        ("finalize_hashes_saved", true, false),
+        ("export_staged", true, false),
+        ("finalize_markdown_replaced", true, false),
+        ("finalize_json_replaced", true, true),
+    ];
+    for (point, committed, proof) in stops {
+        let (fixture, id) = promoted();
+        let state = fixture.state();
+        finalize_killed_at(&fixture, id, point, &[]);
+        assert_eq!(origin(&fixture) == db::TranscriptOrigin::Batch, committed, "{point}");
+        assert_eq!(proofs(&fixture).0, proof, "{point}: archive proof");
+        assert_eq!(fixture.state().phase, recovery::Phase::Complete, "{point}: the session never becomes due");
+        assert!(!fixture.dir.join(".recovered").exists(), "{point}");
+        if committed {
+            assert!(fixture.state().provisional().is_some(), "{point}: the record must outlive the commit");
+            // `transcribe --resume` would reset the session and publish a second copy. It refuses.
+            let before = untouched(&fixture);
+            let resumed = child_output(&fixture, spawn_cli(&fixture, &resume_argv(&fixture)));
+            assert_eq!(resumed.status.code(), Some(1), "{point}: {resumed:?}");
+            assert_eq!(untouched(&fixture), before, "{point}: a refused --resume changed something");
+            // And so does the daemon's own visit, which finds nothing due.
+            let visit = child_output(&fixture, spawn_cli(&fixture, &transcribe_argv(&fixture, &fixture.job())));
+            assert_eq!(visit.status.code(), Some(1), "{point}");
+            assert_eq!(untouched(&fixture), before, "{point}");
+            forbid_engine(&fixture);
+        }
+        if committed && !proof {
+            // Files and database disagree: retention must keep the session, however old.
+            let pruned = maintenance::prune_sessions(&fixture.root.join("sessions"), 30, crate::now_epoch() + 100 * 86_400).unwrap();
+            assert_eq!((pruned.removed, fixture.dir.is_dir()), (0, true), "{point}: retention removed a half-published session");
+        }
+        let output = finalize(&fixture, id, &[]);
+        assert!(output.status.success(), "{point}: the second run failed: {output:?}");
+        assert_eq!(fixture.root.join("engine-ran").exists(), !committed, "{point}: the engine runs again only when nothing was committed");
+        assert_finalized(&fixture, id, &state);
+        let leftovers: Vec<String> = fs::read_dir(&fixture.dir).unwrap().map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.ends_with(".tmp")).collect();
+        // A kill between writing a temporary file and renaming it leaves that one file, as on
+        // every publishing path; nothing deletes a file by its name alone.
+        assert_eq!(leftovers.len(), usize::from(point == "export_staged"), "{point}: {leftovers:?}");
+        assert_eq!(proofs(&fixture), (true, point != "export_staged"), "{point}");
+        no_meeting_text(&output);
+        fs::remove_dir_all(fixture.root).unwrap();
+    }
+}
+
+/// A storage error inside the replacement: nothing is exported, nothing is marked, every row is
+/// what it was. (The first transcription of a meeting does the opposite on purpose: there the
+/// transcript exists nowhere else, here it is still stored.)
+#[test]
+fn a_replacement_the_database_refuses_publishes_nothing_and_marks_nothing() {
+    let (fixture, id) = promoted();
+    let state = fixture.state();
+    sql(&fixture, &["CREATE TRIGGER audit_replace_fault BEFORE UPDATE ON meetings BEGIN SELECT RAISE(ABORT, 'synthetic replace fault'); END"]);
+    let before = untouched(&fixture);
+    let output = finalize(&fixture, id, &[]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(fixture.root.join("engine-ran").is_file(), "the pass ran; only the storing failed");
+    assert_eq!(untouched(&fixture), before, "a failed replacement changed the session or the rows");
+    let after = fixture.state();
+    assert_eq!((after.phase, after.unarchived_manual_output, after.attempts), (recovery::Phase::Complete, false, state.attempts));
+    assert_eq!(origin(&fixture), db::TranscriptOrigin::Live);
+    assert_eq!(proofs(&fixture), (true, true));
+    sql(&fixture, &["DROP TRIGGER audit_replace_fault"]);
+    let output = finalize(&fixture, id, &[]);
+    assert!(output.status.success(), "{output:?}");
+    assert_finalized(&fixture, id, &state);
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+/// After the commit a file someone edited is still theirs: it is not replaced, the error names
+/// it, and the record stays so that `--overwrite` can finish.
+#[test]
+fn a_file_edited_after_the_commit_is_replaced_only_with_overwrite() {
+    let (fixture, id) = promoted();
+    let state = fixture.state();
+    finalize_killed_at(&fixture, id, "finalize_committed", &[]);
+    forbid_engine(&fixture);
+    let markdown = fixture.dir.join("transcript.md");
+    let edited = format!("{}\nmy own note\n", fs::read_to_string(&markdown).unwrap());
+    fs::write(&markdown, &edited).unwrap();
+    let json = fs::read(fixture.dir.join("transcript.json")).unwrap();
+
+    let output = finalize(&fixture, id, &[]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(stderr_of(&output).contains("was changed since meetscribe wrote it"), "{}", stderr_of(&output));
+    assert_eq!(fs::read_to_string(&markdown).unwrap(), edited, "an edited file was replaced without --overwrite");
+    assert_eq!(fs::read(fixture.dir.join("transcript.json")).unwrap(), json, "the Markdown comes first; nothing after it is touched");
+    assert!(fixture.state().provisional().is_some());
+
+    let output = finalize(&fixture, id, &["--overwrite"]);
+    assert!(output.status.success(), "{output:?}");
+    assert_finalized(&fixture, id, &state);
+    assert!(!fs::read_to_string(&markdown).unwrap().contains("my own note"));
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+/// A meeting promoted by the build before this one has no record. It is refused, and
+/// `--overwrite` adopts its files BEFORE the pass, so that a run killed after its commit can
+/// still be told from a meeting nobody touched.
+#[test]
+fn a_meeting_with_no_record_needs_overwrite_and_is_then_finished_like_any_other() {
+    let (fixture, id) = promoted();
+    edit_state(&fixture, |state| { state.as_object_mut().unwrap().remove("provisional"); });
+    let state = fixture.state();
+    let before = untouched(&fixture);
+    let refused = finalize(&fixture, id, &[]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert_eq!(untouched(&fixture), before);
+
+    finalize_killed_at(&fixture, id, "finalize_committed", &["--overwrite"]);
+    assert_eq!(origin(&fixture), db::TranscriptOrigin::Batch);
+    assert_eq!(fixture.state().provisional(), Some(record_of(&fixture.dir)), "the adopted files are on record before the commit");
+    let stopped = untouched(&fixture);
+    let resumed = child_output(&fixture, spawn_cli(&fixture, &resume_argv(&fixture)));
+    assert_eq!(resumed.status.code(), Some(1), "{resumed:?}");
+    assert_eq!(untouched(&fixture), stopped);
+    assert!(!fixture.dir.join(".recovered").exists());
+
+    forbid_engine(&fixture);
+    let output = finalize(&fixture, id, &[]); // no flag: the record is there now
+    assert!(output.status.success(), "{output:?}");
+    assert_finalized(&fixture, id, &state);
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+fn add_rule(fixture: &Fixture, pattern: &str, replacement: &str) {
+    crate::new_runtime().unwrap().block_on(async {
+        let mut db = db::Db::open_existing(&fixture.opts.db_path, fixture.state().archive_id.as_deref().unwrap()).await.unwrap();
+        db.add_vocab(pattern, replacement, false, START).await.unwrap(); db.close().await.unwrap();
+    });
+}
+
+/// A vocabulary rule added between two runs changes the render. The file an interrupted run
+/// already replaced then matches neither the live transcript nor the new render; it is still
+/// recognised, because that run saved its hashes before it wrote and nothing is ever removed
+/// from the record until the end.
+#[test]
+fn a_rule_added_between_runs_does_not_strand_a_half_published_meeting() {
+    for kills in [1, 2] {
+        let (fixture, id) = promoted();
+        finalize_killed_at(&fixture, id, "finalize_markdown_replaced", &[]);
+        forbid_engine(&fixture);
+        add_rule(&fixture, "synthetic", "FIRSTRULE");
+        if kills == 2 {
+            finalize_killed_at(&fixture, id, "finalize_markdown_replaced", &[]);
+            add_rule(&fixture, "ready", "SECONDRULE");
+        }
+        let output = finalize(&fixture, id, &[]);
+        assert!(output.status.success(), "{kills} kill(s): {output:?}\n{}", stderr_of(&output));
+        let state = fixture.state();
+        assert!(state.provisional.is_none(), "{kills} kill(s): the record is still there");
+        assert_eq!(proofs(&fixture), (true, true), "{kills} kill(s): both files are the render under the rules as they are now");
+        let markdown = fs::read_to_string(fixture.dir.join("transcript.md")).unwrap();
+        assert!(markdown.contains("FIRSTRULE") && !markdown.contains("provisional"), "{kills} kill(s)");
+        assert_eq!(markdown.contains("SECONDRULE"), kills == 2);
+        assert!(fs::read_to_string(fixture.dir.join("transcript.json")).unwrap().contains("FIRSTRULE"), "{kills} kill(s): the JSON was left behind");
+        fs::remove_dir_all(fixture.root).unwrap();
+    }
+}
+
+/// The record cannot grow without end: the state file has a size limit, and past it nothing
+/// could read the session at all. A seventeenth version is refused before anything is saved.
+#[test]
+fn a_full_record_refuses_and_overwrite_starts_it_again() {
+    let (fixture, id) = promoted();
+    let state = fixture.state();
+    finalize_killed_at(&fixture, id, "finalize_committed", &[]);
+    forbid_engine(&fixture);
+    edit_state(&fixture, |state| {
+        let own = state["provisional"]["markdown"][0].clone();
+        let mut full: Vec<serde_json::Value> = (1..recovery::PROVISIONAL_HASHES).map(|n| serde_json::json!(format!("{n:064x}"))).collect();
+        full.push(own);
+        state["provisional"]["markdown"] = serde_json::json!(full);
+    });
+    assert_eq!(fixture.state().provisional().unwrap().markdown.len(), recovery::PROVISIONAL_HASHES);
+    let before = untouched(&fixture);
+    let output = finalize(&fixture, id, &[]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(stderr_of(&output).contains("--overwrite"), "{}", stderr_of(&output));
+    assert_eq!(untouched(&fixture), before, "a refused publication changed something");
+    let output = finalize(&fixture, id, &["--overwrite"]);
+    assert!(output.status.success(), "{output:?}");
+    assert_finalized(&fixture, id, &state);
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+/// What an owner does after a call without thinking of `finalize`: a vocabulary rule, and
+/// `speakers cluster` (whose effect on the rows is repeated here). Both change how the meeting
+/// renders and rewrite no file, so the files stop being a fresh render. They are still the files
+/// promotion wrote, and that is what is asked.
+#[test]
+fn ordinary_commands_after_the_call_do_not_block_finalize() {
+    let (fixture, id) = promoted();
+    let state = fixture.state();
+    add_voice(&fixture, id, false);
+    add_rule(&fixture, "live", "LIVERULE");
+    assert!(!proofs(&fixture).0, "the fixture did not make the files differ from a fresh render");
+    let output = finalize(&fixture, id, &[]);
+    assert!(output.status.success(), "finalize refused after ordinary commands: {}", stderr_of(&output));
+    assert_finalized(&fixture, id, &state);
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+fn connection(fixture: &Fixture) -> (tokio::runtime::Runtime, sqlx::SqliteConnection) {
+    let runtime = crate::new_runtime().unwrap();
+    let connection = runtime.block_on(sqlx::SqliteConnection::connect_with(&sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&fixture.opts.db_path).create_if_missing(false))).unwrap();
+    (runtime, connection)
+}
+
+/// Wait until the child's pass has started, then long enough for it to have reached the database.
+fn wait_until_stuck_on_the_database(fixture: &Fixture, child: &mut std::process::Child) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !fixture.root.join("engine-ran").exists() {
+        assert!(std::time::Instant::now() < deadline, "the pass never started");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(Duration::from_millis(900));
+    assert!(child.try_wait().unwrap().is_none(), "finalize did not wait for the database");
+}
+
+/// Another process holds the database. A writer makes the replacement wait at `BEGIN`; a reader
+/// lets it begin and makes it wait at `COMMIT`. Either way it waits, commits once, and the run
+/// ends as if nobody had been there. Held past the timeout, the run fails and nothing changed.
+#[test]
+fn the_replacement_waits_for_a_busy_database_and_gives_up_without_a_trace() {
+    // (the other process's statements, where finalize waits)
+    let others: [(&[&str], &str); 2] = [(&["BEGIN IMMEDIATE"], "BEGIN"), (&["BEGIN", "SELECT COUNT(*) FROM meetings"], "COMMIT")];
+    for (statements, at) in others {
+        // Released in time.
+        let (fixture, id) = promoted();
+        let state = fixture.state();
+        let (runtime, mut other) = connection(&fixture);
+        for statement in statements { runtime.block_on(sqlx::query(statement).fetch_all(&mut other)).unwrap(); }
+        let mut child = spawn_cli(&fixture, &finalize_argv(&fixture, id, &[]));
+        wait_until_stuck_on_the_database(&fixture, &mut child);
+        runtime.block_on(sqlx::query("ROLLBACK").execute(&mut other)).unwrap();
+        let output = child_output(&fixture, child);
+        assert!(output.status.success(), "waiting at {at}: {output:?}\n{}", stderr_of(&output));
+        assert_finalized(&fixture, id, &state);
+        runtime.block_on(other.close()).unwrap();
+        fs::remove_dir_all(fixture.root).unwrap();
+
+        // Held past the timeout (shortened for the test).
+        let (fixture, id) = promoted();
+        let state = fixture.state();
+        fs::write(fixture.root.join("busy-timeout-ms"), "300\n").unwrap();
+        let before = untouched(&fixture);
+        let (runtime, mut other) = connection(&fixture);
+        for statement in statements { runtime.block_on(sqlx::query(statement).fetch_all(&mut other)).unwrap(); }
+        let output = finalize(&fixture, id, &[]);
+        assert_eq!(output.status.code(), Some(1), "giving up at {at}: {output:?}");
+        runtime.block_on(sqlx::query("ROLLBACK").execute(&mut other)).unwrap(); runtime.block_on(other.close()).unwrap();
+        assert_eq!(origin(&fixture), db::TranscriptOrigin::Live, "giving up at {at}");
+        assert_eq!(untouched(&fixture), before, "giving up at {at}: a failed replacement left a trace");
+        // And with the database free again, the same command finishes.
+        fs::remove_file(fixture.root.join("busy-timeout-ms")).unwrap();
+        let output = finalize(&fixture, id, &[]);
+        assert!(output.status.success(), "after giving up at {at}: {output:?}");
+        assert_finalized(&fixture, id, &state);
+        fs::remove_dir_all(fixture.root).unwrap();
+    }
+}
+
+/// A `COMMIT` can report an error after it has committed. The connection that saw the error is
+/// never asked: the outcome is read on a new one, and the run goes on to publish.
+#[test]
+fn an_error_reported_after_a_real_commit_is_read_as_committed() {
+    let (fixture, id) = promoted();
+    let state = fixture.state();
+    fs::write(fixture.root.join("fault"), "replace_reports_an_error\n").unwrap();
+    let output = finalize(&fixture, id, &[]);
+    assert!(output.status.success(), "{output:?}\n{}", stderr_of(&output));
+    assert_finalized(&fixture, id, &state);
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+/// A meeting promoted on a retry: the first attempt is killed at `point`, charged, and retried.
+/// Its pair is published under `.recovered/`, never at the session root.
+fn promoted_on_a_retry(point: &str) -> (Fixture, i64) {
+    let (fixture, owner) = Fixture::new(); drop(owner);
+    write_stream(&fixture, &stream_events(&fixture));
+    fs::write(fixture.root.join("cutpoint"), format!("{point}\n")).unwrap();
+    let argv = promote_argv(&fixture, &fixture.job());
+    assert_eq!(child_output(&fixture, spawn_cli(&fixture, &argv)).status.code(), Some(85));
+    fs::remove_file(fixture.root.join("cutpoint")).unwrap(); fs::remove_file(fixture.root.join("cutpoint-ack.json")).unwrap();
+    assert_eq!(child_output(&fixture, spawn_cli(&fixture, &argv)).status.code(), Some(1));
+    fs::write(fixture.root.join("clock"), format!("{}\n", fixture.state().next_retry)).unwrap();
+    let finished = child_output(&fixture, spawn_cli(&fixture, &argv));
+    assert!(finished.status.success(), "the retry failed: {finished:?}");
+    let id = fixture.meetings()[0].id;
+    (fixture, id)
+}
+
+/// Only the pair in the recorded directory is replaced. With no pair at the root, the root stays
+/// empty; with one (the first attempt wrote it and died), it is left as it is and named.
+#[test]
+fn a_meeting_published_beside_the_root_is_replaced_where_it_was_published() {
+    for (point, root_pair) in [("live_committed", false), ("published", true)] {
+        let (fixture, id) = promoted_on_a_retry(point);
+        let state = fixture.state();
+        let publication = state.publication.clone().unwrap();
+        assert!(publication.starts_with(fixture.dir.join(".recovered")), "{point}");
+        assert_eq!(fixture.dir.join("transcript.md").exists(), root_pair, "{point}");
+        let root = root_pair.then(|| (fs::read(fixture.dir.join("transcript.md")).unwrap(), fs::read(fixture.dir.join("transcript.json")).unwrap()));
+        let output = finalize(&fixture, id, &[]);
+        assert!(output.status.success(), "{point}: {output:?}\n{}", stderr_of(&output));
+        assert_finalized(&fixture, id, &state);
+        let recovered: Vec<PathBuf> = fs::read_dir(publication.parent().unwrap()).unwrap().map(|entry| entry.unwrap().path()).collect();
+        assert_eq!(recovered, std::slice::from_ref(&publication), "{point}: no second copy is published");
+        match root {
+            Some(pair) => {
+                assert_eq!((fs::read(fixture.dir.join("transcript.md")).unwrap(), fs::read(fixture.dir.join("transcript.json")).unwrap()), pair, "{point}: the root pair was touched");
+                assert!(stderr_of(&output).contains("are an older copy and are left as they are"), "{point}: the root pair is not named: {}", stderr_of(&output));
+            }
+            None => assert!(!fixture.dir.join("transcript.md").exists() && !fixture.dir.join("transcript.json").exists(), "{point}: a root pair appeared"),
+        }
+        fs::remove_dir_all(fixture.root).unwrap();
+    }
+}
+
+/// `transcribe --resume` refuses only what `finalize` left unfinished. A live-stored meeting, and
+/// a session whose archive cannot be read, go the way they always went.
+#[test]
+fn transcribe_goes_on_as_before_unless_a_finalize_is_unfinished() {
+    // A record and a `live` row: an explicit resume publishes a second copy, as before, and the
+    // record follows the publication.
+    let (fixture, id) = promoted();
+    let resumed = child_output(&fixture, spawn_cli(&fixture, &resume_argv(&fixture)));
+    assert!(resumed.status.success(), "{resumed:?}");
+    let state = fixture.state(); let publication = state.publication.clone().unwrap();
+    assert!(publication.starts_with(fixture.dir.join(".recovered")));
+    assert_eq!((origin(&fixture), state.provisional()), (db::TranscriptOrigin::Live, Some(record_of(&publication))));
+    // ...and `finalize` then replaces that copy.
+    let output = finalize(&fixture, id, &[]);
+    assert!(output.status.success(), "{output:?}\n{}", stderr_of(&output));
+    assert_finalized(&fixture, id, &state);
+    fs::remove_dir_all(fixture.root).unwrap();
+
+    // An unfinished finalize whose archive is gone, or is another archive: the question cannot be
+    // answered, so nothing is refused here and recovery says what it always said.
+    for foreign in [false, true] {
+        let (fixture, id) = promoted();
+        finalize_killed_at(&fixture, id, "finalize_committed", &[]);
+        fs::rename(&fixture.opts.db_path, fixture.root.join("moved.db")).unwrap();
+        if foreign { crate::new_runtime().unwrap().block_on(async { db::Db::open(&fixture.opts.db_path).await.unwrap().close().await.unwrap(); }); }
+        let resumed = child_output(&fixture, spawn_cli(&fixture, &resume_argv(&fixture)));
+        assert_eq!(resumed.status.code(), Some(1), "foreign={foreign}");
+        let state = fixture.state();
+        assert_eq!((state.phase, state.error_class.as_deref()), (recovery::Phase::NeedsAttention, Some("archive_identity")), "foreign={foreign}: not today's path");
+
+        // The archive is put back. The session is no longer `Complete`, `--resume` now refuses
+        // it, and `finalize` is the one command that can still finish the meeting: it does.
+        fs::rename(fixture.root.join("moved.db"), &fixture.opts.db_path).unwrap();
+        let before = untouched(&fixture);
+        let resumed = child_output(&fixture, spawn_cli(&fixture, &resume_argv(&fixture)));
+        assert_eq!(resumed.status.code(), Some(1), "foreign={foreign}");
+        assert_eq!(untouched(&fixture), before, "foreign={foreign}: a refused --resume changed something");
+        forbid_engine(&fixture);
+        let output = finalize(&fixture, id, &[]);
+        assert!(output.status.success(), "foreign={foreign}: a replaced meeting could not be finished: {}", stderr_of(&output));
+        assert_finalized(&fixture, id, &state);
+        fs::remove_dir_all(fixture.root).unwrap();
+    }
+}
+
+/// The question "did a finalize stop half way here?" is asked of the database. Locked, it has
+/// no answer yet, and "no" would let recovery reserve the session and publish a second copy.
+#[test]
+fn transcribe_resume_does_not_guess_while_the_database_is_locked() {
+    let (fixture, id) = promoted();
+    let state = fixture.state();
+    finalize_killed_at(&fixture, id, "finalize_committed", &[]);
+    fs::write(fixture.root.join("busy-timeout-ms"), "200\n").unwrap();
+    let before = untouched(&fixture);
+    let (runtime, mut other) = connection(&fixture);
+    runtime.block_on(sqlx::query("BEGIN EXCLUSIVE").execute(&mut other)).unwrap();
+    let resumed = child_output(&fixture, spawn_cli(&fixture, &resume_argv(&fixture)));
+    runtime.block_on(sqlx::query("ROLLBACK").execute(&mut other)).unwrap(); runtime.block_on(other.close()).unwrap();
+    assert_eq!(resumed.status.code(), Some(1), "{resumed:?}");
+    assert_eq!(untouched(&fixture), before, "the session was reserved without knowing");
+    assert!(!fixture.dir.join(".recovered").exists());
+    forbid_engine(&fixture);
+    let output = finalize(&fixture, id, &[]);
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert_finalized(&fixture, id, &state);
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+/// A run clears the scratch directories earlier runs of the same meeting left. A session that
+/// sits inside the scratch place must never be taken for one: it is refused before anything.
+#[test]
+fn a_session_inside_the_scratch_place_is_refused_and_left_alone() {
+    let (first, _) = promoted();
+    let inside = session_at(&first, first.base.join("scratch").join("recording"));
+    write_stream(&inside, &stream_events(&inside));
+    assert!(child_output(&inside, spawn_cli(&inside, &promote_argv(&inside, &inside.job()))).status.success());
+    let id = meeting_of(&inside).id;
+    let before = untouched(&inside);
+    let output = finalize(&inside, id, &[]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(stderr_of(&output).contains("inside one another"), "{}", stderr_of(&output));
+    assert_eq!(untouched(&inside), before);
+    assert_eq!(meeting_of(&inside).origin, db::TranscriptOrigin::Live);
+    fs::remove_dir_all(first.root).unwrap();
+}
+
+/// The directory a meeting was published in can be removed by hand while the recording stays.
+/// The files are then simply absent, the run goes on, and after the commit the directory is
+/// made again; otherwise every later run would fail at the same place.
+#[test]
+fn a_publication_directory_removed_by_hand_is_made_again_after_the_commit() {
+    for after_the_commit in [false, true] {
+        let (fixture, id) = promoted_on_a_retry("live_committed");
+        let state = fixture.state();
+        let publication = state.publication.clone().unwrap();
+        if after_the_commit { finalize_killed_at(&fixture, id, "finalize_committed", &[]); forbid_engine(&fixture); }
+        fs::remove_dir_all(&publication).unwrap();
+        let output = finalize(&fixture, id, &[]);
+        assert!(output.status.success(), "after_the_commit={after_the_commit}: {}", stderr_of(&output));
+        assert_finalized(&fixture, id, &state);
+        fs::remove_dir_all(fixture.root).unwrap();
+    }
+}
+
+/// A live transcript always has a session. When it is not at the path the meeting was stored
+/// from, `rerender --write` cannot take its lock, and a `finalize --session` may hold it: the
+/// meeting is skipped, not rewritten without the lock.
+#[test]
+fn rerender_leaves_a_live_meeting_alone_when_its_session_is_not_where_it_was_stored() {
+    let (fixture, id) = promoted();
+    let elsewhere = fixture.root.join("elsewhere");
+    recovery::private_dir(&elsewhere).unwrap();
+    for name in ["transcript.md", "transcript.json"] { fs::copy(fixture.dir.join(name), elsewhere.join(name)).unwrap(); }
+    sql(&fixture, &[&format!("UPDATE meetings SET source_dir = '{}'", elsewhere.display())]);
+    add_rule(&fixture, "live", "LIVERULE"); // a rewrite would be due
+    let before = session_snapshot(&elsewhere);
+    let argv: Vec<String> = ["rerender", &id.to_string(), "--db", fixture.opts.db_path.to_str().unwrap(), "--write"].into_iter().map(String::from).collect();
+    let output = child_output(&fixture, spawn_cli(&fixture, &argv));
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("0 to change · 0 already current · 1 skipped"), "{}", String::from_utf8_lossy(&output.stdout));
+    assert_eq!(session_snapshot(&elsewhere), before, "a live meeting was rewritten without its session lock");
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+fn speakers(fixture: &Fixture, args: &[&str]) -> Result<()> {
+    let mut argv: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+    argv.extend(["--db".to_string(), fixture.opts.db_path.display().to_string()]);
+    crate::speakers::run_speakers(&argv)
+}
+
+/// A second, batch-stored meeting with one voice cluster, in the fixture's archive.
+fn batch_meeting_with_a_voice(fixture: &Fixture) -> i64 {
+    crate::new_runtime().unwrap().block_on(async {
+        let mut db = db::Db::open_existing(&fixture.opts.db_path, fixture.state().archive_id.as_deref().unwrap()).await.unwrap();
+        let meta = db::MeetingMeta { title: "Planning".into(), source_dir: "/synthetic/planning".into(), model: "fixture".into(), lang: "en".into(),
+            started_at: START - 86_400, duration_secs: 2.0, created_at: START, capture_status: None, origin: db::TranscriptOrigin::Batch };
+        let segment = crate::transcript::TranscriptSegment { speaker: crate::transcript::Speaker::Others, text: "The plan is agreed".into(), t_start: 0.0, t_end: 2.0, confidence: 0.9 };
+        let centroid: Vec<u8> = [1.0f32, 0.0].iter().flat_map(|value| value.to_le_bytes()).collect();
+        let cluster = db::NewCluster { cluster: "A".into(), speaker_id: None, assigned_by: None, match_score: None, centroid, dim: 2, n_windows: 1, speech_secs: 2.0 };
+        let id = db.insert_meeting_with_voices(&meta, &[segment], &[cluster], &[db::SegmentVoice { segment: 0, cluster: 0, inherited: false, embedding: None }]).await.unwrap();
+        db.close().await.unwrap(); id
+    })
+}
+
+/// `finalize` replaces every voice cluster of a live meeting, at the end of a pass during which
+/// it holds the session lock. Each `speakers` command that writes clusters takes that lock for a
+/// live meeting, so it is refused for as long as `finalize` runs and can never write across the
+/// replacement. A batch meeting, and `rename`, never meet the lock.
+#[test]
+fn speakers_commands_cannot_cross_a_finalize_and_leave_other_meetings_alone() {
+    let (fixture, id) = promoted();
+    add_voice(&fixture, id, false);
+    let batch = batch_meeting_with_a_voice(&fixture);
+    let (live, other) = (id.to_string(), batch.to_string());
+    let clusters = |meeting: i64| stored_voices(&fixture, meeting).1.iter().map(|c| (c.cluster.clone(), c.speaker_id, c.assigned_by.clone(), c.skipped)).collect::<Vec<_>>();
+
+    let held = recovery::Session::open(&fixture.dir).unwrap().unwrap(); // what a running finalize holds
+    let database = fs::read(&fixture.opts.db_path).unwrap();
+    let writers: [&[&str]; 7] = [&["label", &live, "A", "Ada", "Example"], &["unlabel", &live, "A"], &["skip", &live, "A"],
+        &["merge", &live, "A", "B"], &["split", &live, "A"], &["cluster", &live, "--recluster"], &["match", &live]];
+    for command in writers {
+        let error = speakers(&fixture, command).expect_err(command[0]);
+        assert!(format!("{error:#}").contains("is in use by another meetscribe command"), "{}: {error:#}", command[0]);
+        assert_eq!(fs::read(&fixture.opts.db_path).unwrap(), database, "{}: a refused command wrote", command[0]);
+    }
+    // Other meetings and the people table are not finalize's: no lock, as before.
+    speakers(&fixture, &["label", &other, "A", "Ada", "Example"]).unwrap();
+    speakers(&fixture, &["rename", "1", "Ada", "Sample"]).unwrap();
+    assert_eq!(clusters(batch)[0].2.as_deref(), Some("manual"));
+    // With --all the live meeting is skipped and the rest are done.
+    let live_before = clusters(id);
+    speakers(&fixture, &["match", "--all"]).unwrap();
+    speakers(&fixture, &["cluster", "--all", "--recluster"]).unwrap();
+    assert_eq!(clusters(id), live_before, "--all wrote the locked meeting");
+    drop(held);
+
+    // The lock is free: the same commands work on the live meeting.
+    speakers(&fixture, &["skip", &live, "A"]).unwrap();
+    assert!(clusters(id)[0].3, "skip did not reach the live meeting once the lock was free");
+    // A live meeting stored from a relative path cannot be locked by guessing where it is.
+    sql(&fixture, &[&format!("UPDATE meetings SET source_dir = 'recording' WHERE id = {id}")]);
+    let error = speakers(&fixture, &["unlabel", &live, "A"]).unwrap_err();
+    assert!(format!("{error:#}").contains("--session"), "{error:#}");
+    assert!(clusters(id)[0].3, "a refused command wrote");
+    speakers(&fixture, &["unlabel", &live, "A", "--session", fixture.dir.to_str().unwrap()]).unwrap();
+    assert!(!clusters(id)[0].3);
+    // A live meeting whose recording was pruned has nothing left to replace: no lock, as before.
+    sql(&fixture, &[&format!("UPDATE meetings SET source_dir = '/synthetic/pruned-recording' WHERE id = {id}")]);
+    speakers(&fixture, &["skip", &live, "A"]).unwrap();
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+/// `rerender --write` reads every meeting's rows before it locks anything. Started before a
+/// `finalize` ended, it used to hold the live rows and write their render over the new files.
+/// For a meeting it loaded as live it now locks first and reads again.
+#[test]
+fn rerender_started_before_a_finalize_ended_never_writes_the_old_live_render() {
+    for finalize_dies in [false, true] {
+        let (fixture, id) = promoted();
+        let state = fixture.state();
+        fs::write(fixture.root.join("holdpoint"), "rerender_loaded\n").unwrap();
+        let argv: Vec<String> = ["rerender", &id.to_string(), "--db", fixture.opts.db_path.to_str().unwrap(), "--write"].into_iter().map(String::from).collect();
+        let rerender = spawn_cli(&fixture, &argv);
+        wait_for_owner(&fixture, "rerender_loaded"); // it holds the live rows now
+
+        if finalize_dies { finalize_killed_at(&fixture, id, "finalize_committed", &[]); }
+        else { let output = finalize(&fixture, id, &[]); assert!(output.status.success(), "{output:?}"); }
+        fs::write(fixture.root.join("release-owner"), b"release\n").unwrap();
+        let output = child_output(&fixture, rerender);
+        assert!(output.status.success(), "finalize_dies={finalize_dies}: rerender failed: {output:?}");
+
+        let markdown = fs::read_to_string(fixture.dir.join("transcript.md")).unwrap();
+        assert!(!markdown.contains("provisional") && BATCH_WORDS.iter().all(|words| markdown.contains(words)),
+            "finalize_dies={finalize_dies}: the old live render was written over the meeting");
+        assert!(proofs(&fixture).0, "finalize_dies={finalize_dies}: the files are not the render of the stored rows");
+        if finalize_dies {
+            // rerender did the publishing; finalize finds both files done and only ends the record.
+            let files = (fs::read(fixture.dir.join("transcript.md")).unwrap(), fs::read(fixture.dir.join("transcript.json")).unwrap());
+            forbid_engine(&fixture);
+            let output = finalize(&fixture, id, &[]);
+            assert!(output.status.success(), "{output:?}\n{}", stderr_of(&output));
+            assert_eq!((fs::read(fixture.dir.join("transcript.md")).unwrap(), fs::read(fixture.dir.join("transcript.json")).unwrap()), files);
+        } else {
+            assert!(String::from_utf8_lossy(&output.stdout).contains("0 to change · 1 already current"), "{}", String::from_utf8_lossy(&output.stdout));
+        }
+        assert_finalized(&fixture, id, &state);
+        fs::remove_dir_all(fixture.root).unwrap();
+    }
+}
+
+/// Dividing the batch pass must not move the naming step out of the block whose failure still
+/// publishes the transcript unstored: whisper's half hour is not thrown away over a name.
+#[test]
+fn a_naming_failure_in_the_batch_pass_still_ends_in_the_unstored_export() {
+    let (fixture, owner) = Fixture::new(); drop(owner);
+    fs::write(fixture.root.join("fault"), "naming_fails\n").unwrap();
+    let output = child_output(&fixture, spawn_cli(&fixture, &transcribe_argv(&fixture, &fixture.job())));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let state = fixture.state();
+    assert_eq!((state.meeting_id, state.unarchived_manual_output), (None, true), "an unstored export is the owner's to keep");
+    assert!(fixture.meetings().is_empty());
+    let markdown = fs::read_to_string(fixture.dir.join("transcript.md")).unwrap();
+    assert!(BATCH_WORDS.iter().all(|words| markdown.contains(words)), "the transcript was not exported");
+    assert!(serde_json::from_slice::<serde_json::Value>(&fs::read(fixture.dir.join("transcript.json")).unwrap()).unwrap().is_array());
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+/// Another recorded session in the same archive and under the same base as `first`.
+fn another_session(first: &Fixture, name: &str) -> Fixture {
+    session_at(first, first.root.join("sessions").join(name))
+}
+
+/// As [`another_session`], in a directory of the test's choosing.
+fn session_at(first: &Fixture, dir: PathBuf) -> Fixture {
+    let mut owner = recovery::Session::begin(&dir, &first.opts.db_path, &dir, "com.google.Chrome", "Synthetic release review", START).unwrap();
+    owner.start_roll(0, 16_000, 0.0).unwrap();
+    for (channel, sample) in [("mic", 0.25f32), ("system", -0.5f32)] {
+        let mut wav = hound::WavWriter::create(dir.join(format!("{channel}.wav")), hound::WavSpec {
+            channels: 1, sample_rate: 16_000, bits_per_sample: 32, sample_format: hound::SampleFormat::Float }).unwrap();
+        for _ in 0..48_000 { wav.write_sample(sample).unwrap(); } wav.finalize().unwrap();
+    }
+    owner.checkpoint(0, 48_000, 48_000).unwrap(); owner.finish_capture(3.0, 0.1).unwrap();
+    let mut fixture = first.clone();
+    fixture.opts.export_dir = dir.clone(); fixture.opts.session_key = Some(owner.state.key.clone()); fixture.dir = dir;
+    fixture
+}
+
+fn meeting_of(fixture: &Fixture) -> db::MeetingRow {
+    let id = fixture.state().meeting_id.unwrap();
+    fixture.meetings().into_iter().find(|row| row.id == id).unwrap()
+}
+
+#[test]
+fn all_live_finalizes_every_live_meeting_and_one_failure_does_not_stop_the_rest() {
+    let (first, _) = promoted();
+    let second = another_session(&first, "second");
+    write_stream(&second, &stream_events(&second));
+    assert!(child_output(&second, spawn_cli(&second, &promote_argv(&second, &second.job()))).status.success());
+    let third = another_session(&first, "third"); // an ordinary batch meeting: not finalize's business
+    assert!(child_output(&third, spawn_cli(&third, &transcribe_argv(&third, &third.job()))).status.success());
+    assert_eq!([meeting_of(&first).origin, meeting_of(&second).origin, meeting_of(&third).origin],
+        [db::TranscriptOrigin::Live, db::TranscriptOrigin::Live, db::TranscriptOrigin::Batch]);
+    let untouched_third = session_snapshot(&third.dir);
+    // The older live meeting cannot be finalized: its Markdown was edited.
+    let edited = format!("{}\nmy own note\n", fs::read_to_string(first.dir.join("transcript.md")).unwrap());
+    fs::write(first.dir.join("transcript.md"), &edited).unwrap();
+
+    let all_live = |extra: &[&str]| -> std::process::Output {
+        let mut argv: Vec<String> = ["finalize", "--all-live", "--db", first.opts.db_path.to_str().unwrap(), "--base", first.base.to_str().unwrap(),
+            "--lang", "en", "--model", first.opts.model.to_str().unwrap()].into_iter().map(String::from).collect();
+        argv.extend(extra.iter().map(|flag| flag.to_string()));
+        child_output(&first, spawn_cli(&first, &argv))
+    };
+    let output = all_live(&[]);
+    assert_eq!(output.status.code(), Some(1), "one meeting failed, so the command did: {output:?}");
+    assert_eq!([meeting_of(&first).origin, meeting_of(&second).origin], [db::TranscriptOrigin::Live, db::TranscriptOrigin::Batch], "the failure stopped the other meeting");
+    assert_eq!(fs::read_to_string(first.dir.join("transcript.md")).unwrap(), edited);
+    assert!(String::from_utf8_lossy(&output.stdout).contains(&format!("meeting {}: finalized", meeting_of(&second).id)));
+    assert!(stderr_of(&output).contains(&format!("meeting {}:", meeting_of(&first).id)));
+    assert_eq!(session_snapshot(&third.dir), untouched_third, "a batch meeting was touched by --all-live");
+    no_meeting_text(&output);
+
+    let output = all_live(&["--overwrite"]);
+    assert!(output.status.success(), "{output:?}\n{}", stderr_of(&output));
+    assert_eq!(meeting_of(&first).origin, db::TranscriptOrigin::Batch);
+    assert_eq!(session_snapshot(&third.dir), untouched_third);
+    let output = all_live(&[]);
+    assert!(output.status.success() && String::from_utf8_lossy(&output.stdout).contains("no live-stored meeting"), "{output:?}");
+
+    // A session directory that is gone: the live transcript is final. With --all-live that is
+    // a skip, not a failure; asked for by id, it is said and counted.
+    let fourth = another_session(&first, "fourth");
+    write_stream(&fourth, &stream_events(&fourth));
+    assert!(child_output(&fourth, spawn_cli(&fourth, &promote_argv(&fourth, &fourth.job()))).status.success());
+    let gone = meeting_of(&fourth).id;
+    fs::remove_dir_all(&fourth.dir).unwrap();
+    let output = all_live(&[]);
+    assert!(output.status.success() && String::from_utf8_lossy(&output.stdout).contains("the recording is gone"), "{output:?}");
+    let output = finalize(&first, gone, &[]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr_of(&output).contains("the recording is gone; the live transcript is final"));
+    fs::remove_dir_all(first.root).unwrap();
+}
+
+/// A meeting stored from a relative path is found only when its session is named.
+#[test]
+fn finalize_finds_a_relatively_stored_meeting_through_session() {
+    let (fixture, id) = promoted();
+    let state = fixture.state();
+    sql(&fixture, &["UPDATE meetings SET source_dir = 'recording'"]);
+    let output = finalize(&fixture, id, &["--session", fixture.dir.to_str().unwrap()]);
+    assert!(output.status.success(), "{output:?}\n{}", stderr_of(&output));
+    assert_finalized(&fixture, id, &state);
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+/// `finalize` must produce what the daemon's own pass would have produced for the session, so it
+/// reads its options where the daemon reads them. `job_for` is the daemon's; the config mapping
+/// above it is `run_daemon`'s, repeated here because it is not a function.
+#[test]
+fn finalize_runs_the_pass_with_the_options_the_daemon_would_use() {
+    let (fixture, owner) = Fixture::new(); drop(owner);
+    let base = fixture.base.clone();
+    let argv = |extra: &[&str]| -> Vec<String> { ["7", "--base", base.to_str().unwrap()].iter().chain(extra).map(|arg| arg.to_string()).collect() };
+    for config in [None, Some("[daemon]\nlang = \"pt\"\n\n[speakers]\nsplit = false\n")] {
+        if let Some(text) = config { fs::write(base.join("config.toml"), text).unwrap(); }
+        let file = crate::config::Config::load(&base);
+        let daemon = DaemonConfig {
+            base: base.clone(), sessions_dir: base.join("sessions"), logs_dir: base.join("logs"), db_path: base.join("meetscribe.db"),
+            model: base.join("models/ggml-large-v3.bin"), speaker_model: base.join(crate::SPEAKER_MODEL_REL), split: file.speakers.split,
+            diarizer_bin: base.join(crate::DIARIZER_BIN_REL), diarizer_model: base.join(crate::DIARIZER_MODEL_REL), lang: file.daemon.lang.clone(),
+            min_secs: file.daemon.min_secs, once: false, allowlist: file.effective_allowlist(),
+            sessions_days: file.retention.sessions_days, log_max_mb: file.retention.log_max_mb,
+        };
+        let job = job_for(&daemon, fixture.dir.clone(), "Chrome".into(), "a title the stored state overrides".into());
+        assert_eq!(crate::finalize::options(&argv(&[]), &fixture.state()).unwrap(), job.opts, "config: {config:?}");
+        assert_eq!(job.opts.lang == "pt", config.is_some(), "the fixture's config was not read");
+    }
+    // Flags go on top of the configuration.
+    fs::remove_file(base.join("config.toml")).unwrap();
+    let flagged = crate::finalize::options(&argv(&["--lang", "en", "--no-split", "--model", "/synthetic/other.bin"]), &fixture.state()).unwrap();
+    assert_eq!((flagged.lang.as_str(), flagged.split, flagged.model.as_path()), ("en", false, Path::new("/synthetic/other.bin")));
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+/// The pass takes about half an hour, and the files were checked before it began. They are
+/// looked at again when it ends, before the transaction: a file edited meanwhile stops the
+/// replacement while the database still holds the live transcript.
+#[test]
+fn a_file_edited_during_the_pass_stops_the_replacement_before_it_starts() {
+    let (fixture, id) = promoted();
+    fs::write(fixture.root.join("holdpoint"), "decoding\n").unwrap();
+    let child = spawn_cli(&fixture, &finalize_argv(&fixture, id, &[]));
+    wait_for_owner(&fixture, "decoding");
+    let markdown = fixture.dir.join("transcript.md");
+    let edited = format!("{}\nmy own note\n", fs::read_to_string(&markdown).unwrap());
+    fs::write(&markdown, &edited).unwrap();
+    let before = untouched(&fixture);
+    fs::write(fixture.root.join("release-owner"), b"release\n").unwrap();
+    let output = child_output(&fixture, child);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(stderr_of(&output).contains("was changed since meetscribe wrote it"), "{}", stderr_of(&output));
+    assert_eq!(origin(&fixture), db::TranscriptOrigin::Live, "the rows were replaced although a file had been edited");
+    assert_eq!(untouched(&fixture), before);
+    assert_eq!(fs::read_to_string(&markdown).unwrap(), edited);
+    fs::remove_dir_all(fixture.root).unwrap();
 }

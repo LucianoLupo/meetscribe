@@ -190,6 +190,13 @@ Stated plainly, so nothing surprises you later.
   recorder has already saved, so it cannot drop audio. It has no voices or names, it can word
   a sentence differently from the stored transcript, and the daemon does not start it for
   you: it runs while that terminal is open.
+- **A transcript stored from the live stream can be upgraded later.** Storing the live
+  transcript at hangup is not switched on by the daemon yet; it exists as a command
+  (`transcribe --promote-live`, see [`docs/DAEMON.md`](docs/DAEMON.md)). A meeting stored that
+  way has the words and no voices, and `meetscribe list` marks it `live`.
+  `meetscribe finalize <id>` runs the full pass over its recording and replaces it under the
+  same id. It takes as long as the pass after a call, changes nothing until that pass has
+  finished, and replaces only transcript files meetscribe itself wrote.
 - **Transcripts are stored unencrypted** on your disk (readable only by your user account).
   Encryption is planned. If your meetings are sensitive, know this now.
 - **Names come from you, once per voice.** The far end is one mixed track; meetscribe groups

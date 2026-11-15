@@ -37,6 +37,7 @@ mod diagnostics;
 mod audit_recovery;
 mod pipeline;
 mod promote;
+mod finalize;
 mod daemon;
 mod live;
 mod launchd;
@@ -559,9 +560,51 @@ fn run_rerender(argv: &[String]) -> Result<()> {
     }
     let ids = render::IdentityMap::from_db(&speakers);
 
+    #[cfg(test)]
+    pipeline::cutpoint("rerender_loaded");
     let (mut changed, mut unchanged, mut skipped) = (0usize, 0usize, 0usize);
     for (row, segs) in &meetings {
         let id = row.id;
+        // A meeting loaded as a live transcript may have been replaced by `finalize` since: its
+        // rows were read before any lock was held. With --write it is locked first and read
+        // again, so what is compared and written is what is stored now, never the old live text.
+        let mut ownership = None;
+        let mut reloaded = None;
+        if write && row.origin == db::TranscriptOrigin::Live {
+            let dir = PathBuf::from(&row.source_dir);
+            if dir.is_absolute() && dir.is_dir() {
+                // A live transcript always has a session. If it is not where the meeting was
+                // stored from, it was moved, and a `finalize --session` may be at work on it
+                // under a lock this command cannot find: leave the meeting alone.
+                if !dir.join(recovery::STATE_FILE).exists() {
+                    println!("meeting {id}: a live transcript whose session is not at its stored path — skipped");
+                    skipped += 1;
+                    continue;
+                }
+                let Some(session) = recovery::Session::open(&dir)? else {
+                    println!("meeting {id}: its session is in use by another meetscribe command — skipped");
+                    skipped += 1;
+                    continue;
+                };
+                ownership = Some(session);
+            }
+            reloaded = rt.block_on(async {
+                let mut database = db::Db::open(&db_path).await?;
+                let row = database.get_meeting(id).await?;
+                let segs = database.load_segments(id).await?;
+                database.close().await?;
+                anyhow::Ok(row.map(|row| (row, segs)))
+            })?;
+            if reloaded.is_none() {
+                log::warn!("meeting {id}: no longer stored — skipped");
+                skipped += 1;
+                continue;
+            }
+        }
+        let (row, segs) = match &reloaded {
+            Some((row, segs)) => (row, segs),
+            None => (row, segs),
+        };
         let rendered = render::render(segs, &ids, &vocab);
 
         // source_dir is untrusted historical data: early rows hold a relative path long since
@@ -590,9 +633,9 @@ fn run_rerender(argv: &[String]) -> Result<()> {
         changed += 1;
 
         if write {
-            let mut ownership = if dir.join(recovery::STATE_FILE).exists() {
-                Some(recovery::Session::open(&dir)?.context("rerender source session is busy")?)
-            } else { None };
+            if ownership.is_none() && dir.join(recovery::STATE_FILE).exists() {
+                ownership = Some(recovery::Session::open(&dir)?.context("rerender source session is busy")?);
+            }
             if let Some(session) = ownership.as_mut() { session.protect_outputs()?; }
             export::write_exports(&dir, "transcript", row, &rendered)?;
             println!("meeting {id}: rewrote {}", dir.display());
@@ -953,13 +996,7 @@ fn run_subcommand(argv: &[String]) -> Option<Result<()>> {
         "tray" => tray::run_tray(rest),
         "install" => launchd::run_install(rest),
         "uninstall" => launchd::run_uninstall(rest),
-        // A live-stored meeting's Markdown names this command. Until it exists it must fail here:
-        // an unknown word falls through to the capture below and starts a recording.
-        "finalize" => {
-            // Said in plain words too: the error below reaches the terminal only as a class.
-            eprintln!("meetscribe finalize is not available in this build; nothing was changed");
-            Err(anyhow::anyhow!("`meetscribe finalize` is not part of this build yet; nothing was changed"))
-        }
+        "finalize" => finalize::run(rest),
         _ => return None,
     })
 }

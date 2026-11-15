@@ -274,6 +274,17 @@ struct StreamWriter {
     print: bool,
 }
 
+impl Drop for StreamWriter {
+    fn drop(&mut self) {
+        // Give the stream up now, not when the last copy of the descriptor closes: a process
+        // forked by another thread holds a copy until it execs, and the lock with it.
+        // SAFETY: `file` owns the live descriptor; flock does not access Rust memory.
+        if unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) } != 0 {
+            log::warn!("component=live event=stream_unlock_failed");
+        }
+    }
+}
+
 impl StreamWriter {
     fn create(out_dir: &Path, key: &str, print: bool) -> Result<Self> {
         recovery::private_dir(out_dir)?;
@@ -423,7 +434,7 @@ pub(crate) fn run_live(
         "segments": segments, "short_windows": short_windows, "lag_ms": last_lag_ms,
         "outcome": if reason == "ended" { "ok" } else { "attention" },
     }));
-    Ok(LiveSummary { segments, short_windows, audio_secs, reason, stream: stream.path })
+    Ok(LiveSummary { segments, short_windows, audio_secs, reason, stream: stream.path.clone() })
 }
 
 /// The fields of one `segment` line. The times are written as computed (the roll's offset plus
@@ -855,6 +866,41 @@ mod tests {
         let again = StreamWriter::create(&out, key, false).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
         drop(again);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The stream's lock lives on an open file description, and a process forked by another
+    /// thread holds a copy of it until it execs. Dropping the writer must give the stream up at
+    /// once all the same: the next writer of that meeting may start in that instant.
+    #[test]
+    fn a_dropped_writer_gives_the_stream_up_even_while_a_fork_holds_its_descriptor() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        let root = temp_root("writer-fork");
+        let out = root.join("live");
+        let key = "a6e79ba0314c4cc2b647f4d25b327011";
+        for _ in 0..5 {
+            let first = StreamWriter::create(&out, key, false).unwrap();
+            let (mut parent, child_stream) = UnixStream::pair().unwrap();
+            let child_fd = child_stream.as_raw_fd();
+            // SAFETY: after fork the child uses only read/_exit, no allocator, Rust Drop or locks.
+            let child = unsafe { libc::fork() };
+            assert!(child >= 0);
+            if child == 0 {
+                let mut byte = 0u8;
+                // SAFETY: descriptor and one-byte stack buffer are valid; _exit skips inherited Drops.
+                unsafe { libc::read(child_fd, std::ptr::from_mut(&mut byte).cast(), 1); libc::_exit(0); }
+            }
+            drop(child_stream);
+            drop(first);
+            let again = StreamWriter::create(&out, key, false);
+            parent.write_all(b"x").unwrap();
+            let mut status = 0;
+            // SAFETY: wait only for the exact child this test created.
+            assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+            assert_eq!(status, 0);
+            assert!(again.is_ok(), "a fork-inherited descriptor kept the stream locked after its writer was dropped");
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 
