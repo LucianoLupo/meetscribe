@@ -129,7 +129,7 @@ impl Fixture {
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         (Self { root, dir, base, executable, opts }, owner)
     }
-    fn job(&self) -> TranscribeJob { TranscribeJob { dir: self.dir.clone(), label: "Chrome".into(), opts: self.opts.clone() } }
+    fn job(&self) -> TranscribeJob { TranscribeJob { dir: self.dir.clone(), label: "Chrome".into(), opts: self.opts.clone(), promote_live: None } }
     fn queued_job(&self) -> TranscribeJob {
         let (tx, rx) = mpsc::channel(); queue_job(&tx, self.job()); rx.recv().unwrap()
     }
@@ -151,7 +151,7 @@ impl Fixture {
 }
 
 fn transcribe_argv(fixture: &Fixture, job: &TranscribeJob) -> Vec<String> {
-    let mut argv = vec!["transcribe".into()]; argv.extend(child_args(&job.dir, &job.opts, &fixture.base)); argv
+    let mut argv = vec!["transcribe".into()]; argv.extend(child_args(&job.dir, &job.opts, &fixture.base, job.promote_live.as_deref())); argv
 }
 
 fn spawn_cli(fixture: &Fixture, argv: &[String]) -> std::process::Child {
@@ -331,7 +331,7 @@ impl LaunchWorker {
             finished_tx.send(run_fixture.state()).unwrap();
         }, move || {
             let found: Vec<_> = pending_sessions_at(&scan_fixture.root.join("sessions"), scan_clock.load(Ordering::SeqCst))
-                .into_iter().map(|(dir, label, _)| TranscribeJob { dir, label, opts: scan_fixture.opts.clone() }).collect();
+                .into_iter().map(|(dir, label, _)| TranscribeJob { dir, label, opts: scan_fixture.opts.clone(), promote_live: None }).collect();
             scanned_tx.send(found.len()).unwrap(); found
         }, move || scheduler_clock.load(Ordering::SeqCst), Duration::from_millis(5)).unwrap();
         Self { jobs, handle, clock, finished, scanned }
@@ -609,7 +609,7 @@ fn audit_f2_child_fault_retry_and_retention() {
             run_transcribe_job(job, &run_fixture.executable, &run_fixture.base);
             finished_tx.send(run_fixture.state()).unwrap();
         }, move || pending_sessions_at(&due_fixture.root.join("sessions"), due_clock.load(Ordering::SeqCst)).into_iter()
-            .map(|(dir, label, _)| TranscribeJob { dir, label, opts: due_fixture.opts.clone() }).collect(),
+            .map(|(dir, label, _)| TranscribeJob { dir, label, opts: due_fixture.opts.clone(), promote_live: None }).collect(),
             move || poll_clock.load(Ordering::SeqCst), Duration::from_millis(5)).unwrap();
         queue_job(&jobs, fixture.job());
         let first = finished_rx.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -855,7 +855,7 @@ fn ordinary_no_store_child_succeeds_without_a_database() {
         let sentinel = fixture.root.join("not-a-database"); fs::create_dir(&sentinel).unwrap();
         fixture.opts.no_store = true; fixture.opts.session_key = None; fixture.opts.db_path = sentinel.clone();
         let child = std::process::Command::new(&fixture.executable).arg("transcribe")
-            .args(child_args(&fixture.dir, &fixture.opts, &fixture.base)).current_dir(&fixture.dir).output().unwrap();
+            .args(child_args(&fixture.dir, &fixture.opts, &fixture.base, None)).current_dir(&fixture.dir).output().unwrap();
         assert!(child.status.success(), "no-store child failed: {child:?}");
         assert!(String::from_utf8_lossy(&child.stdout).contains("synthetic release checklist"));
         assert!(String::from_utf8_lossy(&child.stdout).contains("pipeline_child_entered"));
@@ -940,7 +940,7 @@ B windows=1 secs=1.500 speaker=None
 
 // ---- Promotion: the live stream becomes the stored transcript (`promote.rs`). The stream is
 // fictional and written by hand in the reader's format; the child is the real argv, parser and
-// pipeline. `child_args` does not pass the flag yet (the daemon is wired later), so it is appended.
+// pipeline, with the flag as the daemon passes it (`child_args`).
 
 fn live_dir(fixture: &Fixture) -> PathBuf { fixture.root.join("live") }
 
@@ -968,8 +968,32 @@ fn write_stream(fixture: &Fixture, events: &[serde_json::Value]) -> PathBuf {
 }
 
 fn promote_argv(fixture: &Fixture, job: &TranscribeJob) -> Vec<String> {
-    let mut argv = transcribe_argv(fixture, job);
-    argv.extend(["--promote-live".to_string(), live_dir(fixture).display().to_string()]); argv
+    let mut argv = vec!["transcribe".to_string()];
+    argv.extend(child_args(&job.dir, &job.opts, &fixture.base, Some(&live_dir(fixture)))); argv
+}
+
+/// The daemon's own road from its configuration to a stored meeting: `job_for` decides whether
+/// the live transcript is on offer, the worker's `run_transcribe_job` starts the real child with
+/// the flag `child_args` writes, and that child stores. With `[live] promote` in effect the stream
+/// is stored and no engine is loaded. Without it (off, or `promote` without `enabled`) the same
+/// session, with the same complete stream on disk, gets the batch pass: the gate never ran, or
+/// it would have accepted.
+#[test]
+fn a_job_built_by_the_daemon_stores_the_live_stream_only_with_promotion_in_effect() {
+    for (text, promoted) in [("[live]\nenabled = true\npromote = true\n", true), ("[live]\npromote = true\n", false), ("", false)] {
+        let (fixture, owner) = Fixture::new(); drop(owner);
+        write_stream(&fixture, &stream_events(&fixture));
+        // The daemon's base directory is the fixture's root: its streams are in `<root>/live`.
+        let daemon = test_config(&fixture.root, toml::from_str::<crate::config::Config>(text).unwrap().live.effective());
+        let job = job_for(&daemon, fixture.dir.clone(), "Chrome".into(), "a title the stored state overrides".into());
+        assert_eq!(job.promote_live, promoted.then(|| live_dir(&fixture)), "config: {text:?}");
+        run_transcribe_job(&job, &fixture.executable, &fixture.base);
+        let rows = fixture.meetings(); assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].origin, if promoted { db::TranscriptOrigin::Live } else { db::TranscriptOrigin::Batch }, "config: {text:?}");
+        assert_eq!(fixture.root.join("engine-ran").exists(), !promoted, "config: {text:?}");
+        assert_eq!(fixture.state().phase, recovery::Phase::Complete);
+        fs::remove_dir_all(fixture.root).unwrap();
+    }
 }
 
 /// The record promotion must leave: the pair in `dir`, each file by the hash of what is on disk.
@@ -2184,7 +2208,7 @@ fn finalize_runs_the_pass_with_the_options_the_daemon_would_use() {
             model: base.join("models/ggml-large-v3.bin"), speaker_model: base.join(crate::SPEAKER_MODEL_REL), split: file.speakers.split,
             diarizer_bin: base.join(crate::DIARIZER_BIN_REL), diarizer_model: base.join(crate::DIARIZER_MODEL_REL), lang: file.daemon.lang.clone(),
             min_secs: file.daemon.min_secs, once: false, allowlist: file.effective_allowlist(),
-            sessions_days: file.retention.sessions_days, log_max_mb: file.retention.log_max_mb,
+            sessions_days: file.retention.sessions_days, log_max_mb: file.retention.log_max_mb, live: file.live.effective(),
         };
         let job = job_for(&daemon, fixture.dir.clone(), "Chrome".into(), "a title the stored state overrides".into());
         assert_eq!(crate::finalize::options(&argv(&[]), &fixture.state()).unwrap(), job.opts, "config: {config:?}");

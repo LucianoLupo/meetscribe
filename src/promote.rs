@@ -563,7 +563,7 @@ mod tests {
         session.checkpoint(0, 48_000, 48_000).unwrap();
         session.finish_capture(3.0, 0.1).unwrap();
         let opts = live::LiveOpts { model: root.join("unused.bin"), lang: "es".into(), out_dir: root.join("live"),
-            base: root.join("base"), max_window_ms: 12_000, print: false };
+            base: root.join("base"), max_window_ms: 12_000, print: false, owner_pid: None };
         let summary = live::run_live(&session.dir, &opts, |_, _| Ok(("decoded".into(), 0.9))).unwrap();
         assert_eq!((summary.reason, summary.segments), ("ended", 0));
         assert_eq!(wait_and_load(&root.join("live"), &session.state, &Wait::default()), Err(Reject::Empty));

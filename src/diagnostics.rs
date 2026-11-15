@@ -58,6 +58,7 @@ fn safe_fields(fields: Map<String, Value>) -> Option<Map<String, Value>> {
                 "runtime_published" | "runtime_restored" | "stop_requested" | "stop_received" | "status_published" | "recovery_scan_failed" | "launch_failure_persist_failed" |
                 "live_started" | "live_lag" | "live_stopped" | "live_failed" |
                 "live_promoted" | "live_promotion_rejected" |
+                "live_child_started" | "live_child_exited" | "live_child_killed" |
                 "finalize_started" | "finalize_committed" | "finalize_published" | "finalize_failed")),
             // Live-lane measurements: numbers only, so a transcript can never ride along.
             "audio_secs" | "decoded_secs" => value.as_f64().is_some_and(|value| value.is_finite() && value >= 0.0),
@@ -67,6 +68,8 @@ fn safe_fields(fields: Map<String, Value>) -> Option<Map<String, Value>> {
             "session_id" | "instance_id" => value.as_str().is_some_and(|value| value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())),
             "phase" => value.as_str().is_some_and(|value| matches!(value, "Recording" | "Ready" | "Archived" | "Complete" | "NeedsAttention" | "SkippedShort")),
             "attempt" => value.as_u64().is_some_and(|value| value <= 4),
+            // How the daemon's live reader ended: a process exit code, absent after a signal.
+            "exit_code" => value.as_u64().is_some_and(|value| value <= 255),
             "pending" | "attention" => value.as_u64().is_some(),
             "daemon_state" => value.as_str().is_some_and(|value| matches!(value, "idle" | "recording" | "transcribing" | "paused")),
             "elapsed_ms" => value.as_i64().is_some_and(|value| value >= 0),
@@ -147,6 +150,12 @@ pub fn init_to_file(path: &std::path::Path) -> bool {
     let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(path) else { return false; };
     builder().target(env_logger::Target::Pipe(Box::new(file))).init();
     true
+}
+
+/// One event as the log would carry it, for a test in the module that writes the event.
+#[cfg(test)]
+pub(crate) fn formatted_event(fields: &Value) -> Value {
+    formatted(&log::Record::builder().target("meetscribe::event").args(format_args!("{fields}")).build(), "synthetic-run")
 }
 
 /// The approved class of an error, for a caller that reports a failure and carries on.
@@ -285,6 +294,33 @@ mod tests {
             let withheld = event(fields);
             assert_eq!(withheld["event"], "invalid_event", "{field}");
             assert!(!withheld.to_string().contains("SYNTHETIC_PRIVATE_SENTENCE"), "{field}");
+        }
+    }
+
+    #[test]
+    fn live_reader_events_keep_an_exit_code_and_nothing_else_about_the_process() {
+        let session = "a6e79ba0314c4cc2b647f4d25b327011";
+        for (name, outcome) in [("live_child_started", "ok"), ("live_child_exited", "error"), ("live_child_killed", "attention")] {
+            let kept = formatted_event(&json!({"component":"daemon", "event":name, "session_id":session, "outcome":outcome,
+                "exit_code":3, "command":"SYNTHETIC_PRIVATE_SENTENCE"}));
+            assert_eq!((kept["component"].as_str(), kept["event"].as_str(), kept["session_id"].as_str(), kept["outcome"].as_str()),
+                (Some("daemon"), Some(name), Some(session), Some(outcome)));
+            assert_eq!(kept["exit_code"].as_u64(), Some(3), "{name}");
+            assert!(!kept.to_string().contains("SYNTHETIC_PRIVATE_SENTENCE"), "{name}");
+        }
+        for code in [0, 255] {
+            let kept = formatted_event(&json!({"component":"daemon", "event":"live_child_exited", "session_id":session, "exit_code":code}));
+            assert_eq!(kept["exit_code"].as_u64(), Some(code));
+        }
+        // A reader ended by a signal has no code, and the event is still a valid one.
+        let signalled = formatted_event(&json!({"component":"daemon", "event":"live_child_exited", "session_id":session, "outcome":"error"}));
+        assert_eq!(signalled["event"], "live_child_exited");
+        assert!(signalled["exit_code"].is_null());
+        // Anything that is not an exit code withholds the whole event.
+        for value in [json!("SYNTHETIC_PRIVATE_SENTENCE"), json!(-1), json!(256), json!(1.5), json!(null)] {
+            let withheld = formatted_event(&json!({"component":"daemon", "event":"live_child_exited", "session_id":session, "exit_code":value}));
+            assert_eq!(withheld["event"], "invalid_event", "{value}");
+            assert!(!withheld.to_string().contains("SYNTHETIC_PRIVATE_SENTENCE"));
         }
     }
 

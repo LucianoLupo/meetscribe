@@ -63,6 +63,9 @@ pub(crate) struct LiveOpts {
     pub max_window_ms: usize,
     /// Also print each line to the terminal as the viewer would.
     pub print: bool,
+    /// The daemon that started this reader (`--owner-pid`). When that process is no longer this
+    /// one's parent the reader stops; `None` for a reader started by hand.
+    pub owner_pid: Option<u32>,
 }
 
 /// What one run did, for the caller and the tests. No text.
@@ -285,24 +288,47 @@ impl Drop for StreamWriter {
     }
 }
 
+/// How often a writer opens its stream again when the file it opened is no longer the one at
+/// the path (see [`StreamWriter::create_with`]).
+const OPEN_ATTEMPTS: usize = 3;
+
 impl StreamWriter {
     fn create(out_dir: &Path, key: &str, print: bool) -> Result<Self> {
+        Self::create_with(out_dir, key, print, |_| {})
+    }
+
+    /// [`create`](Self::create), with `opened` called after each open and before its lock: the
+    /// instant in which the daily prune (`maintenance::prune_live`) can remove the file. Tests
+    /// remove it there.
+    fn create_with(out_dir: &Path, key: &str, print: bool, mut opened: impl FnMut(&Path)) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
         recovery::private_dir(out_dir)?;
         let path = out_dir.join(format!("{key}.jsonl"));
-        // Opened without truncating: a second reader of the same meeting must meet the first
-        // one's lock before it can empty the stream under it. The lock lasts as long as `file`.
-        let file = OpenOptions::new().write(true).create(true).truncate(false).mode(0o600).open(&path)
-            .with_context(|| format!("create live stream {}", path.display()))?;
-        // SAFETY: `file` owns the valid descriptor; flock does not access Rust memory.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::WouldBlock {
-                bail!("another live reader already writes this meeting's stream");
+        for _ in 0..OPEN_ATTEMPTS {
+            // Opened without truncating: a second reader of the same meeting must meet the first
+            // one's lock before it can empty the stream under it. The lock lasts as long as `file`.
+            let file = OpenOptions::new().write(true).create(true).truncate(false).mode(0o600).open(&path)
+                .with_context(|| format!("create live stream {}", path.display()))?;
+            opened(&path);
+            // SAFETY: `file` owns the valid descriptor; flock does not access Rust memory.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    bail!("another live reader already writes this meeting's stream");
+                }
+                return Err(error).context("lock the live stream");
             }
-            return Err(error).context("lock the live stream");
+            // The prune unlinks a stream while it holds this lock. A file opened just before
+            // that is locked here just after, and is no longer at the path: writing it would
+            // fill a file nobody can open. Only the file the path names is truncated.
+            let held = file.metadata().context("inspect the live stream")?;
+            if std::fs::symlink_metadata(&path).is_ok_and(|at| at.dev() == held.dev() && at.ino() == held.ino()) {
+                file.set_len(0).context("start the live stream")?;
+                return Ok(Self { file, path, seq: 0, print });
+            }
+            // Dropping `file` closes it, and the lock on the removed file goes with it.
         }
-        file.set_len(0).context("start the live stream")?;
-        Ok(Self { file, path, seq: 0, print })
+        bail!("the live stream was removed {OPEN_ATTEMPTS} times while it was being opened")
     }
 
     fn event(&mut self, event: StreamEvent) -> Result<()> {
@@ -358,6 +384,14 @@ fn lag_ms(state: &State, written: SystemTime, t_end: f64, now: SystemTime) -> u6
         .map_or(0, |lag| lag.as_millis() as u64)
 }
 
+/// Whether the process that started this reader is no longer its parent. A child is given a
+/// new parent the moment its own dies, so the answer changes exactly then, and a later process
+/// that reuses the pid never becomes this one's parent. `None` (no `--owner-pid`) is never gone.
+fn owner_gone(owner_pid: Option<u32>) -> bool {
+    // SAFETY: getppid takes no argument, cannot fail and touches no memory.
+    owner_pid.is_some_and(|owner| i64::from(unsafe { libc::getppid() }) != i64::from(owner))
+}
+
 /// Follow the recording in `dir` until it ends. `decode` turns one 16 kHz window into
 /// `(text, confidence)`; the binary passes whisper, tests pass a fake.
 pub(crate) fn run_live(
@@ -379,6 +413,11 @@ pub(crate) fn run_live(
     let (mut last_heartbeat, mut last_lag_log) = (Instant::now(), Instant::now());
     let mut last_lag_ms = 0u64;
     let reason = loop {
+        // Before anything else, on every turn: a reader whose daemon is gone stops here, without
+        // reading or decoding what is left. Nothing corrects `status.json` after a daemon is
+        // killed, so the stalled rule below can wait for ever; and a recording whose daemon died
+        // is cut short, so its stream could not be stored anyway (`promote.rs`: `capture_partial`).
+        if owner_gone(opts.owner_pid) { break "stalled"; }
         // A state file is replaced atomically, so a failed read is a transient race at worst.
         if let Ok((fresh, fresh_written)) = read_state(dir) {
             if fresh.key != key { bail!("the session directory now belongs to another recording"); }
@@ -477,7 +516,14 @@ fn newest_stream(out_dir: &Path) -> Option<PathBuf> {
 /// Print the complete lines of `path` from byte `offset` on; returns the new offset. A last line
 /// without its newline is still being written and is left for the next call.
 fn print_from(path: &Path, offset: u64, out: &mut impl Write) -> Result<u64> {
-    let mut reader = BufReader::new(File::open(path).with_context(|| format!("open {}", path.display()))?);
+    let file = match File::open(path) {
+        Ok(file) => file,
+        // Removed between being chosen and being opened (the daily prune of old streams does
+        // that): nothing new to show, and the viewer goes on to the next stream.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(offset),
+        Err(error) => return Err(error).with_context(|| format!("open {}", path.display())),
+    };
+    let mut reader = BufReader::new(file);
     // A stream that shrank was started again for the same meeting: show it from its beginning.
     let mut offset = if reader.get_ref().metadata()?.len() < offset { 0 } else { offset };
     reader.seek(SeekFrom::Start(offset))?;
@@ -628,9 +674,9 @@ fn run_watch(opts: &LiveOpts) -> Result<()> {
 
 /// The options of `live <session-dir>` and `live watch`, and the session directory when one was
 /// given. `None` after `--help`.
-fn parse_args(argv: &[String], watch: bool, base: PathBuf) -> Result<Option<(LiveOpts, Option<PathBuf>)>> {
+pub(crate) fn parse_args(argv: &[String], watch: bool, base: PathBuf) -> Result<Option<(LiveOpts, Option<PathBuf>)>> {
     let mut base = base;
-    let (mut model, mut lang, mut out_dir) = (None, None, None);
+    let (mut model, mut lang, mut out_dir, mut owner_pid) = (None, None, None, None);
     let (mut max_window_ms, mut print, mut dir) = (12_000, watch, None);
     let mut it = argv.iter();
     while let Some(arg) = it.next() {
@@ -646,12 +692,14 @@ fn parse_args(argv: &[String], watch: bool, base: PathBuf) -> Result<Option<(Liv
                 max_window_ms = (secs * 1000.0) as usize;
             }
             "--print" => print = true,
+            "--owner-pid" => owner_pid = Some(value("--owner-pid")?.parse::<u32>().context("--owner-pid")?),
             "-h" | "--help" => {
                 eprintln!("usage: meetscribe live watch [options]            wait for calls and print each transcript\n       \
                     meetscribe live <session-dir> [options]    follow one recording\n       \
                     meetscribe live tail [--follow] [--key <k>] [--dir <dir>]\n       \
                     meetscribe live replay <recording dir> <new session dir> [--speed <n>] [--seconds <n>]\n\
-                    options: [--model <ggml>] [--lang <code>] [--out <dir>] [--base <dir>] [--max-window-secs <n>] [--print]");
+                    options: [--model <ggml>] [--lang <code>] [--out <dir>] [--base <dir>] [--max-window-secs <n>] [--print]\n         \
+                    [--owner-pid <pid>]  stop when that process is no longer this one's parent (the daemon passes its own)");
                 return Ok(None);
             }
             other if !watch && dir.is_none() && !other.starts_with('-') => dir = Some(PathBuf::from(other)),
@@ -665,13 +713,14 @@ fn parse_args(argv: &[String], watch: bool, base: PathBuf) -> Result<Option<(Liv
         model: model.unwrap_or_else(|| base.join("models/ggml-large-v3.bin")),
         lang: lang.unwrap_or_else(|| crate::config::Config::load(&base).daemon.lang),
         out_dir: out_dir.unwrap_or_else(|| default_out_dir(&base)),
-        base, max_window_ms, print,
+        base, max_window_ms, print, owner_pid,
     };
     Ok(Some((opts, dir)))
 }
 
 /// `meetscribe live <session-dir> [--model <ggml>] [--lang <code>] [--out <dir>] [--base <dir>]
-/// [--max-window-secs <n>] [--print]`, plus the `watch`, `tail` and `replay` subcommands.
+/// [--max-window-secs <n>] [--print] [--owner-pid <pid>]`, plus the `watch`, `tail` and `replay`
+/// subcommands.
 pub(crate) fn run(argv: &[String]) -> Result<()> {
     match argv.first().map(String::as_str) {
         Some("tail") => return run_tail(&argv[1..]),
@@ -706,7 +755,7 @@ mod tests {
 
     fn opts(root: &Path) -> LiveOpts {
         LiveOpts { model: root.join("unused.bin"), lang: "es".into(), out_dir: root.join("live"),
-            base: root.join("base"), max_window_ms: 12_000, print: false }
+            base: root.join("base"), max_window_ms: 12_000, print: false, owner_pid: None }
     }
 
     fn events(path: &Path) -> Vec<Value> {
@@ -947,6 +996,188 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    fn recording_status(base: &Path) {
+        recovery::private_dir(base).unwrap();
+        status::Status { state: status::DaemonState::Recording, app: Some("Chrome".into()), since_epoch: 1, updated_epoch: 1,
+            pid: 1, instance: None, pending: 0, attention: 0 }.write(base).unwrap();
+        assert!(status::call_is_live(base));
+    }
+
+    /// The id of a process that is not this one's parent: a child that has already ended.
+    fn gone_pid() -> u32 {
+        let mut child = std::process::Command::new("/bin/sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    fn own_parent() -> u32 {
+        // SAFETY: getppid takes no argument and cannot fail.
+        (unsafe { libc::getppid() }) as u32
+    }
+
+    /// Run a reader on its own thread, so a test can tell "still following" from "ended".
+    fn follow(dir: &Path, opts: LiveOpts) -> std::sync::mpsc::Receiver<Result<LiveSummary>> {
+        let (done, ended) = std::sync::mpsc::channel();
+        let dir = dir.to_path_buf();
+        std::thread::spawn(move || done.send(run_live(&dir, &opts, |_, _| Ok((String::new(), 0.0)))));
+        ended
+    }
+
+    /// A daemon killed during a call leaves `status.json` at `recording` for ever, so the
+    /// stalled rule alone never stops its reader. The reader started with `--owner-pid` stops
+    /// on its next turn: with the checkpoint fresh, and without reading the audio that is left.
+    #[test]
+    fn a_reader_whose_daemon_is_gone_stops_at_once_whatever_the_status_file_says() {
+        let root = temp_root("owner");
+        let dir = root.join("recording");
+        let mut session = recovery::Session::begin(&dir, &root.join("archive.db"), &dir,
+            "com.google.Chrome", "Owner fixture", 1_762_880_000).unwrap();
+        session.start_roll(0, 16_000, 0.0).unwrap();
+        let dir = session.dir.clone();
+        let (mut mic, mut system) = (wav(&dir.join("mic.wav"), 16_000), wav(&dir.join("system.wav"), 16_000));
+        for _ in 0..8_000 { mic.write_sample(0.0f32).unwrap(); system.write_sample(0.0f32).unwrap(); }
+        mic.flush().unwrap(); system.flush().unwrap();
+        session.checkpoint(0, 8_000, 8_000).unwrap();
+        recording_status(&root.join("base"));
+
+        let mut orphan = opts(&root);
+        orphan.owner_pid = Some(gone_pid());
+        let summary = follow(&dir, orphan).recv_timeout(Duration::from_secs(5))
+            .expect("a reader whose daemon is gone went on following the recording").unwrap();
+        assert_eq!(summary.reason, "stalled");
+        assert_eq!(summary.audio_secs, 0.0, "it read committed audio after its daemon was gone");
+        let lines = events(&summary.stream);
+        assert_eq!(lines.iter().map(|line| line["type"].as_str().unwrap()).collect::<Vec<_>>(), ["meeting_started", "meeting_ended"]);
+        assert_eq!(lines[1]["reason"], "stalled");
+
+        // With its daemon alive (this test's own parent stands in) the same reader waits, and
+        // follows the recording to its end.
+        let mut owned = opts(&root);
+        owned.owner_pid = Some(own_parent());
+        let ended = follow(&dir, owned);
+        assert!(ended.recv_timeout(Duration::from_millis(1200)).is_err(), "a reader whose daemon is alive stopped during the call");
+        session.finish_capture(0.5, 0.1).unwrap();
+        let summary = ended.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+        assert_eq!(summary.reason, "ended");
+        assert!((summary.audio_secs - 0.5).abs() < 1e-6);
+        drop((mic, system));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The daemon starts its reader right after `Session::begin`, before capture has opened a
+    /// device: the state is readable and has no roll and no WAV yet. That is a recording to
+    /// wait on, not one that has ended.
+    #[test]
+    fn a_recording_that_has_only_just_begun_is_waited_on() {
+        let root = temp_root("begun");
+        let dir = root.join("recording");
+        let mut session = recovery::Session::begin(&dir, &root.join("archive.db"), &dir,
+            "com.google.Chrome", "Begun fixture", 1_762_880_000).unwrap();
+        let dir = session.dir.clone();
+        recording_status(&root.join("base"));
+        let mut owned = opts(&root);
+        owned.owner_pid = Some(own_parent());
+        let ended = follow(&dir, owned);
+        assert!(ended.recv_timeout(Duration::from_millis(1200)).is_err(), "a recording with no roll yet was taken as ended");
+        // Capture starts, writes and ends.
+        session.start_roll(0, 16_000, 0.0).unwrap();
+        let (mut mic, mut system) = (wav(&dir.join("mic.wav"), 16_000), wav(&dir.join("system.wav"), 16_000));
+        for _ in 0..8_000 { mic.write_sample(0.0f32).unwrap(); system.write_sample(0.0f32).unwrap(); }
+        mic.flush().unwrap(); system.flush().unwrap();
+        session.checkpoint(0, 8_000, 8_000).unwrap();
+        session.finish_capture(0.5, 0.1).unwrap();
+        let summary = ended.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+        assert_eq!(summary.reason, "ended");
+        assert!((summary.audio_secs - 0.5).abs() < 1e-6);
+        drop((mic, system));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn started_event(key: &str) -> StreamEvent {
+        StreamEvent::MeetingStarted { key: key.into(), app: "Chrome".into(), started_at: 1_794_443_305, model: "unused".into(), lang: None }
+    }
+
+    /// The daily prune unlinks an old stream while it holds the stream's lock. A reader that
+    /// opened the file just before must not go on to fill a file nobody can open.
+    #[test]
+    fn a_writer_whose_file_was_removed_before_its_lock_writes_a_file_at_the_path() {
+        use std::os::unix::fs::MetadataExt;
+        let root = temp_root("writer-unlinked");
+        let out = root.join("live");
+        let key = "a6e79ba0314c4cc2b647f4d25b327011";
+        let mut opens = 0;
+        let mut stream = StreamWriter::create_with(&out, key, false, |path| {
+            opens += 1;
+            if opens == 1 { std::fs::remove_file(path).unwrap(); }
+        }).unwrap();
+        assert_eq!(opens, 2, "the writer kept a file that was no longer at its path");
+        stream.event(started_event(key)).unwrap();
+        assert_eq!(stream.file.metadata().unwrap().ino(), std::fs::metadata(&stream.path).unwrap().ino());
+        assert_eq!(events(&out.join(format!("{key}.jsonl"))).len(), 1);
+        drop(stream);
+        // Removed every time: it gives up rather than write where nobody will look.
+        let mut opens = 0;
+        let refused = StreamWriter::create_with(&out, key, false, |path| { opens += 1; std::fs::remove_file(path).unwrap(); });
+        assert!(refused.is_err());
+        assert_eq!(opens, OPEN_ATTEMPTS);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The prune against the real writer: a stream somebody is writing is kept however old its
+    /// file looks, and so is one that a reader starts again between the prune listing it and
+    /// locking it. Left alone and old, it goes.
+    #[test]
+    fn the_prune_keeps_a_stream_being_written_and_one_rewritten_while_it_looked() {
+        use crate::maintenance::{PruneReport, PruneStep, prune_live, prune_live_with};
+        let root = temp_root("prune-writer");
+        let out = root.join("live");
+        let key = "a6e79ba0314c4cc2b647f4d25b327011";
+        let path = out.join(format!("{key}.jsonl"));
+        let month_old = |path: &Path| File::options().write(true).open(path).unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(30 * 86_400)).unwrap();
+        let now = crate::now_epoch();
+
+        let mut writer = StreamWriter::create(&out, key, false).unwrap();
+        writer.event(started_event(key)).unwrap();
+        month_old(&path);
+        assert_eq!(prune_live(&out, 7, now).unwrap(), PruneReport { removed: 0, kept: 1 }, "a stream being written was pruned");
+        assert_eq!(events(&path).len(), 1);
+        drop(writer);
+
+        month_old(&path);
+        let report = prune_live_with(&out, 7, now, |step, _| if step == PruneStep::Listed {
+            let mut again = StreamWriter::create(&out, key, false).unwrap();
+            again.event(started_event(key)).unwrap();
+            again.event(StreamEvent::Heartbeat { audio_secs: 2.0, decoded_secs: 0.0 }).unwrap();
+        }).unwrap();
+        assert_eq!(report, PruneReport { removed: 0, kept: 1 }, "the age read before the lock condemned a stream written a moment ago");
+        assert_eq!(events(&path).len(), 2);
+
+        month_old(&path);
+        assert_eq!(prune_live(&out, 7, now).unwrap(), PruneReport { removed: 1, kept: 0 });
+        assert!(!path.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_viewer_takes_a_stream_that_vanished_as_nothing_new() {
+        let root = temp_root("vanished");
+        let path = root.join("stream.jsonl");
+        let line = format!("{}\n", json!({"v":1,"seq":0,"type":"segment","speaker":"you","t_start":1.0,"t_end":2.0,"text":"uno"}));
+        std::fs::write(&path, &line).unwrap();
+        let (mut offsets, mut shown) = (HashMap::new(), Vec::new());
+        show(&path, &mut offsets, &mut shown).unwrap();
+        assert_eq!(offsets[&path], line.len() as u64);
+        // Pruned between being chosen and being opened.
+        std::fs::remove_file(&path).unwrap();
+        show(&path, &mut offsets, &mut shown).unwrap();
+        assert_eq!(offsets[&path], line.len() as u64);
+        show(&root.join("never-there.jsonl"), &mut offsets, &mut shown).unwrap();
+        assert_eq!(String::from_utf8(shown).unwrap().lines().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn watch_picks_the_recording_in_progress_and_nothing_else() {
         let root = temp_root("watch");
@@ -989,6 +1220,9 @@ mod tests {
         std::fs::write(home.join("config.toml"), "version = 1\n[daemon]\nlang = \"en\"\n").unwrap();
         let (opts, dir) = parse_args(&[], true, home.clone()).unwrap().unwrap();
         assert_eq!((opts.lang.as_str(), dir, opts.print), ("en", None, true));
+        assert_eq!(opts.owner_pid, None, "a reader started by hand has no owner to watch");
+        assert_eq!(parse_args(&args(&["--owner-pid", "4242"]), true, home.clone()).unwrap().unwrap().0.owner_pid, Some(4242));
+        assert!(parse_args(&args(&["--owner-pid", "the-daemon"]), true, home.clone()).is_err());
         assert_eq!((opts.out_dir, opts.model), (home.join("live"), home.join("models/ggml-large-v3.bin")));
         // Another base directory moves the stream, the model and the config with it.
         let moved = args(&["session", "--base", other.to_str().unwrap()]);
