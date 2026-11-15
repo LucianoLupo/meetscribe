@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::{asr, db, diar, export, render, resample, split, spk, transcript, vad, voices};
+use crate::{asr, db, diar, export, promote, render, resample, split, spk, transcript, vad, voices};
 
 /// Inputs for one transcribe+store+export run. Designed against BOTH callers (CLI + daemon):
 /// the daemon supplies an ABSOLUTE `model` path (under launchd `cwd=/`, a repo-relative path
@@ -100,11 +100,16 @@ pub(crate) struct PipelineOutput {
 
 /// Transcribe every channel segment under `dir`, merge into one time-ordered speaker-labeled
 /// transcript, persist to the DB (unless `no_store`), and write Markdown+JSON exports.
-pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts) -> Result<PipelineOutput> {
-    transcribe_with_clock(dir, opts, crate::now_epoch)
+///
+/// `promote_live` is the directory of live streams (`--promote-live`). With it, a managed session
+/// whose stream passes the completeness gate (`promote.rs`) is stored from that stream and whisper
+/// does not run; with any other stream the recording is transcribed as usual, in the same attempt.
+/// It travels beside `PipelineOpts` because the daemon builds those by literal.
+pub(crate) fn transcribe_and_store(dir: &Path, opts: &PipelineOpts, promote_live: Option<&Path>) -> Result<PipelineOutput> {
+    transcribe_with_clock(dir, opts, promote_live, crate::now_epoch)
 }
 
-pub(crate) fn transcribe_with_clock(dir: &Path, opts: &PipelineOpts, now: impl Fn() -> i64) -> Result<PipelineOutput> {
+pub(crate) fn transcribe_with_clock(dir: &Path, opts: &PipelineOpts, promote_live: Option<&Path>, now: impl Fn() -> i64) -> Result<PipelineOutput> {
     use crate::recovery::{Session, STATE_FILE};
     let keyed = opts.resume || opts.session_key.is_some();
     anyhow::ensure!(!(keyed && opts.no_store), "recovery cannot use --no-store");
@@ -144,7 +149,17 @@ pub(crate) fn transcribe_with_clock(dir: &Path, opts: &PipelineOpts, now: impl F
             db.close().await?;
             anyhow::Ok(id)
         })?;
-        if let Some(id) = existing { return render_existing(managed, &actual, id); }
+        if let Some(id) = existing { return render_existing(managed, &actual, id, export::Publication::Recovered); }
+        if let Some(live_dir) = promote_live {
+            match promote::wait_and_load(live_dir, &managed.state, &promote::Wait::current()) {
+                Ok(promotion) => return store_promoted(dir, managed, &actual, promotion),
+                // Not an error: the batch pass below runs under this same reservation.
+                Err(reason) => log::info!(target: "meetscribe::event", "{}", serde_json::json!({
+                    "component": "pipeline", "event": "live_promotion_rejected",
+                    "session_id": managed.state.key, "reason": reason.as_str(),
+                })),
+            }
+        }
         let inputs = match managed.inputs() {
             Ok(inputs) => inputs,
             Err(error) => { managed.needs_attention("checkpoint_invalid")?; return Err(error); }
@@ -166,7 +181,47 @@ pub(crate) fn transcribe_with_clock(dir: &Path, opts: &PipelineOpts, now: impl F
     result
 }
 
-fn render_existing(managed: &mut crate::recovery::Session, opts: &PipelineOpts, id: i64) -> Result<PipelineOutput> {
+/// Store a live stream that passed the gate as this session's meeting, then publish it like any
+/// stored meeting. No voice clusters: the live lane does not embed speakers.
+fn store_promoted(dir: &Path, managed: &mut crate::recovery::Session, opts: &PipelineOpts, promotion: promote::Promotion) -> Result<PipelineOutput> {
+    let meta = db::MeetingMeta {
+        title: managed.state.title.clone(),
+        source_dir: dir.display().to_string(),
+        model: promotion.model.clone(),
+        // The language the text was decoded in is the reader's, not this child's option. Only a
+        // stream from before readers recorded it leaves the option as the best answer.
+        lang: promotion.lang.clone().unwrap_or_else(|| opts.lang.clone()),
+        started_at: managed.state.started_at,
+        duration_secs: promotion.duration_secs,
+        created_at: crate::now_epoch(),
+        capture_status: Some(managed.state.capture_status.as_str().to_owned()),
+        origin: db::TranscriptOrigin::Live,
+    };
+    let key = managed.state.key.clone();
+    let id = crate::new_runtime()?.block_on(async {
+        let mut db = managed.archive().await?;
+        let id = db.insert_keyed_meeting_with_voices(&meta, &promotion.segments, &[], &[], &key).await?;
+        db.close().await?;
+        anyhow::Ok(id)
+    })?;
+    #[cfg(test)]
+    cutpoint("live_committed");
+    log::info!(target: "meetscribe::event", "{}", serde_json::json!({
+        "component": "pipeline", "event": "live_promoted", "session_id": key, "outcome": "ok",
+        "segments": promotion.stream_segments, "merged_segments": promotion.segments.len(),
+        "short_windows": promotion.short_windows, "audio_secs": promotion.duration_secs, "wait_ms": promotion.wait_ms,
+    }));
+    let mode = publication_mode(opts, managed);
+    render_existing(managed, opts, id, mode)
+}
+
+/// Only a first, automatic attempt may create the root pair; a retry or an explicit resume
+/// publishes beside it and never replaces files that may have been edited since.
+fn publication_mode(opts: &PipelineOpts, session: &crate::recovery::Session) -> export::Publication {
+    if opts.resume || session.state.attempts > 1 { export::Publication::Recovered } else { export::Publication::Initial }
+}
+
+fn render_existing(managed: &mut crate::recovery::Session, opts: &PipelineOpts, id: i64, mode: export::Publication) -> Result<PipelineOutput> {
     let started = Instant::now();
     let runtime = crate::new_runtime()?;
     let (row, segments, vocabulary, people) = runtime.block_on(async {
@@ -185,7 +240,7 @@ fn render_existing(managed: &mut crate::recovery::Session, opts: &PipelineOpts, 
         _ => crate::recovery::CaptureStatus::Unknown,
     };
     managed.committed(id)?;
-    let (md_path, json_path) = export::write_managed_exports(&opts.export_dir, &managed.state.key, export::Publication::Recovered, &row, &rendered)?;
+    let (md_path, json_path) = export::write_managed_exports(&opts.export_dir, &managed.state.key, mode, &row, &rendered)?;
     let wall_secs = started.elapsed().as_secs_f64();
     Ok(PipelineOutput {
         segments: rendered, stored_id: Some(id), md_path, json_path, meeting_secs: row.duration_secs,
@@ -402,6 +457,7 @@ fn transcribe_core(dir: &Path, audio_dir: &Path, opts: &PipelineOpts, mut manage
         duration_secs: meeting_secs,
         created_at: crate::now_epoch(),
         capture_status: managed.as_ref().map(|session| session.state.capture_status.as_str().to_owned()),
+        origin: db::TranscriptOrigin::Batch,
     };
 
     // Persist to the DB, then export. A storage failure must NOT discard the transcript: on error
@@ -508,8 +564,7 @@ fn transcribe_core(dir: &Path, audio_dir: &Path, opts: &PipelineOpts, mut manage
     }
     let (md_path, json_path) = if let Some(key) = &opts.session_key {
         let session = managed.as_ref().context("keyed publication has no session")?;
-        let mode = if opts.resume || session.state.attempts > 1 { export::Publication::Recovered } else { export::Publication::Initial };
-        export::write_managed_exports(&opts.export_dir, key, mode, &row, &rendered)?
+        export::write_managed_exports(&opts.export_dir, key, publication_mode(opts, session), &row, &rendered)?
     } else { export::write_exports(&opts.export_dir, "transcript", &row, &rendered)? };
     if let Some(error) = storage_error {
         return Err(error.context(format!("archive incomplete; exported files preserved at {}", md_path.parent().unwrap_or(&opts.export_dir).display())));
@@ -712,6 +767,7 @@ fn synth_row(meta: &db::MeetingMeta, segment_count: usize) -> db::MeetingRow {
         segment_count: segment_count as i64,
         created_at: meta.created_at,
         capture_status: meta.capture_status.clone().unwrap_or_else(|| "unknown".into()),
+        origin: meta.origin,
     }
 }
 

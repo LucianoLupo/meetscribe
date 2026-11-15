@@ -30,7 +30,7 @@ fn meta(session: &recovery::Session) -> db::MeetingMeta {
         title: session.state.title.clone(), source_dir: session.dir.display().to_string(),
         model: "synthetic-whisper-large-v3".into(), lang: "en".into(),
         started_at: session.state.started_at, duration_secs: 1.0, created_at: 1_762_880_010,
-        capture_status: Some("partial".into()),
+        capture_status: Some("partial".into()), origin: db::TranscriptOrigin::Batch,
     }
 }
 
@@ -342,4 +342,111 @@ fn audit_f3_independent_database_connections_converge() {
         std::fs::remove_dir_all(base).unwrap();
     }
     println!("{{\"event\":\"audit_case_complete\",\"case\":\"f3_db_race\",\"iterations\":5}}");
+}
+
+/// A finished, published session whose archive is still at schema v3: what every session stored
+/// before this binary looks like. Built through `open_existing`, which never migrates.
+fn stored_in_a_v3_archive() -> (PathBuf, recovery::Session) {
+    let (base, mut session) = fixture(CaptureKind::Complete);
+    let runtime = crate::new_runtime().unwrap();
+    let identity = runtime.block_on(db::Db::create_v3_archive(&session.state.db_path)).unwrap();
+    session.state.archive_id = Some(identity.clone());
+    session.reserve(crate::now_epoch(), false).unwrap();
+    let mut metadata = meta(&session); metadata.capture_status = Some("complete".into());
+    let key = session.state.key.clone();
+    let (id, row, stored) = runtime.block_on(async {
+        let mut archive = db::Db::open_existing(&session.state.db_path, &identity).await.unwrap();
+        let id = archive.insert_keyed_meeting_with_voices(&metadata, &[segment()], &[], &[], &key).await.unwrap();
+        let row = archive.get_meeting(id).await.unwrap().unwrap();
+        let stored = archive.load_segments(id).await.unwrap(); archive.close().await.unwrap();
+        (id, row, stored)
+    });
+    let (vocab, _) = crate::render::Vocab::compile(&[]);
+    let rendered = crate::render::render(&stored, &crate::render::IdentityMap::from_db(&[]), &vocab);
+    let (md, _) = crate::export::write_managed_exports(&session.state.export_dir, &key,
+        crate::export::Publication::Initial, &row, &rendered).unwrap();
+    session.committed(id).unwrap(); session.complete(md.parent().unwrap()).unwrap();
+    (base, session)
+}
+
+fn schema_version(state: &recovery::State) -> i32 {
+    crate::new_runtime().unwrap().block_on(async {
+        let mut archive = db::Db::open_existing(&state.db_path, state.archive_id.as_deref().unwrap()).await.unwrap();
+        let version = archive.schema_version().await.unwrap(); archive.close().await.unwrap(); version
+    })
+}
+
+/// Retention and the pending-marker reconciliation prove a session with this binary before any
+/// command has migrated its archive. The proof must hold on the v3 file and must not migrate it.
+#[test]
+fn a_session_in_a_v3_archive_is_proven_without_migrating_it() {
+    for _ in 0..5 {
+        let (base, session) = stored_in_a_v3_archive();
+        assert!(session.proof(recovery::ProofScope::Archive).unwrap());
+        assert!(session.proof(recovery::ProofScope::Retention).unwrap());
+        assert_eq!(schema_version(&session.state), 3, "a read-only proof migrated the archive");
+        let dir = session.dir.clone(); let state = session.state.clone(); drop(session);
+        assert_eq!(crate::maintenance::prune_sessions(&base, 30, crate::now_epoch() + 100 * 86_400).unwrap().removed, 1);
+        assert!(!dir.exists());
+        assert_eq!(schema_version(&state), 3);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+}
+
+/// The attempt that next touches a bound v3 archive migrates it: that archive, the one the
+/// session is bound to, wherever it is. A second session bound to another v3 file is untouched.
+#[test]
+fn resuming_a_session_migrates_its_own_bound_archive_and_no_other() {
+    for _ in 0..5 {
+        let (base, session) = stored_in_a_v3_archive();
+        let (other_base, other) = stored_in_a_v3_archive();
+        assert_ne!(session.state.db_path, other.state.db_path);
+        let dir = session.dir.clone(); let id = session.state.meeting_id; drop(session);
+        crate::run_transcribe(&resume_args(&dir)).unwrap(); // Missing model: the stored meeting is rendered, nothing is decoded.
+        let state = recovery::State::read(&dir).unwrap();
+        assert_eq!((state.phase, state.meeting_id), (recovery::Phase::Complete, id));
+        assert_eq!(schema_version(&state), 4, "the bound archive was left at v3");
+        assert_eq!(schema_version(&other.state), 3, "an archive no attempt touched was migrated");
+        crate::new_runtime().unwrap().block_on(async {
+            let mut archive = db::Db::open_existing(&state.db_path, state.archive_id.as_deref().unwrap()).await.unwrap();
+            let rows = archive.list_meetings().await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].origin, db::TranscriptOrigin::Batch, "a meeting stored before the column existed is a batch transcript");
+            archive.close().await.unwrap();
+        });
+        // Migrated or not, both sessions still prove their publication.
+        assert!(recovery::Session::open(&dir).unwrap().unwrap().proof(recovery::ProofScope::Archive).unwrap());
+        assert!(other.proof(recovery::ProofScope::Retention).unwrap());
+        // The second session's turn: its archive, a different file, is the one migrated now.
+        let other_dir = other.dir.clone(); drop(other);
+        crate::run_transcribe(&resume_args(&other_dir)).unwrap();
+        assert_eq!(schema_version(&recovery::State::read(&other_dir).unwrap()), 4);
+        std::fs::remove_dir_all(base).unwrap(); std::fs::remove_dir_all(other_base).unwrap();
+    }
+}
+
+/// An archive whose identity is verified but whose upgrade fails is not a foreign archive: the
+/// attempt fails and is retried, the session does not go to `needs_attention("archive_identity")`.
+#[test]
+fn a_failed_schema_upgrade_is_a_failed_attempt_not_an_identity_failure() {
+    use sqlx::Connection;
+    for _ in 0..5 {
+        let (base, session) = stored_in_a_v3_archive();
+        let dir = session.dir.clone(); let db_path = session.state.db_path.clone(); drop(session);
+        // The v4 rung cannot apply: its column is already there under a v3 version number.
+        crate::new_runtime().unwrap().block_on(async {
+            let mut connection = sqlx::SqliteConnection::connect_with(&sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&db_path).create_if_missing(false)).await.unwrap();
+            sqlx::query("ALTER TABLE meetings ADD COLUMN transcript_origin TEXT NULL").execute(&mut connection).await.unwrap();
+            connection.close().await.unwrap();
+        });
+        let error = crate::run_transcribe(&resume_args(&dir)).expect_err("the upgrade cannot succeed");
+        assert_ne!(crate::diagnostics::error_class(&error), "archive_identity", "unexpected class for: {error:#}");
+        let state = recovery::State::read(&dir).unwrap();
+        assert_eq!(state.phase, recovery::Phase::Archived, "the session must stay eligible for a retry");
+        assert_eq!((state.attempts, state.in_flight, state.error_class.as_deref()), (1, false, Some("processing")));
+        assert!(state.next_retry > 0);
+        assert_eq!(schema_version(&state), 3, "a failed rung must leave the version where it was");
+        std::fs::remove_dir_all(base).unwrap();
+    }
 }

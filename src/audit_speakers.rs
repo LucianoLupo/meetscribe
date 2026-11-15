@@ -19,6 +19,7 @@ async fn seed(path: &Path, mode: &str) -> (i64, i64, i64) {
         title: "Release readiness sync".into(), source_dir: "/synthetic/release-sync".into(),
         model: "fixture-whisper-large-v3".into(), lang: "en".into(),
         started_at: 1_762_880_000, duration_secs: 24.0, created_at: 1_762_880_030, capture_status: None,
+        origin: db::TranscriptOrigin::Batch,
     };
     let clusters: Vec<db::NewCluster> = ["A", "B", "C", "D"].iter().map(|label| db::NewCluster {
         cluster: (*label).into(), speaker_id: None, assigned_by: None, match_score: None,

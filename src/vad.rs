@@ -8,10 +8,10 @@ use anyhow::{Context, Result};
 use silero::{VadConfig, VadSession, VadTransition};
 
 /// Merge speech segments separated by less than this much silence (brief in-turn pauses).
-const COALESCE_GAP_MS: usize = 800;
+pub(crate) const COALESCE_GAP_MS: usize = 800;
 /// Don't coalesce past this length — keeps windows whisper-friendly and preserves
 /// turn-level granularity for the cross-channel merge.
-const MAX_WINDOW_MS: usize = 30_000;
+pub(crate) const MAX_WINDOW_MS: usize = 30_000;
 
 const SAMPLES_PER_MS: usize = 16; // 16 kHz
 

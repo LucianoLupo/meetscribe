@@ -228,13 +228,18 @@ impl Session {
 
     pub async fn archive(&mut self) -> Result<crate::db::Db> {
         if let Some(identity) = &self.state.archive_id {
-            match crate::db::Db::open_existing(&self.state.db_path, identity).await {
-                Ok(db) => Ok(db),
+            let mut db = match crate::db::Db::open_existing(&self.state.db_path, identity).await {
+                Ok(db) => db,
                 Err(error) => {
                     self.needs_attention("archive_identity")?;
-                    Err(error.context("bound archive unavailable; no database was created"))
+                    return Err(error.context("bound archive unavailable; no database was created"));
                 }
-            }
+            };
+            // The identity is verified, so this is the session's own archive: an older schema is
+            // upgraded on this same connection. A failure here (another process holds the write
+            // lock) is an ordinary failed attempt that is retried, not a foreign archive.
+            db.migrate().await.context("upgrade the schema of the session's archive")?;
+            Ok(db)
         } else {
             let mut db = crate::db::Db::open(&self.state.db_path).await?;
             let identity = db.archive_id().await?;
