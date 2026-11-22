@@ -28,24 +28,39 @@ pub struct PruneReport {
     pub kept: usize,
 }
 
-/// mtime of `path` as unix epoch seconds (best-effort; 0 if unavailable → treated as very old).
-fn mtime_epoch(path: &Path) -> i64 {
-    fs::metadata(path)
-        .and_then(|m| m.modified())
+/// A file's modification time as unix epoch seconds; `None` when it cannot be read.
+fn modified_epoch(meta: &fs::Metadata) -> Option<i64> {
+    meta.modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
+}
+
+/// mtime of `path` as unix epoch seconds (best-effort; 0 if unavailable → treated as very old).
+fn mtime_epoch(path: &Path) -> i64 {
+    fs::metadata(path)
+        .ok()
+        .and_then(|m| modified_epoch(&m))
         .unwrap_or(0)
 }
 
 /// True if something last modified at `mtime_epoch` is strictly older than `days` relative to
-/// `now_epoch`. `days == 0` is never old (keep forever).
+/// `now_epoch`. `days == 0` is never old (keep forever), and neither is anything whose age
+/// cannot be established: a `days` too large to count in seconds, or an age that overflows.
 #[must_use]
 pub fn is_older_than(mtime_epoch: i64, now_epoch: i64, days: u64) -> bool {
     if days == 0 {
         return false;
     }
-    now_epoch - mtime_epoch > (days as i64) * SECS_PER_DAY
+    let Some(limit) = i64::try_from(days)
+        .ok()
+        .and_then(|days| days.checked_mul(SECS_PER_DAY))
+    else {
+        return false;
+    };
+    now_epoch
+        .checked_sub(mtime_epoch)
+        .is_some_and(|age| age > limit)
 }
 
 /// File the daemon drops in a session dir while its transcription is queued; removed after the
@@ -109,11 +124,9 @@ fn stream_key(name: &std::ffi::OsStr) -> Option<&str> {
 #[must_use]
 fn stream_expired(regular: bool, modified: Option<i64>, first_line: Option<&str>, key: &str, now_epoch: i64, days: u64) -> bool {
     use crate::live::{StreamEvent, StreamLine};
-    let Some(limit) = i64::try_from(days).ok().and_then(|days| days.checked_mul(SECS_PER_DAY)) else { return false; };
-    let Some(age) = modified.and_then(|modified| now_epoch.checked_sub(modified)) else { return false; };
     let ours = first_line.and_then(|line| serde_json::from_str::<StreamLine>(line).ok())
         .is_some_and(|line| matches!(line.event, StreamEvent::MeetingStarted { key: written, .. } if written == key));
-    regular && days > 0 && age > limit && ours
+    regular && modified.is_some_and(|modified| is_older_than(modified, now_epoch, days)) && ours
 }
 
 /// Longest first line read from a stream: a `meeting_started` event is a few hundred bytes.
@@ -163,8 +176,7 @@ fn prune_stream(path: &Path, key: &str, days: u64, now_epoch: i64, at: &mut impl
     // SAFETY: `file` owns the valid descriptor; flock does not access Rust memory.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 { return false; }
     let Ok(held) = file.metadata() else { return false; };
-    let modified = held.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok()).map(|age| age.as_secs() as i64);
-    if !stream_expired(held.file_type().is_file(), modified, first_line(&file).as_deref(), key, now_epoch, days) { return false; }
+    if !stream_expired(held.file_type().is_file(), modified_epoch(&held), first_line(&file).as_deref(), key, now_epoch, days) { return false; }
     at(PruneStep::Locked, path);
     if !fs::symlink_metadata(path).is_ok_and(|at| at.dev() == held.dev() && at.ino() == held.ino()) { return false; }
     // `file` is dropped, and the lock released, only after the unlink.
@@ -249,6 +261,12 @@ mod tests {
         assert!(is_older_than(now - 31 * SECS_PER_DAY, now, 30));
         // Exactly at the threshold is NOT old (strict >).
         assert!(!is_older_than(now - 30 * SECS_PER_DAY, now, 30));
+        // An age that cannot be established is not old: too many days to count in seconds…
+        for days in [u64::MAX, i64::MAX as u64, i64::MAX as u64 / SECS_PER_DAY as u64 + 1] {
+            assert!(!is_older_than(0, now, days), "{days} days");
+        }
+        // …or a modification time so far back that the age overflows.
+        assert!(!is_older_than(i64::MIN, now, 30));
     }
 
     #[test]
@@ -419,14 +437,14 @@ mod tests {
         fs::remove_dir_all(&tmp).ok();
     }
 
-    /// `live watch` keeps `live-watch.log` open for days, in append mode. After a rotation it
-    /// must go on writing at the new end of the file, not at its old offset.
+    /// launchd holds the daemon's log open for as long as the daemon runs, in append mode. After
+    /// a rotation the holder must go on writing at the new end of the file, not at its old offset.
     #[test]
     fn a_log_held_open_in_append_mode_is_written_at_the_new_end_after_rotation() {
         use std::io::Write;
         let tmp = std::env::temp_dir().join(format!("meetscribe-rotate-append-{}", crate::recovery::new_identity()));
         fs::create_dir_all(&tmp).unwrap();
-        let log = tmp.join("live-watch.log");
+        let log = tmp.join("meetscribe.err.log");
         let mut held = fs::OpenOptions::new().create(true).append(true).open(&log).unwrap();
         held.write_all(b"0123456789ABCDEF").unwrap();
         assert!(rotate_log(&log, 8).unwrap());

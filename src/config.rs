@@ -214,9 +214,8 @@ impl Default for LiveSettings {
     }
 }
 
-const DEFAULT_MAX_WINDOW_SECS: u64 = 12;
-/// The live reader refuses a shorter window (`live::parse_args`).
-const MIN_MAX_WINDOW_SECS: u64 = 2;
+// The reader owns both limits: it refuses a window shorter than the minimum.
+use crate::live::{DEFAULT_MAX_WINDOW_SECS, MIN_MAX_WINDOW_SECS};
 
 /// What the daemon does about the live lane: `[live]` with its two rules applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

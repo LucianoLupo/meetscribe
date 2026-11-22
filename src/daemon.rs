@@ -605,13 +605,8 @@ fn job_for(cfg: &DaemonConfig, dir: PathBuf, label: String, title: String) -> Tr
     // Only a session with a key has a stream to find and a recorded length to check it against,
     // and the child refuses the flag without one. `live.promote` is already false without
     // `live.enabled`.
-    let promote_live = (cfg.live.promote && opts.session_key.is_some()).then(|| live_dir(&cfg.base));
+    let promote_live = (cfg.live.promote && opts.session_key.is_some()).then(|| crate::live::default_out_dir(&cfg.base));
     TranscribeJob { dir, label, opts, promote_live }
-}
-
-/// Where the live readers write their streams, and where the transcription child looks for one.
-fn live_dir(base: &Path) -> PathBuf {
-    base.join("live")
 }
 
 /// Mark the session dir pending (best-effort: without the marker the job still runs now, it just
@@ -846,6 +841,18 @@ enum Killed {
     TrackingLost,
 }
 
+impl Killed {
+    /// The `reason` of a `live_child_killed` log line (`diagnostics.rs` allows these four).
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Replaced => "replaced",
+            Self::Deadline => "deadline",
+            Self::Stopped => "stopped",
+            Self::TrackingLost => "tracking_lost",
+        }
+    }
+}
+
 /// What happened to a live reader in one call of a [`LiveReader`] method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReaderChange {
@@ -960,7 +967,7 @@ fn reader_args(dir: &Path, cfg: &DaemonConfig, owner_pid: u32) -> Vec<String> {
         "--lang".into(),
         cfg.lang.clone(),
         "--out".into(),
-        path(&live_dir(&cfg.base)),
+        path(&crate::live::default_out_dir(&cfg.base)),
         "--base".into(),
         path(&cfg.base),
         "--max-window-secs".into(),
@@ -971,7 +978,8 @@ fn reader_args(dir: &Path, cfg: &DaemonConfig, owner_pid: u32) -> Vec<String> {
 }
 
 /// The log line of one [`ReaderReport`]: an event name, the session, an outcome and, for a
-/// reader that exited with one, its exit code. Nothing else about the process.
+/// reader that exited with one, its exit code; for one the daemon ended, why. Nothing else
+/// about the process.
 fn reader_event(report: &ReaderReport) -> serde_json::Value {
     let (event, outcome) = match report.change {
         ReaderChange::Started => ("live_child_started", "ok"),
@@ -983,6 +991,7 @@ fn reader_event(report: &ReaderReport) -> serde_json::Value {
     let mut line = serde_json::json!({"component": "daemon", "event": event, "session_id": report.key, "outcome": outcome});
     if report.change == ReaderChange::SpawnFailed { line["error_class"] = serde_json::json!("child_launch"); }
     if let ReaderChange::Exited(Some(code)) = report.change { line["exit_code"] = serde_json::json!(code); }
+    if let ReaderChange::Killed(why) = report.change { line["reason"] = serde_json::json!(why.as_str()); }
     line
 }
 
@@ -1080,8 +1089,14 @@ fn record_and_queue(
         return Ok(());
     }
 
+    let mut job = job_for(cfg, dir, label.to_string(), title);
+    // `--once` stops this call's reader as soon as the loop is left, before it can finish its
+    // stream. Offering that stream would only make the child wait for a reader that is gone.
+    if cfg.once {
+        job.promote_live = None;
+    }
     // Queued even on shutdown: the marker survives the restart and the next start transcribes it.
-    queue_job(jobs, job_for(cfg, dir, label.to_string(), title));
+    queue_job(jobs, job);
     Ok(())
 }
 
@@ -1098,16 +1113,13 @@ fn run_maintenance(cfg: &DaemonConfig) {
         Err(e) => log::warn!("retention: session prune failed: {e}"),
     }
     // Independent of `live.enabled`: a stream written by a hand-started reader is pruned too.
-    match crate::maintenance::prune_live(&live_dir(&cfg.base), cfg.live.retain_days, crate::now_epoch()) {
+    match crate::maintenance::prune_live(&crate::live::default_out_dir(&cfg.base), cfg.live.retain_days, crate::now_epoch()) {
         Ok(r) if r.removed > 0 => log::info!("retention: pruned {} old live stream(s) (kept {})", r.removed, r.kept),
         Ok(_) => {}
         Err(e) => log::warn!("retention: live stream prune failed: {e}"),
     }
     let max_bytes = cfg.log_max_mb.saturating_mul(1024 * 1024);
-    // `live-watch.log` belongs to a hand-started `live watch`. It is rotated only with the
-    // daemon's reader on, so that a daemon with `[live]` left alone touches nothing new.
-    let live_log = cfg.live.enabled.then_some("live-watch.log");
-    for name in ["meetscribe.err.log", "meetscribe.out.log"].into_iter().chain(live_log) {
+    for name in ["meetscribe.err.log", "meetscribe.out.log"] {
         let p = cfg.logs_dir.join(name);
         if let Err(e) = crate::maintenance::rotate_log(&p, max_bytes) {
             log::warn!("retention: log rotate failed for {}: {e}", p.display());
@@ -1528,22 +1540,23 @@ mod tests {
     #[test]
     fn every_reader_report_is_a_log_line_the_formatter_accepts() {
         use ReaderChange::{Exited, SpawnFailed, Started};
-        for (change, event, outcome, exit_code, error_class) in [
-            (Started, "live_child_started", "ok", None, None),
-            (SpawnFailed, "live_child_started", "error", None, Some("child_launch")),
-            (Exited(Some(0)), "live_child_exited", "ok", Some(0), None),
-            (Exited(Some(3)), "live_child_exited", "error", Some(3), None),
-            (Exited(Some(255)), "live_child_exited", "error", Some(255), None),
-            (Exited(None), "live_child_exited", "error", None, None),
-            (ReaderChange::Killed(Killed::Replaced), "live_child_killed", "attention", None, None),
-            (ReaderChange::Killed(Killed::Deadline), "live_child_killed", "attention", None, None),
-            (ReaderChange::Killed(Killed::Stopped), "live_child_killed", "attention", None, None),
-            (ReaderChange::Killed(Killed::TrackingLost), "live_child_killed", "attention", None, None),
+        for (change, event, outcome, exit_code, error_class, reason) in [
+            (Started, "live_child_started", "ok", None, None, None),
+            (SpawnFailed, "live_child_started", "error", None, Some("child_launch"), None),
+            (Exited(Some(0)), "live_child_exited", "ok", Some(0), None, None),
+            (Exited(Some(3)), "live_child_exited", "error", Some(3), None, None),
+            (Exited(Some(255)), "live_child_exited", "error", Some(255), None, None),
+            (Exited(None), "live_child_exited", "error", None, None, None),
+            (ReaderChange::Killed(Killed::Replaced), "live_child_killed", "attention", None, None, Some("replaced")),
+            (ReaderChange::Killed(Killed::Deadline), "live_child_killed", "attention", None, None, Some("deadline")),
+            (ReaderChange::Killed(Killed::Stopped), "live_child_killed", "attention", None, None, Some("stopped")),
+            (ReaderChange::Killed(Killed::TrackingLost), "live_child_killed", "attention", None, None, Some("tracking_lost")),
         ] {
             let line = crate::diagnostics::formatted_event(&reader_event(&report(KEY, change)));
             assert_eq!((line["component"].as_str(), line["event"].as_str(), line["session_id"].as_str(), line["outcome"].as_str()),
                 (Some("daemon"), Some(event), Some(KEY), Some(outcome)), "{change:?}");
             assert_eq!((line["exit_code"].as_u64(), line["error_class"].as_str()), (exit_code, error_class), "{change:?}");
+            assert_eq!(line["reason"].as_str(), reason, "{change:?}");
         }
     }
 
@@ -1585,6 +1598,22 @@ mod tests {
         assert_eq!(job.opts.session_key, Some(state.key));
         assert_eq!(job.promote_live, Some(call.base.join("live")));
         assert!(reader.running.is_none());
+        std::fs::remove_dir_all(&call.base).unwrap();
+    }
+
+    /// `--once` stops the reader as the loop is left, so the call it recorded is not offered
+    /// its live transcript: the child would wait for a reader that is already gone. A session
+    /// from the backlog keeps the offer, since no reader of it is being stopped.
+    #[test]
+    fn a_call_recorded_with_once_is_not_offered_its_live_transcript() {
+        let mut call = call("rq-once", LIVE_ON);
+        call.cfg.once = true;
+        let mut reader = unspawnable();
+        record_and_queue(&call.cfg, "com.google.Chrome", &call.jobs, &call.board, &mut reader, |_, _, managed| captured(managed, 30.0)).unwrap();
+        let job = call.queued.try_recv().expect("the recording was not queued");
+        assert_eq!(job.promote_live, None);
+        let backlog = job_for(&call.cfg, job.dir.clone(), "Chrome".into(), "a title the stored state overrides".into());
+        assert_eq!(backlog.promote_live, Some(call.base.join("live")));
         std::fs::remove_dir_all(&call.base).unwrap();
     }
 
@@ -1686,11 +1715,11 @@ mod tests {
         }
     }
 
-    /// `live-watch.log` belongs to a hand-started `live watch`; a daemon with `[live]` left alone
-    /// must not start truncating it. Old live streams go with `retain_days`, on or off.
+    /// `live-watch.log` belongs to a hand-started `live watch`: the daemon never truncates it,
+    /// whatever `[live]` says. Old live streams go with `retain_days`, on or off.
     #[test]
-    fn maintenance_rotates_the_watch_log_only_with_the_reader_on_and_prunes_streams_by_retain_days() {
-        for (text, rotated, pruned) in [("", false, false), ("[live]\nenabled = true\n", true, false), ("[live]\nretain_days = 7\n", false, true)] {
+    fn maintenance_leaves_the_watch_log_alone_and_prunes_streams_by_retain_days() {
+        for (text, pruned) in [("", false), ("[live]\nenabled = true\n", false), ("[live]\nretain_days = 7\n", true)] {
             let base = temp_base("maintenance-live");
             let mut cfg = test_config(&base, live(text));
             cfg.log_max_mb = 1;
@@ -1707,8 +1736,8 @@ mod tests {
             run_maintenance(&cfg);
             let len = |name: &str| std::fs::metadata(cfg.logs_dir.join(name)).unwrap().len();
             assert_eq!(len("meetscribe.err.log"), 0, "the daemon's own log is rotated as before");
-            assert_eq!(len("live-watch.log") == 0, rotated, "config: {text:?}");
-            assert_eq!(cfg.logs_dir.join("live-watch.log.1").exists(), rotated, "config: {text:?}");
+            assert_eq!(len("live-watch.log"), big.len() as u64, "config: {text:?}");
+            assert!(!cfg.logs_dir.join("live-watch.log.1").exists(), "config: {text:?}");
             assert_eq!(!stream.exists(), pruned, "config: {text:?}");
             std::fs::remove_dir_all(&base).unwrap();
         }

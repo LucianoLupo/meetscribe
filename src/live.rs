@@ -78,8 +78,14 @@ pub(crate) struct LiveSummary {
     pub stream: PathBuf,
 }
 
-/// The live streams' directory under the daemon's base directory.
-fn default_out_dir(base: &Path) -> PathBuf {
+/// The longest stretch a reader decodes in one piece when nothing sets it, and the shortest one
+/// it accepts, in seconds. `[live] max_window_secs` (`config.rs`) follows both.
+pub(crate) const DEFAULT_MAX_WINDOW_SECS: u64 = 12;
+pub(crate) const MIN_MAX_WINDOW_SECS: u64 = 2;
+
+/// The live streams' directory under the daemon's base directory: where a reader writes its
+/// stream, and where the daemon's transcription child looks for one.
+pub(crate) fn default_out_dir(base: &Path) -> PathBuf {
     base.join("live")
 }
 
@@ -696,7 +702,7 @@ fn run_watch(opts: &LiveOpts) -> Result<()> {
 pub(crate) fn parse_args(argv: &[String], watch: bool, base: PathBuf) -> Result<Option<(LiveOpts, Option<PathBuf>)>> {
     let mut base = base;
     let (mut model, mut lang, mut out_dir, mut owner_pid) = (None, None, None, None);
-    let (mut max_window_ms, mut print, mut dir) = (12_000, watch, None);
+    let (mut max_window_ms, mut print, mut dir) = (DEFAULT_MAX_WINDOW_SECS as usize * 1000, watch, None);
     let mut it = argv.iter();
     while let Some(arg) = it.next() {
         let mut value = |name: &str| it.next().cloned().with_context(|| format!("{name} needs a value"));
@@ -707,7 +713,7 @@ pub(crate) fn parse_args(argv: &[String], watch: bool, base: PathBuf) -> Result<
             "--base" => base = PathBuf::from(value("--base")?),
             "--max-window-secs" => {
                 let secs: f64 = value("--max-window-secs")?.parse().context("--max-window-secs")?;
-                anyhow::ensure!(secs >= 2.0, "--max-window-secs must be at least 2");
+                anyhow::ensure!(secs >= MIN_MAX_WINDOW_SECS as f64, "--max-window-secs must be at least {MIN_MAX_WINDOW_SECS}");
                 max_window_ms = (secs * 1000.0) as usize;
             }
             "--print" => print = true,

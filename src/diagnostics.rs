@@ -63,8 +63,10 @@ fn safe_fields(fields: Map<String, Value>) -> Option<Map<String, Value>> {
             // Live-lane measurements: numbers only, so a transcript can never ride along.
             "audio_secs" | "decoded_secs" => value.as_f64().is_some_and(|value| value.is_finite() && value >= 0.0),
             "segments" | "short_windows" | "lag_ms" | "merged_segments" | "wait_ms" | "clusters" => value.as_u64().is_some(),
-            // Why a live stream was not stored: one of the gate's reasons, never free text.
-            "reason" => value.as_str().is_some_and(crate::promote::Reject::is_known),
+            // Why a live stream was not stored (one of the gate's reasons) or why the daemon ended
+            // its live reader (`daemon::Killed`): a known word, never free text.
+            "reason" => value.as_str().is_some_and(|value| crate::promote::Reject::is_known(value)
+                || matches!(value, "replaced" | "deadline" | "stopped" | "tracking_lost")),
             "session_id" | "instance_id" => value.as_str().is_some_and(|value| value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())),
             "phase" => value.as_str().is_some_and(|value| matches!(value, "Recording" | "Ready" | "Archived" | "Complete" | "NeedsAttention" | "SkippedShort")),
             "attempt" => value.as_u64().is_some_and(|value| value <= 4),
