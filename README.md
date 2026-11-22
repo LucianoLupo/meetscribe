@@ -19,10 +19,6 @@ You:     works for me
 > version and `~/.meetscribe/logs/meetscribe.err.log`. Review logs for sensitive information
 > before sharing them.
 
-> **Development checkpoint:** this audit-hardening branch is work in progress, not a release.
-> Local automated checks do not establish live capture, upgrade or installation safety;
-> full audit closure and integration verification remain outstanding.
-
 ---
 
 ## Quick start
