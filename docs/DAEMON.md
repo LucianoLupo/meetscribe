@@ -36,8 +36,16 @@ Keys (all optional; unknown keys are warned and ignored, missing keys default):
   (**0 = keep forever**, the default). Eligibility requires stable ownership and either a verified
   matching archive/export pair or a clean short capture; unknown, edited and legacy material stays. ·
   `log_max_mb = 10` — rotate the daemon log over N MB (keeps one `.1` backup; 0 = never).
+- `[live] enabled = false` — the daemon starts a live reader for every call. ·
+  `promote = false` — at hangup, store the live transcript when it covers the whole recording;
+  takes effect only with `enabled = true` (alone it is off, with a warning). ·
+  `max_window_secs = 12` — the longest stretch the daemon's reader decodes in one piece (a value
+  under 2 is replaced by 12, with a warning; a hand-started `meetscribe live` takes
+  `--max-window-secs` and does not read this). · `retain_days = 0` — delete a meeting's live stream after N
+  days (**0 = keep**); works with `enabled` on or off. See "Live transcript during a call".
 
-Disk/log hygiene (session prune + log rotation) runs at daemon startup and once per day.
+Disk/log hygiene (session prune, live stream prune, log rotation) runs at daemon startup and once
+per day, never while this daemon is recording.
 
 ⚠️ **`retention.sessions_days > 0` permanently deletes eligible audio without a confirmation**.
 Prune failures are logged; age alone is not permission to delete unarchived or unknown material.
@@ -118,10 +126,65 @@ is not marked as having a foreign archive. Reading never migrates: the retention
 v3 file and leaves it at v3, and an older binary that writes into a v4 file leaves the new column
 empty.
 
+## Live transcript during a call (`[live]`)
+
+Off by default. With `[live] enabled = true` the daemon starts `meetscribe live <session dir>` (its
+own installed binary) right after it creates a call's session and before capture starts. That
+reader writes the meeting's text to `~/.meetscribe/live/<session key>.jsonl`; read it with
+
+```
+meetscribe live tail --follow      # moves to the next call's stream by itself
+```
+
+The reader only reads what capture has already checkpointed. It is a separate process, and a
+failure to start it is logged and the recording goes on. A recording never waits for its own
+reader; the one wait is for the previous call's reader to end (below).
+
+- **One reader at a time.** It outlives the call to finish its last windows. It is ended by its
+  own exit, 300 s after hangup (checked at each idle poll: 1.5 s, or up to 30 s while a capture
+  keeps failing to start), by the next call, or when the daemon stops. When two calls are less
+  than 300 s apart, the first reader is killed and waited for before the second call's capture
+  starts.
+- **A reader whose daemon was killed stops by itself** (`--owner-pid`): on its next turn, without
+  decoding what is left, or before it opens its stream if the daemon was already gone. That
+  recording was cut short, so its stream is never stored.
+- **A hand-started `meetscribe live watch` is not needed any more**, and the two do not mix:
+  while one reader writes a meeting's stream the other is refused for that meeting, and a
+  reader that starts after the first has finished starts the stream again from nothing. Stop
+  the hand-started one. A reader started by hand has no `--owner-pid`: after a daemon is killed
+  during a call it can wait for ever, and needs a restart.
+- **`daemon --once`** stops its reader as soon as the call ends and does not offer that call's
+  live transcript for storing: the meeting gets the normal transcription.
+- A capture that cannot start (a missing permission, a route that dropped) starts a reader and
+  stops it at once, on every retry.
+
+```
+grep 'live_child_' ~/.meetscribe/logs/meetscribe.err.log
+```
+
+| Event | Means |
+|---|---|
+| `live_child_started` | a reader was started; with `outcome: error` it could not be started |
+| `live_child_exited` | it ended by itself: `exit_code` 0 is `ok`, anything else (or a signal, with no `exit_code`) is `error` |
+| `live_child_killed` | the daemon ended it; `reason` says why: `deadline` (300 s after hangup), `replaced` (the next call), `stopped` (a failed capture, or the daemon stopping), `tracking_lost` (its status could not be read) |
+
+`[live] retain_days = N` deletes a stream N days after it was last written, finished or not, at
+startup and once per day. Only a file directly in `~/.meetscribe/live`, named like a stream and
+starting as one, is removed, and never one a reader is writing. The recording, the stored
+transcript and the database are not touched.
+
+⚠️ **A pruned stream cannot be restored, and cannot be stored as the meeting any more.** A meeting
+whose transcription comes later than `retain_days` (a Mac that was off, a session recovered after
+retries) finds no stream and gets the normal transcription.
+
+`~/.meetscribe/logs/live-watch.log` (written by a hand-started `live watch`) is not rotated by
+the daemon, whatever `[live]` says.
+
 ## Storing the live transcript (`transcribe --promote-live`)
 
-Not wired into the daemon yet: the daemon never passes this flag, so nothing changes unless you
-run it by hand.
+The daemon passes this flag to its transcription child when `[live] enabled` and `promote` are
+both true, for every session it queues or recovers that has a session key. With either one false
+the flag is not passed and nothing below runs. By hand:
 
 `meetscribe transcribe <session dir> --resume --promote-live <live dir>` (or `--session-key`, with
 `--db` and `--export-dir`) looks for `<live dir>/<session key>.jsonl`, the stream `meetscribe live`
@@ -131,6 +194,10 @@ and whisper does not run. The stored meeting is marked `live` (`meetscribe list`
 far-end voices or names. Its model and language are the ones the reader recorded in the stream
 (a stream from a reader that did not record its language takes this command's `--lang`). The
 stream itself is left as it is.
+
+The check is on the stream, not on who wrote it: a complete stream written by another reader of
+the same meeting (a hand-started `live watch` that took it first) is stored too, under the model
+and language that reader used.
 
 Retention treats a live-stored meeting like any other: with `[retention] sessions_days` above 0
 its audio is pruned on schedule, and after that the live text is the final transcript. Keep
@@ -383,4 +450,5 @@ To also remove data: `rm -rf ~/.meetscribe` (deletes the DB, sessions, exports, 
 ## Signals
 `launchctl bootout` (and system logout) sends **SIGTERM**; the daemon folds it into the capture stop
 predicate, so it finalizes the current WAVs cleanly and exits 0 (an in-progress meeting is kept on
-disk but not transcribed on shutdown). `KeepAlive{SuccessfulExit:false}` restarts it only on a crash.
+disk but not transcribed on shutdown). A live reader still running is killed before the daemon
+waits for its transcription worker. `KeepAlive{SuccessfulExit:false}` restarts it only on a crash.
